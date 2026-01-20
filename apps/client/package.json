@@ -1,0 +1,25 @@
+{
+  "name": "client",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist node_modules/.vite"
+  },
+  "dependencies": {
+    "@babylonjs/core": "^8.46.2",
+    "@babylonjs/loaders": "^8.46.2",
+    "@babylonjs/materials": "^8.46.2",
+    "colyseus.js": "^0.15.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.21.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "sass": "^1.69.5",
+    "vite": "^5.0.8"
+  }
+}

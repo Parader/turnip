@@ -1,0 +1,16 @@
+{
+  "name": "turnip",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix apps/client && npm install --prefix apps/server",
+    "dev:all": "concurrently \"npm run dev --prefix apps/client\" \"npm run dev --prefix apps/server\"",
+    "dev:client": "npm run dev --prefix apps/client",
+    "dev:server": "npm run dev --prefix apps/server",
+    "build": "npm run build --prefix apps/client"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
+

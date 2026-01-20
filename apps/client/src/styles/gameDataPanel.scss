@@ -1,0 +1,221 @@
+.game-data-panel {
+  position: fixed;
+  top: 80px;
+  right: 20px;
+  width: 350px;
+  max-height: calc(100vh - 100px);
+  background: rgba(20, 20, 30, 0.95);
+  border: 2px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  backdrop-filter: blur(10px);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem;
+    background: rgba(255, 255, 255, 0.05);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+
+    h3 {
+      margin: 0;
+      font-size: 1.1rem;
+      color: white;
+    }
+
+    .close-btn {
+      background: transparent;
+      border: none;
+      color: white;
+      font-size: 1.5rem;
+      cursor: pointer;
+      padding: 0;
+      width: 30px;
+      height: 30px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      transition: background 0.2s;
+
+      &:hover {
+        background: rgba(255, 255, 255, 0.1);
+      }
+    }
+  }
+
+  .panel-content {
+    padding: 1rem;
+    overflow-y: auto;
+    color: white;
+    font-size: 0.9rem;
+
+    .game-info-section,
+    .team-section,
+    .stats-section {
+      margin-bottom: 1.5rem;
+
+      h4 {
+        margin: 0 0 0.75rem 0;
+        font-size: 1rem;
+        color: rgba(255, 255, 255, 0.9);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        padding-bottom: 0.5rem;
+      }
+
+      &.enemy-team {
+        opacity: 0.8;
+      }
+    }
+
+    .info-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.5rem 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+
+      .label {
+        color: rgba(255, 255, 255, 0.6);
+        font-weight: 500;
+      }
+
+      .value {
+        color: white;
+        font-weight: 600;
+
+        &.phase-badge {
+          padding: 0.25rem 0.5rem;
+          border-radius: 4px;
+          font-size: 0.85rem;
+          text-transform: capitalize;
+
+          &[data-phase="preparation"] {
+            background: rgba(255, 193, 7, 0.2);
+            color: #ffc107;
+          }
+
+          &[data-phase="game"] {
+            background: rgba(76, 175, 80, 0.2);
+            color: #4caf50;
+          }
+
+          &[data-phase="stats"] {
+            background: rgba(33, 150, 243, 0.2);
+            color: #2196f3;
+          }
+        }
+      }
+    }
+
+    .players-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .player-item {
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 6px;
+      padding: 0.75rem;
+      border-left: 3px solid rgba(255, 255, 255, 0.2);
+
+      .player-name {
+        font-weight: 600;
+        color: white;
+        margin-bottom: 0.5rem;
+        font-size: 1rem;
+      }
+
+      .player-details {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        font-size: 0.85rem;
+        color: rgba(255, 255, 255, 0.7);
+
+        span {
+          display: block;
+        }
+
+        .ready {
+          color: #4caf50;
+          font-weight: 600;
+        }
+
+        .not-ready {
+          color: rgba(255, 255, 255, 0.4);
+        }
+      }
+    }
+
+    .raw-data-section {
+      margin-top: 1rem;
+      padding-top: 1rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+
+      details {
+        cursor: pointer;
+        color: rgba(255, 255, 255, 0.6);
+
+        summary {
+          padding: 0.5rem;
+          border-radius: 4px;
+          transition: background 0.2s;
+
+          &:hover {
+            background: rgba(255, 255, 255, 0.05);
+          }
+        }
+
+        pre {
+          margin: 0.5rem 0 0 0;
+          padding: 0.75rem;
+          background: rgba(0, 0, 0, 0.3);
+          border-radius: 4px;
+          overflow-x: auto;
+          font-size: 0.75rem;
+          color: rgba(255, 255, 255, 0.8);
+          max-height: 300px;
+          overflow-y: auto;
+        }
+      }
+    }
+  }
+}
+
+// Toggle button for opening the panel
+.game-data-toggle {
+  position: fixed;
+  top: 80px;
+  right: 20px;
+  width: 50px;
+  height: 50px;
+  background: rgba(20, 20, 30, 0.9);
+  border: 2px solid rgba(255, 255, 255, 0.1);
+  border-radius: 50%;
+  backdrop-filter: blur(10px);
+  z-index: 199;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: white;
+  font-size: 1.5rem;
+  transition: all 0.2s;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+
+  &:hover {
+    background: rgba(20, 20, 30, 1);
+    border-color: rgba(255, 255, 255, 0.2);
+    transform: scale(1.1);
+  }
+
+  &.hidden {
+    display: none;
+  }
+}
