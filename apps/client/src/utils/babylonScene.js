@@ -2,6 +2,10 @@ import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder,
 import '@babylonjs/loaders/glTF';
 import { TILE_TYPES } from './mapRenderer';
 import { findPath, getMovementRange } from './pathfinding';
+import { build3DMap } from './babylon/babylonMap';
+import { buildPlayerCharacters, updatePlayerCharacters } from './babylon/babylonPlayers';
+import { startMovementAnimation, startStanceAnimation, stopStanceAnimation, playCastAnimation, playHitAnimation, updateMovementAnimations, blendAnimations } from './babylon/babylonAnimations';
+import { playSpellVfx } from './babylon/babylonVfx';
 
 // Helper to convert angle in radians to Babylon.js rotation (Y axis)
 // In Babylon.js, rotation around Y axis: 
@@ -122,6 +126,11 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   
   // Store callback for position change requests
   let onPositionChangeRequest = null;
+  
+  // Spell casting state
+  let selectedSpell = null; // Currently selected spell for casting
+  let selectedSpellDef = null; // Spell definition
+  let isCasting = false; // Track if currently casting (prevents movement during cast animation)
 
   // Build player characters (spheres) if game state is available
   if (gameState) {
@@ -252,6 +261,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   let previousHoveredTarget = null; // Previous hovered target tile {x, y}
   let movementPathMaterial = null; // Material for path tiles
   let onMovementRequest = null; // Callback for movement requests
+  let onSpellCast = null; // Callback for spell cast requests
   
   // Initialize scene metadata for pending movement paths
   if (!scene.metadata) {
@@ -267,6 +277,21 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   movementPathMaterial.emissiveColor = new Color3(0.0, 0.5, 0.0);
   movementPathMaterial.alpha = 0.6;
   
+  // Create material for spell range visualization (light blue)
+  let spellRangeMaterial = new StandardMaterial('spellRangeMaterial', scene);
+  spellRangeMaterial.diffuseColor = new Color3(0.4, 0.6, 0.9); // Light blue
+  spellRangeMaterial.emissiveColor = new Color3(0.2, 0.3, 0.5);
+  spellRangeMaterial.alpha = 0.5;
+  
+  // Create material for spell target visualization (red)
+  let spellTargetMaterial = new StandardMaterial('spellTargetMaterial', scene);
+  spellTargetMaterial.diffuseColor = new Color3(0.8, 0.2, 0.2); // Red
+  spellTargetMaterial.emissiveColor = new Color3(0.5, 0.1, 0.1);
+  spellTargetMaterial.alpha = 0.7;
+  
+  let spellRangeTiles = []; // Currently highlighted spell range tiles
+  let spellTargetTiles = []; // Currently highlighted spell target tiles
+  
   // Function to clear movement visualization
   const clearMovementVisualization = () => {
     // Clear path
@@ -279,12 +304,137 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     movementPath = [];
   };
   
+  // Function to clear spell targeting visualization
+  const clearSpellTargeting = () => {
+    // Clear range tiles
+    spellRangeTiles.forEach(tileKey => {
+      const tile = allTiles.get(tileKey);
+      if (tile && tile.userData && tile.userData.originalMaterial) {
+        tile.material = tile.userData.originalMaterial;
+      }
+    });
+    spellRangeTiles = [];
+    
+    // Clear target tiles
+    spellTargetTiles.forEach(tileKey => {
+      const tile = allTiles.get(tileKey);
+      if (tile && tile.userData && tile.userData.originalMaterial) {
+        tile.material = tile.userData.originalMaterial;
+      }
+    });
+    spellTargetTiles = [];
+  };
+  
+  // Function to get all tiles within spell range
+  const getSpellRangeTiles = (startX, startY, minRange, maxRange, terrain) => {
+    const rangeTiles = [];
+    const mapHeight = terrain.length;
+    const mapWidth = terrain[0]?.length || 0;
+    
+    // Check all tiles in a square around the player
+    for (let y = 0; y < mapHeight; y++) {
+      for (let x = 0; x < mapWidth; x++) {
+        // Calculate Manhattan distance
+        const distance = Math.abs(x - startX) + Math.abs(y - startY);
+        
+        // Check if tile is within range and walkable
+        if (distance >= minRange && distance <= maxRange) {
+          if (terrain[y][x] === TILE_TYPES.TILE) {
+            rangeTiles.push({ x, y });
+          }
+        }
+      }
+    }
+    
+    return rangeTiles;
+  };
+  
+  // Function to handle spell targeting visualization
+  const handleSpellTargeting = (pointerInfo, currentPlayer, spellDef, terrain, allTiles, scene) => {
+    const isLeftClick = pointerInfo.type === PointerEventTypes.POINTERDOWN && 
+                        (pointerInfo.event.button === undefined || pointerInfo.event.button === 0);
+    const isHover = pointerInfo.type === PointerEventTypes.POINTERMOVE;
+    
+    const targeting = spellDef.targeting || {};
+    const range = targeting.range || { min: 0, max: 10 };
+    const playerX = currentPlayer.position.x;
+    const playerY = currentPlayer.position.y;
+    
+    // Always show spell range when in cast mode
+    if (isHover || isLeftClick) {
+      // Clear previous visualization
+      clearSpellTargeting();
+      
+      // Show spell range in light blue
+      const rangeTiles = getSpellRangeTiles(playerX, playerY, range.min, range.max, terrain);
+      rangeTiles.forEach(({ x, y }) => {
+        const tileKey = `${x}_${y}`;
+        const tile = allTiles.get(tileKey);
+        if (tile) {
+          if (!tile.userData) {
+            tile.userData = {};
+          }
+          if (!tile.userData.originalMaterial) {
+            tile.userData.originalMaterial = tile.material;
+          }
+          tile.material = spellRangeMaterial;
+          spellRangeTiles.push(tileKey);
+        }
+      });
+    }
+    
+    // Get pick result for target tile highlighting
+    const x = pointerInfo.event.pointerX !== undefined ? pointerInfo.event.pointerX : (pointerInfo.event.offsetX || pointerInfo.event.clientX);
+    const y = pointerInfo.event.pointerY !== undefined ? pointerInfo.event.pointerY : (pointerInfo.event.offsetY || pointerInfo.event.clientY);
+    const pickResult = scene.pick(x, y, (mesh) => {
+      return mesh.userData && mesh.userData.tileX !== undefined && mesh.userData.tileY !== undefined;
+    });
+    
+    if (pickResult && pickResult.hit && pickResult.pickedMesh) {
+      const pickedMesh = pickResult.pickedMesh;
+      const tileX = pickedMesh.userData?.tileX;
+      const tileY = pickedMesh.userData?.tileY;
+      
+      if (tileX !== undefined && tileY !== undefined) {
+        // Calculate distance (Manhattan for now)
+        const distance = Math.abs(tileX - playerX) + Math.abs(tileY - playerY);
+        
+        // Check if target is in range
+        if (distance >= range.min && distance <= range.max) {
+          // Highlight target tile in red (overrides range blue)
+          const tileKey = `${tileX}_${tileY}`;
+          const tile = allTiles.get(tileKey);
+          if (tile) {
+            if (!tile.userData) {
+              tile.userData = {};
+            }
+            // Don't overwrite originalMaterial if already set
+            if (!tile.userData.originalMaterial) {
+              tile.userData.originalMaterial = tile.material;
+            }
+            tile.material = spellTargetMaterial;
+            spellTargetTiles.push(tileKey);
+          }
+          
+          // Handle spell cast on click
+          if (isLeftClick) {
+            // Send spell cast request to server
+            // The server will broadcast to all clients (including this one) to play the animation
+            if (onSpellCast) {
+              onSpellCast(spellDef.spellId || spellDef.name, tileX, tileY);
+            }
+          }
+        }
+      }
+    }
+  };
+  
   // Set up pointer picking with proper event types
   console.log(`Setting up pointer observable, startPositionTiles size: ${startPositionTiles.size}`);
   console.log('Start position tiles:', Array.from(startPositionTiles.entries()).map(([id, tile]) => ({ id, x: tile.x, y: tile.y, meshName: tile.mesh.name })));
   
   scene.onPointerObservable.add((pointerInfo) => {
-    // Handle game phase movement
+    // Handle game phase movement or spell casting
     if (currentGameState && currentGameState.phase === 'game' && currentGameState.currentPlayerId === userId) {
       // Get current player
       const currentPlayer = currentGameState.myTeam && Object.values(currentGameState.myTeam.players || {}).find(p => p.userId === userId);
@@ -295,6 +445,24 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         return;
       }
       
+      // Check if we're in cast mode or currently casting
+      const isCastMode = selectedSpell !== null && selectedSpellDef !== null;
+      
+      // If currently casting, disable movement to prevent animation glitches
+      if (isCasting) {
+        return; // Don't allow movement during cast animation
+      }
+      
+      // If in cast mode, handle spell targeting
+      if (isCastMode) {
+        handleSpellTargeting(pointerInfo, currentPlayer, selectedSpellDef, terrain, allTiles, scene);
+        return;
+      }
+      
+      // Clear spell targeting when switching back to movement mode
+      clearSpellTargeting();
+      
+      // Movement mode - existing movement logic
       // Calculate available movement points
       const availableMP = (currentPlayer.movementPoints || 0) - (currentPlayer.usedMovementPoints || 0);
       
@@ -315,10 +483,13 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         });
       }
       
-      // Get pick result
+      // Get pick result - use predicate to only pick tile meshes (skip character meshes)
       const x = pointerInfo.event.pointerX !== undefined ? pointerInfo.event.pointerX : (pointerInfo.event.offsetX || pointerInfo.event.clientX);
       const y = pointerInfo.event.pointerY !== undefined ? pointerInfo.event.pointerY : (pointerInfo.event.offsetY || pointerInfo.event.clientY);
-      const pickResult = scene.pick(x, y);
+      const pickResult = scene.pick(x, y, (mesh) => {
+        // Only pick meshes that have tile coordinates (tiles), skip character meshes
+        return mesh.userData && mesh.userData.tileX !== undefined && mesh.userData.tileY !== undefined;
+      });
       
       if (pickResult && pickResult.hit && pickResult.pickedMesh) {
         const pickedMesh = pickResult.pickedMesh;
@@ -418,8 +589,8 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                     startTime: Date.now()
                   });
                   
-                  // Send movement request to server
-                  onMovementRequest(targetPos.x, targetPos.y);
+                  // Send movement request to server with the previsualized path
+                  onMovementRequest(targetPos.x, targetPos.y, fullPath);
                   
                   // Clear visualization after moving
                   clearMovementVisualization();
@@ -429,13 +600,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
               }
             }
         }
-      } else {
-        // Clear visualization when not hovering over a tile (only on move, not on click)
-        if (isHover) {
-          clearMovementVisualization();
-          previousHoveredPath = [];
-        }
-      }
+      } 
       
       return; // Don't process preparation phase logic
     }
@@ -463,11 +628,15 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       return; // Don't process hover/click when ready
     }
     
-    // Get pick result - use scene.pick with proper coordinates
+    // Get pick result - use predicate to only pick tile meshes (skip character meshes)
     // Babylon.js provides pointerX and pointerY in the event
     const x = pointerInfo.event.pointerX !== undefined ? pointerInfo.event.pointerX : (pointerInfo.event.offsetX || pointerInfo.event.clientX);
     const y = pointerInfo.event.pointerY !== undefined ? pointerInfo.event.pointerY : (pointerInfo.event.offsetY || pointerInfo.event.clientY);
-    const pickResult = scene.pick(x, y);
+    const pickResult = scene.pick(x, y, (mesh) => {
+      // Only pick meshes that are start position tiles (for preparation phase)
+      // Check if it's a start position tile by checking the startPositionTiles map
+      return startPositionTiles.has(mesh.uniqueId);
+    });
     
     if (!pickResult || !pickResult.hit) {
       // No hit, restore hover if needed
@@ -593,12 +762,15 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             // Check if this is a player start tile or enemy start tile from userData
             const isPlayerStart = tile.userData?.isPlayerStart;
             
-            // Only update if not currently highlighted by movement system
+            // Only update if not currently highlighted by movement system or spell targeting
             const tileKey = `${tile.userData?.tileX}_${tile.userData?.tileY}`;
             const isInMovementPath = movementPath.includes(tileKey);
+            const isInSpellRange = spellRangeTiles.includes(tileKey);
+            const isInSpellTarget = spellTargetTiles.includes(tileKey);
             
             // During game phase, always show as regular tiles (not blue/red)
-            if (!isInMovementPath) {
+            // But preserve spell range and target highlights
+            if (!isInMovementPath && !isInSpellRange && !isInSpellTarget) {
               if (isPreparationPhase) {
                 // Restore original starting position material
                 if (isPlayerStart) {
@@ -644,1155 +816,342 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       }
     },
     setOnMovementRequest: (callback) => {
-      onMovementRequest = callback;
+      onMovementRequest = callback; // Callback signature: (x, y, path) => void
     },
     setOnPositionChangeRequest: (callback) => {
       onPositionChangeRequest = callback;
-    }
-  };
-}
-
-/**
- * Builds a 3D representation of the map terrain
- * @param {Scene} scene - Babylon.js scene
- * @param {Array<Array<number>>} terrain - 2D array of tile types
- * @param {number} mapWidth - Width of the map
- * @param {number} mapHeight - Height of the map
- * @param {Object} startZones - Starting positions for teams A and B
- * @param {string} playerTeam - Player's team ('A' or 'B')
- * @param {string} enemyTeam - Enemy team ('A' or 'B')
- */
-function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, playerTeam, enemyTeam, userId, gameState) {
-  const tileSize = 1; // Size of each tile in 3D units
-  const tileHeight = 0.02; // Minimal height for walkable tiles
-  const wallHeight = 0.5; // Height of walls
-
-  // Create a set of starting positions for quick lookup
-  const playerStartPositions = new Set();
-  const enemyStartPositions = new Set();
-  
-  if (startZones) {
-    // Player team starting positions
-    if (startZones[playerTeam]) {
-      startZones[playerTeam].forEach(pos => {
-        playerStartPositions.add(`${pos.x}_${pos.y}`);
-      });
-    }
-    // Enemy team starting positions
-    if (startZones[enemyTeam]) {
-      startZones[enemyTeam].forEach(pos => {
-        enemyStartPositions.add(`${pos.x}_${pos.y}`);
-      });
-    }
-  }
-
-  // Base tile material - transparent
-  const createTileMaterial = (color, scene) => {
-    const material = new StandardMaterial('tileMaterial', scene);
-    material.diffuseColor = color;
-    material.alpha = 0.3; // Transparent
-    material.wireframe = false;
-    material.emissiveColor = color.scale(0.2); // Slight glow
-    return material;
-  };
-
-  // Starting position materials
-  const playerStartMaterial = new StandardMaterial('playerStartMaterial', scene);
-  playerStartMaterial.diffuseColor = new Color3(0.2, 0.4, 1.0); // Blue
-  playerStartMaterial.emissiveColor = new Color3(0.2, 0.4, 1.0);
-  playerStartMaterial.alpha = 0.6;
-
-  const enemyStartMaterial = new StandardMaterial('enemyStartMaterial', scene);
-  enemyStartMaterial.diffuseColor = new Color3(1.0, 0.2, 0.2); // Red
-  enemyStartMaterial.emissiveColor = new Color3(1.0, 0.2, 0.2);
-  enemyStartMaterial.alpha = 0.6;
-
-  // Wall material
-  const wallMaterial = new StandardMaterial('wallMaterial', scene);
-  wallMaterial.diffuseColor = new Color3(0.35, 0.35, 0.35); // Gray
-  wallMaterial.specularColor = new Color3(0.2, 0.2, 0.2);
-
-  // Empty material
-  const emptyMaterial = new StandardMaterial('emptyMaterial', scene);
-  emptyMaterial.diffuseColor = new Color3(0.05, 0.05, 0.05); // Very dark
-  emptyMaterial.alpha = 0.1;
-
-  // Create a parent mesh to hold all tiles
-  const mapContainer = MeshBuilder.CreateBox('mapContainer', { size: 0.01 }, scene);
-  mapContainer.isVisible = false;
-
-  // Map to store starting position tiles for interaction (player team only)
-  const startPositionTiles = new Map();
-  // Array to store all starting position tiles (player + enemy) for visibility control
-  const allStartPositionTiles = [];
-  // Map to store all tiles for movement range highlighting: "x_y" -> mesh
-  const allTiles = new Map();
-
-  // Build tiles
-  for (let y = 0; y < mapHeight; y++) {
-    for (let x = 0; x < mapWidth; x++) {
-      const tileType = terrain[y][x];
-      const xPos = x * tileSize;
-      const zPos = y * tileSize;
-      const tileKey = `${x}_${y}`;
-      const isPlayerStart = playerStartPositions.has(tileKey);
-      const isEnemyStart = enemyStartPositions.has(tileKey);
-
-      if (tileType === TILE_TYPES.NONE) {
-        // Create a very low ground plane for empty spaces
-        const emptyTile = MeshBuilder.CreateBox('emptyTile', {
-          width: tileSize * 0.95,
-          height: 0.01,
-          depth: tileSize * 0.95
-        }, scene);
-        emptyTile.position = new Vector3(xPos, -0.05, zPos);
-        emptyTile.material = emptyMaterial;
-        emptyTile.parent = mapContainer;
-      } else if (tileType === TILE_TYPES.TILE) {
-        // Determine tile color based on checkerboard pattern
-        const isLight = (x + y) % 2 === 0;
-        const baseColor = isLight 
-          ? new Color3(0.83, 0.65, 0.45) // Light beige
-          : new Color3(0.72, 0.58, 0.42); // Dark beige
-
-        // Create transparent tile
-        const tile = MeshBuilder.CreateBox('tile', {
-          width: tileSize * 0.95,
-          height: tileHeight,
-          depth: tileSize * 0.95
-        }, scene);
-        tile.position = new Vector3(xPos, tileHeight / 2, zPos);
-        
-        // Use starting position material if applicable, otherwise use transparent tile
-        if (isPlayerStart) {
-          tile.material = playerStartMaterial;
-          // Make tile pickable and enable pointer events
-          tile.isPickable = true;
-          tile.enablePointerMoveEvents = true;
-          // Store tile reference for interaction
-          startPositionTiles.set(tile.uniqueId, {
-            mesh: tile,
-            x: x,
-            y: y,
-            isPlayerStart: true
-          });
-          // Also store by name for easier lookup
-          tile.name = `startTile_${x}_${y}`;
-          // Store tile coordinates in userData for material switching
-          if (!tile.userData) {
-            tile.userData = {};
-          }
-          tile.userData.tileX = x;
-          tile.userData.tileY = y;
-          tile.userData.isPlayerStart = true;
-          // Add to all start tiles array for visibility control
-          allStartPositionTiles.push(tile);
-        } else if (isEnemyStart) {
-          tile.material = enemyStartMaterial;
-          tile.isPickable = false; // Enemy tiles not interactive
-          // Store tile coordinates in userData for material switching
-          if (!tile.userData) {
-            tile.userData = {};
-          }
-          tile.userData.tileX = x;
-          tile.userData.tileY = y;
-          tile.userData.isPlayerStart = false;
-          // Add to all start tiles array for visibility control
-          allStartPositionTiles.push(tile);
-        } else {
-          tile.material = createTileMaterial(baseColor, scene);
-          tile.isPickable = true; // Make tiles pickable for movement during game phase
-        }
-        tile.parent = mapContainer;
-        
-        // Store all walkable tiles for movement range highlighting
-        const tileKey = `${x}_${y}`;
-        allTiles.set(tileKey, tile);
-        
-        // Store tile coordinates in userData
-        if (!tile.userData) {
-          tile.userData = {};
-        }
-        tile.userData.tileX = x;
-        tile.userData.tileY = y;
-
-        // If it's a starting position, make it slightly elevated
-        if (isPlayerStart || isEnemyStart) {
-          tile.position.y = tileHeight;
-        }
-      } else if (tileType === TILE_TYPES.WALL) {
-        // Create wall
-        const wall = MeshBuilder.CreateBox('wall', {
-          width: tileSize * 0.95,
-          height: wallHeight,
-          depth: tileSize * 0.95
-        }, scene);
-        wall.position = new Vector3(xPos, wallHeight / 2, zPos);
-        wall.material = wallMaterial;
-        wall.parent = mapContainer;
-      }
-    }
-  }
-  
-  return {
-    interactiveTiles: startPositionTiles, // Tiles that can be clicked (player team only)
-    allStartTiles: allStartPositionTiles, // All starting position tiles (player + enemy) for visibility
-    allTiles: allTiles, // All tiles for movement range highlighting
-    playerStartMaterial: playerStartMaterial, // Material for player team starting positions
-    enemyStartMaterial: enemyStartMaterial, // Material for enemy team starting positions
-    createTileMaterial: createTileMaterial // Function to create regular tile material
-  };
-}
-
-/**
- * Build player characters as spheres at their positions
- * @param {Scene} scene - Babylon.js scene
- * @param {Object} gameState - Game state with player data
- * @param {string} userId - Current user's ID
- * @param {number} mapWidth - Width of the map
- * @param {number} mapHeight - Height of the map
- */
-function buildPlayerCharacters(scene, gameState, userId, mapWidth, mapHeight) {
-  const tileSize = 1;
-  const sphereRadius = 0.3;
-  const sphereHeight = sphereRadius + 0.15; // Position sphere above the tile
-
-  // Store player meshes and animation groups in scene metadata for updates
-  if (!scene.metadata) {
-    scene.metadata = { 
-      playerMeshes: new Map(),
-      playerAnimationGroups: new Map(),
-      modelCache: new Map() // Cache loaded models to avoid reloading
-    };
-  }
-
-  // Clear existing player meshes
-  scene.metadata.playerMeshes.forEach((mesh) => {
-    if (mesh.rootMesh) {
-      mesh.rootMesh.dispose();
-    } else {
-      mesh.dispose();
-    }
-  });
-  scene.metadata.playerMeshes.clear();
-  
-  // Clear animation groups
-  scene.metadata.playerAnimationGroups.forEach((animGroup) => {
-    animGroup.dispose();
-  });
-  scene.metadata.playerAnimationGroups.clear();
-
-  // Helper function to get model path for character class
-  const getModelPath = (characterClass) => {
-    const classId = characterClass?.toLowerCase() || 'warrior';
-    const validClasses = ['assassin', 'warrior', 'archer', 'mage'];
-    const normalizedClass = validClasses.includes(classId) ? classId : 'warrior';
-    return `/models/${normalizedClass}/master.glb`;
-  };
-
-  // Helper function to load and create a character model
-  const createPlayerModel = async (player, isMyTeam) => {
-    const xPos = player.position.x * tileSize;
-    const zPos = player.position.y * tileSize;
-    const modelPath = getModelPath(player.characterClass);
-    
-    try {
-      // Check if model is cached
-      let modelRoot = null;
-      let animationGroups = [];
+    },
+    setOnSpellCast: (callback) => {
+      onSpellCast = callback; // Callback signature: (spellId, targetX, targetY) => void
+    },
+    setSelectedSpell: (spellId, spellDef) => {
+      selectedSpell = spellId;
+      selectedSpellDef = spellDef;
       
-      if (scene.metadata.modelCache.has(modelPath)) {
-        // Clone from cache
-        const cached = scene.metadata.modelCache.get(modelPath);
-        modelRoot = cached.root.clone(`player_${player.userId}`);
-        animationGroups = cached.animationGroups.map(ag => ag.clone(`anim_${player.userId}_${ag.name}`));
-      } else {
-        // Load new model
-        const result = await SceneLoader.ImportMeshAsync('', modelPath, '', scene);
-        // The first mesh might be a root/container, find the actual character mesh
-        // GLB files often have a root node, so we might need to find the actual mesh
-        modelRoot = result.meshes[0];
+      // Store in scene metadata
+      if (!scene.metadata) {
+        scene.metadata = {};
+      }
+      scene.metadata.selectedSpell = spellId;
+      scene.metadata.selectedSpellDef = spellDef;
+      
+      // If spell is selected, start stance animation
+      if (spellId && spellDef && spellDef.animations && spellDef.animations.prep) {
+        startStanceAnimation(scene, userId, spellDef.animations.prep);
         
-        // If the root has children, we might need to rotate those instead
-        // Or create a parent container to rotate
-        if (modelRoot.getChildMeshes && modelRoot.getChildMeshes().length > 0) {
-          // Model has child meshes - we'll rotate the root which will rotate all children
-          console.log(`Model has ${modelRoot.getChildMeshes().length} child meshes`);
+        // Show spell range immediately when entering cast mode
+        if (currentGameState && currentGameState.phase === 'game') {
+          const currentPlayer = currentGameState.myTeam && 
+            Object.values(currentGameState.myTeam.players || {}).find(p => p.userId === userId);
+          
+          if (currentPlayer && currentPlayer.position && terrain) {
+            const targeting = spellDef.targeting || {};
+            const range = targeting.range || { min: 0, max: 10 };
+            const playerX = currentPlayer.position.x;
+            const playerY = currentPlayer.position.y;
+            
+            // Clear previous visualization
+            clearSpellTargeting();
+            
+            // Show spell range in light blue
+            const rangeTiles = getSpellRangeTiles(playerX, playerY, range.min, range.max, terrain);
+            rangeTiles.forEach(({ x, y }) => {
+              const tileKey = `${x}_${y}`;
+              const tile = allTiles.get(tileKey);
+              if (tile) {
+                if (!tile.userData) {
+                  tile.userData = {};
+                }
+                if (!tile.userData.originalMaterial) {
+                  tile.userData.originalMaterial = tile.material;
+                }
+                tile.material = spellRangeMaterial;
+                spellRangeTiles.push(tileKey);
+              }
+            });
+          }
+        }
+      } else if (!spellId) {
+        // Cancel stance animation and return to idle
+        stopStanceAnimation(scene, userId);
+        // Clear spell targeting visualization
+        clearSpellTargeting();
+      }
+      
+      // Clear movement visualization when switching modes
+      clearMovementVisualization();
+    },
+    playSpellCastAnimation: (castUserId, spellId, castAnimDef, spellDef = null, targetX = null, targetY = null) => {
+      // Rotate player to face target before casting
+      if (targetX !== null && targetY !== null && scene.metadata && scene.metadata.playerMeshes) {
+        const playerMesh = scene.metadata.playerMeshes.get(castUserId);
+        if (playerMesh) {
+          // Get caster position from game state or mesh
+          const gameState = currentGameState || scene.metadata?.gameState;
+          let casterX = null;
+          let casterY = null;
+          
+          // Try to get from game state first
+          if (gameState) {
+            const myTeam = gameState.myTeam?.players;
+            const enemyTeam = gameState.enemyTeam?.players;
+            let caster = null;
+            if (myTeam) {
+              caster = Object.values(myTeam).find(p => p.userId === castUserId);
+            }
+            if (!caster && enemyTeam) {
+              caster = Object.values(enemyTeam).find(p => p.userId === castUserId);
+            }
+            if (caster && caster.position) {
+              casterX = caster.position.x;
+              casterY = caster.position.y;
+            }
+          }
+          
+          // Fallback to mesh position if game state not available
+          if (casterX === null && playerMesh.position) {
+            casterX = playerMesh.position.x;
+            casterY = playerMesh.position.z; // Z in Babylon = Y in game
+          }
+          
+          if (casterX !== null && casterY !== null) {
+            // Check if this is a self-cast (target is same as caster position)
+            const isSelfCast = Math.abs(targetX - casterX) < 0.1 && Math.abs(targetY - casterY) < 0.1;
+            
+            // Only rotate if not self-casting
+            if (!isSelfCast) {
+              // Calculate direction from caster to target
+              const dx = targetX - casterX;
+              const dy = targetY - casterY;
+              
+              // Calculate target angle using atan2
+              // In game coordinates: dx = X difference, dy = Y difference
+              // In Babylon: 0 = +Z, PI/2 = +X, PI = -Z, -PI/2 = -X
+              // atan2(dy, dx) gives angle from +X axis, but we need angle for +Z axis
+              // So we use atan2(dx, dy) to get angle from +Z axis
+              let targetAngle = Math.atan2(dx, dy);
+              
+              // Normalize to [0, 2*PI] range
+              while (targetAngle < 0) targetAngle += 2 * Math.PI;
+              while (targetAngle >= 2 * Math.PI) targetAngle -= 2 * Math.PI;
+              
+              // Get current rotation
+              const currentRotation = playerMesh.rotation.y;
+              
+              // Calculate shortest rotation path
+              let rotationDiff = targetAngle - currentRotation;
+              if (rotationDiff > Math.PI) rotationDiff -= 2 * Math.PI;
+              if (rotationDiff < -Math.PI) rotationDiff += 2 * Math.PI;
+              
+              // Smoothly rotate to target angle using render loop
+              const rotationDuration = 200; // 200ms rotation duration
+              const rotationStartTime = Date.now();
+              const startRotation = currentRotation;
+              const targetRotation = currentRotation + rotationDiff;
+              
+              // Store rotation state in mesh metadata
+              if (!playerMesh.metadata) {
+                playerMesh.metadata = {};
+              }
+              playerMesh.metadata.isRotating = true;
+              playerMesh.metadata.rotationStartTime = rotationStartTime;
+              playerMesh.metadata.rotationStartAngle = startRotation;
+              playerMesh.metadata.rotationTargetAngle = targetRotation;
+              playerMesh.metadata.rotationDuration = rotationDuration;
+              
+              // Use render loop for smooth rotation
+              const rotationObserver = scene.onBeforeRenderObservable.add(() => {
+                if (!playerMesh || !playerMesh.metadata || !playerMesh.metadata.isRotating) {
+                  if (rotationObserver) {
+                    scene.onBeforeRenderObservable.remove(rotationObserver);
+                  }
+                  return;
+                }
+                
+                const elapsed = Date.now() - playerMesh.metadata.rotationStartTime;
+                const progress = Math.min(elapsed / playerMesh.metadata.rotationDuration, 1.0);
+                
+                // Ease-in-out function for smooth rotation
+                const easeInOut = (t) => {
+                  return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+                };
+                
+                const easedProgress = easeInOut(progress);
+                const currentAngle = playerMesh.metadata.rotationStartAngle + 
+                  (playerMesh.metadata.rotationTargetAngle - playerMesh.metadata.rotationStartAngle) * easedProgress;
+                
+                playerMesh.rotation.y = currentAngle;
+                
+                if (progress >= 1.0) {
+                  // Rotation complete
+                  playerMesh.metadata.isRotating = false;
+                  scene.onBeforeRenderObservable.remove(rotationObserver);
+                }
+              });
+            }
+            // If self-casting, keep current rotation (do nothing)
+          }
+        }
+      }
+      
+      // Play cast animation for any player (for observers)
+      if (castAnimDef) {
+        const castStartTime = Date.now();
+        
+        // If casting as current user, set casting flag to disable movement
+        if (castUserId === userId) {
+          isCasting = true;
         }
         
-        animationGroups = result.animationGroups || [];
-        
-        // Cache the original for future clones
-        scene.metadata.modelCache.set(modelPath, {
-          root: modelRoot,
-          animationGroups: animationGroups
+        // Play cast animation and wait for it to complete
+        playCastAnimation(scene, castUserId, castAnimDef).then(() => {
+          // Cast animation completed - wait for blend-out before re-enabling movement
+          const blendOutMs = castAnimDef.blendOutMs || 200;
+          setTimeout(() => {
+            // Re-enable movement for current user after blend-out completes
+            if (castUserId === userId) {
+              isCasting = false;
+            }
+          }, blendOutMs);
+        }).catch((error) => {
+          // On error, still clear the casting flag
+          if (castUserId === userId) {
+            isCasting = false;
+          }
+          console.error('Error in cast animation:', error);
         });
-      }
-
-      // Position the model
-      if (modelRoot) {
-        // Create a parent transform node to handle rotation reliably
-        const characterContainer = new TransformNode(`characterContainer_${player.userId}`, scene);
         
-        // Get bounding box to center the model
-        const boundingInfo = modelRoot.getBoundingInfo();
-        const size = boundingInfo.boundingBox.extendSize;
-        
-        // Calculate rotation based on team - ignore server orientation for now
-        let rotationY = 0;
-        if (player.team === 'A') {
-          rotationY = Math.PI / 2; // 90 degrees - face right (+X)
-        } else if (player.team === 'B') {
-          rotationY = 3 * Math.PI / 2; // 270 degrees - face left (-X)
+        // Play VFX if spell definition is provided
+        // Ensure spellDef has spellId for routing
+        if (spellDef && !spellDef.spellId) {
+          spellDef.spellId = spellId;
         }
         
-        // TODO: Use orientation from game state when server-side orientation is fixed
-        // For now, always use team-based rotation
-        
-        console.log(`Rotating player ${player.userId} (team ${player.team}): rotation.y=${rotationY} radians (${(rotationY * 180 / Math.PI).toFixed(1)} degrees)`);
-        console.log(`Model root: "${modelRoot.name}", type: ${modelRoot.constructor.name}, has children: ${modelRoot.getChildMeshes ? modelRoot.getChildMeshes().length : 0}`);
-        
-        // Apply rotation to container
-        characterContainer.rotation.y = rotationY;
-        
-        // Position container at tile location
-        characterContainer.position = new Vector3(xPos, size.y, zPos);
-        
-        // Make model a child of the container (this ensures rotation propagates)
-        modelRoot.parent = characterContainer;
-        
-        // Reset model's local position/rotation since it's now relative to container
-        modelRoot.position = Vector3.Zero();
-        modelRoot.rotation = Vector3.Zero();
-        
-        // Scale model to appropriate size - make them bigger
-        const scale = 0.8; // Increased from 0.5 to make models bigger
-        modelRoot.scaling = new Vector3(scale, scale, scale);
-        
-        // Use container as the root for tracking
-        const actualRoot = characterContainer;
-        
-        // Don't apply team color - use original model materials
-        
-        // Store all animation groups for this player
-        if (animationGroups.length > 0) {
-          // Store all animation groups in a map for easy access
-          const animMap = new Map();
-          animationGroups.forEach(ag => {
-            const animName = ag.name ? ag.name.toLowerCase() : '';
-            animMap.set(animName, ag);
-          });
-          scene.metadata.playerAnimationGroups.set(player.userId, animMap);
+        if (spellDef && spellDef.presentation && (spellDef.presentation.projectileVfx || spellDef.presentation.impactVfxDef || spellDef.presentation.groundEffectVfx) && targetX !== null && targetY !== null) {
+          // Get caster position - prioritize player mesh (most accurate)
+          let casterPos = null;
+          let casterOrientation = 0;
           
-          // Start idle animation if available (with full weight)
-          const idleAnim = animationGroups.find(ag => {
-            const name = ag.name ? ag.name.toLowerCase() : '';
-            return name.includes('idle') || name.includes('stand');
-          });
-          if (idleAnim) {
-            idleAnim.setWeightForAllAnimatables(1.0);
-            idleAnim.play(true); // Loop the animation
+          // First try: get from player meshes in scene (most reliable for 3D position)
+          if (scene.metadata && scene.metadata.playerMeshes) {
+            const playerMesh = scene.metadata.playerMeshes.get(castUserId);
+            if (playerMesh) {
+              // Handle both TransformNode containers and direct meshes
+              if (playerMesh.position) {
+                casterPos = new Vector3(
+                  playerMesh.position.x, 
+                  playerMesh.position.y || 0.5, // Default height if not set
+                  playerMesh.position.z
+                );
+                console.log(`Found caster position from player mesh: (${casterPos.x.toFixed(2)}, ${casterPos.y.toFixed(2)}, ${casterPos.z.toFixed(2)})`);
+              } else if (playerMesh.metadata && playerMesh.metadata.modelMesh && playerMesh.metadata.modelMesh.position) {
+                // Fallback: try to get from modelMesh if it's a container
+                const modelMesh = playerMesh.metadata.modelMesh;
+                casterPos = new Vector3(
+                  playerMesh.position.x || modelMesh.position.x,
+                  playerMesh.position.y || modelMesh.position.y || 0.5,
+                  playerMesh.position.z || modelMesh.position.z
+                );
+                console.log(`Found caster position from modelMesh: (${casterPos.x.toFixed(2)}, ${casterPos.y.toFixed(2)}, ${casterPos.z.toFixed(2)})`);
+              }
+            }
           }
-        }
-        
-        // Store metadata on the container
-        actualRoot.metadata = {
-          userId: player.userId,
-          username: player.username,
-          team: player.team,
-          characterId: player.characterId,
-          isMyTeam: isMyTeam,
-          modelMesh: modelRoot // Keep reference to actual model mesh
-        };
-        
-        return { root: actualRoot, animationGroups };
-      }
-    } catch (error) {
-      console.error(`Failed to load model for ${player.characterId}:`, error);
-      // Fallback to sphere if model fails to load
-      return createPlayerSphereFallback(player, isMyTeam, xPos, zPos);
-    }
-  };
-
-  // Fallback function to create a sphere if model loading fails
-  const createPlayerSphereFallback = (player, isMyTeam, xPos, zPos) => {
-    const sphere = MeshBuilder.CreateSphere(`player_${player.userId}`, {
-      diameter: 0.6,
-      segments: 16
-    }, scene);
-
-    sphere.position = new Vector3(xPos, 0.3, zPos);
-
-    const material = new StandardMaterial(`playerMaterial_${player.userId}`, scene);
-    if (isMyTeam) {
-      material.diffuseColor = new Color3(0.2, 0.6, 1.0);
-      material.emissiveColor = new Color3(0.1, 0.3, 0.5);
-    } else {
-      material.diffuseColor = new Color3(1.0, 0.3, 0.3);
-      material.emissiveColor = new Color3(0.5, 0.1, 0.1);
-    }
-    material.specularColor = new Color3(0.5, 0.5, 0.5);
-    sphere.material = material;
-
-    sphere.metadata = {
-      userId: player.userId,
-      username: player.username,
-      team: player.team,
-      characterId: player.characterId,
-      isMyTeam: isMyTeam
-    };
-
-    return { root: sphere, animationGroups: [] };
-  };
-
-
-  // Load all player models asynchronously
-  const loadPlayers = async () => {
-    const loadPromises = [];
-
-    // Add players from my team
-    if (gameState.myTeam && gameState.myTeam.players) {
-      Object.values(gameState.myTeam.players).forEach(player => {
-        if (player.position && player.position.x !== undefined && player.position.y !== undefined) {
-          loadPromises.push(
-            createPlayerModel(player, true).then(result => {
-              if (result) {
-                scene.metadata.playerMeshes.set(player.userId, result.root);
-                if (result.animationGroups.length > 0) {
-                  scene.metadata.playerAnimationGroups.set(player.userId, result.animationGroups[0]);
-                }
-              }
-            })
-          );
-        }
-      });
-    }
-
-    // Add players from enemy team (only if visible in current phase - not during preparation)
-    if (gameState.enemyTeam && gameState.enemyTeam.players && gameState.phase !== 'preparation') {
-      Object.values(gameState.enemyTeam.players).forEach(player => {
-        if (player.position && player.position.x !== undefined && player.position.y !== undefined) {
-          loadPromises.push(
-            createPlayerModel(player, false).then(result => {
-              if (result) {
-                scene.metadata.playerMeshes.set(player.userId, result.root);
-                if (result.animationGroups.length > 0) {
-                  scene.metadata.playerAnimationGroups.set(player.userId, result.animationGroups[0]);
-                }
-              }
-            })
-          );
-        }
-      });
-    }
-
-    await Promise.all(loadPromises);
-  };
-
-  // Start loading models
-  loadPlayers().catch(error => {
-    console.error('Error loading player models:', error);
-  });
-}
-
-/**
- * Update player character positions when game state changes
- * @param {Scene} scene - Babylon.js scene
- * @param {Object} gameState - Updated game state
- * @param {string} userId - Current user's ID
- * @param {number} mapWidth - Width of the map
- * @param {number} mapHeight - Height of the map
- */
-async function updatePlayerCharacters(scene, gameState, userId, mapWidth, mapHeight) {
-  if (!scene.metadata) {
-    scene.metadata = {};
-  }
-  
-  // Ensure all required maps exist
-  if (!scene.metadata.playerMeshes) {
-    scene.metadata.playerMeshes = new Map();
-  }
-  if (!scene.metadata.playerAnimationGroups) {
-    scene.metadata.playerAnimationGroups = new Map();
-  }
-  if (!scene.metadata.modelCache) {
-    scene.metadata.modelCache = new Map();
-  }
-  if (!scene.metadata.playerPreviousPositions) {
-    scene.metadata.playerPreviousPositions = new Map();
-  }
-  if (!scene.metadata.playerMovementAnimations) {
-    scene.metadata.playerMovementAnimations = new Map();
-  }
-
-  const tileSize = 1;
-
-  // Update or create player meshes
-  const allPlayers = [];
-  if (gameState.myTeam && gameState.myTeam.players) {
-    allPlayers.push(...Object.values(gameState.myTeam.players).map(p => ({ ...p, isMyTeam: true })));
-  }
-  // Only include enemy team if not in preparation phase
-  if (gameState.enemyTeam && gameState.enemyTeam.players && gameState.phase !== 'preparation') {
-    allPlayers.push(...Object.values(gameState.enemyTeam.players).map(p => ({ ...p, isMyTeam: false })));
-  }
-
-  const loadPromises = [];
-
-  allPlayers.forEach(player => {
-    if (!player.position || player.position.x === undefined || player.position.y === undefined) {
-      return;
-    }
-
-    // Ensure playerMeshes exists
-    if (!scene.metadata.playerMeshes) {
-      scene.metadata.playerMeshes = new Map();
-    }
-    
-    const existingMesh = scene.metadata.playerMeshes.get(player.userId);
-    const xPos = player.position.x * tileSize;
-    const zPos = player.position.y * tileSize;
-
-    // Check if player has moved (for animation)
-    const previousPos = scene.metadata.playerPreviousPositions.get(player.userId);
-    const hasMoved = !previousPos || 
-                     previousPos.x !== player.position.x || 
-                     previousPos.y !== player.position.y;
-    
-    if (existingMesh) {
-      // Check if this is a TransformNode container (new approach) or a direct mesh (old approach)
-      const isContainer = existingMesh instanceof TransformNode;
-      
-      // If player has moved, start movement animation
-      if (hasMoved && previousPos) {
-        const startX = previousPos.x;
-        const startY = previousPos.y;
-        const endX = player.position.x;
-        const endY = player.position.y;
-        const distance = Math.abs(endX - startX) + Math.abs(endY - startY);
-        
-        // Check if we have a pending movement path (from previsualization)
-        let path = [];
-        const pendingPath = scene.metadata.pendingMovementPaths?.get(player.userId);
-        
-        if (pendingPath && pendingPath.path && pendingPath.path.length > 0) {
-          // Use the previsualized path (it already includes the start position)
-          path = pendingPath.path.map(pos => ({ x: pos.x, y: pos.y }));
           
-          // Verify the path matches the actual movement
-          const pathStart = path[0];
-          const pathEnd = path[path.length - 1];
-          if (pathStart.x === startX && pathStart.y === startY && 
-              pathEnd.x === endX && pathEnd.y === endY) {
-            // Path is valid, use it
-            // Clear pending path after using it
-            scene.metadata.pendingMovementPaths.delete(player.userId);
-          } else {
-            // Path doesn't match, recalculate
-            path = [];
-          }
-        }
-        
-        // If no previsualized path or it doesn't match, calculate path
-        if (path.length === 0) {
-          if (scene.metadata && scene.metadata.terrain) {
-            // Get occupied tiles (excluding the moving player)
-            const occupiedTiles = new Set();
-            allPlayers.forEach(p => {
-              if (p.userId !== player.userId && p.position) {
-                occupiedTiles.add(`${p.position.x}_${p.position.y}`);
+          // Get game state for orientation and fallback position
+          const gameState = currentGameState || scene.metadata?.gameState;
+          let caster = null;
+          if (gameState) {
+            const myTeam = gameState.myTeam?.players;
+            const enemyTeam = gameState.enemyTeam?.players;
+            
+            if (myTeam) {
+              caster = Object.values(myTeam).find(p => p.userId === castUserId);
+            }
+            if (!caster && enemyTeam) {
+              caster = Object.values(enemyTeam).find(p => p.userId === castUserId);
+            }
+            
+            if (caster) {
+              // Get orientation
+              if (caster.orientation !== undefined) {
+                casterOrientation = caster.orientation;
               }
-            });
-            
-            // Use pathfinding to get the actual path
-            const calculatedPath = findPath(
-              scene.metadata.terrain,
-              startX,
-              startY,
-              endX,
-              endY,
-              occupiedTiles
-            );
-            
-            if (calculatedPath.length > 0) {
-              path = calculatedPath;
-            } else {
-              // Fallback to simple straight path if pathfinding fails
-              let currentX = startX;
-              let currentY = startY;
-              const dx = endX > startX ? 1 : (endX < startX ? -1 : 0);
-              const dy = endY > startY ? 1 : (endY < startY ? -1 : 0);
               
-              while (currentX !== endX || currentY !== endY) {
-                path.push({ x: currentX, y: currentY });
-                if (currentX !== endX) currentX += dx;
-                if (currentY !== endY) currentY += dy;
+              // Fallback: use game state position if mesh position not found
+              if (!casterPos && caster.position) {
+                casterPos = new Vector3(caster.position.x, 0.5, caster.position.y); // Y=0.5 for character height, map y->z
+                console.log(`Found caster position from gameState: (${caster.position.x}, ${caster.position.y})`);
               }
-              path.push({ x: endX, y: endY });
             }
-          } else {
-            // Fallback to simple straight path if terrain not available
-            let currentX = startX;
-            let currentY = startY;
-            const dx = endX > startX ? 1 : (endX < startX ? -1 : 0);
-            const dy = endY > startY ? 1 : (endY < startY ? -1 : 0);
-            
-            while (currentX !== endX || currentY !== endY) {
-              path.push({ x: currentX, y: currentY });
-              if (currentX !== endX) currentX += dx;
-              if (currentY !== endY) currentY += dy;
-            }
-            path.push({ x: endX, y: endY });
           }
-        }
-        
-        // Determine animation type (walk for 2 tiles or less, run for more)
-        const animationType = distance <= 2 ? 'walk' : 'run';
-        
-        // Start movement animation
-        startMovementAnimation(scene, player.userId, existingMesh, path, animationType, tileSize);
-      }
-      
-      // If it's not a container, we need to wrap it in one for proper rotation
-      if (!isContainer) {
-        console.log(`Wrapping existing mesh for player ${player.userId} in TransformNode container`);
-        const characterContainer = new TransformNode(`characterContainer_${player.userId}`, scene);
-        
-        // Get the model mesh (might be the existingMesh itself or a child)
-        const modelMesh = existingMesh.metadata?.modelMesh || existingMesh;
-        
-        // Calculate rotation based on team - ignore server orientation for now
-        let rotationY = 0;
-        if (player.team === 'A') {
-          rotationY = Math.PI / 2; // 90 degrees - face right (+X)
-        } else if (player.team === 'B') {
-          rotationY = 3 * Math.PI / 2; // 270 degrees - face left (-X)
-        }
-        
-        // TODO: Use orientation from game state when server-side orientation is fixed
-        // For now, always use team-based rotation
-        
-        // Set container position and rotation
-        characterContainer.position = new Vector3(xPos, existingMesh.position.y, zPos);
-        characterContainer.rotation.y = rotationY;
-        
-        // Parent the model to the container
-        modelMesh.parent = characterContainer;
-        modelMesh.position = Vector3.Zero();
-        modelMesh.rotation = Vector3.Zero();
-        
-        // Update metadata
-        characterContainer.metadata = existingMesh.metadata || {};
-        characterContainer.metadata.modelMesh = modelMesh;
-        
-        // Replace in the map
-        scene.metadata.playerMeshes.set(player.userId, characterContainer);
-        
-        console.log(`Wrapped player ${player.userId} (team ${player.team}) in container with rotation.y=${rotationY}`);
-      } else {
-        // It's already a container, just update position and rotation
-        if (existingMesh.position) {
-          existingMesh.position.x = xPos;
-          existingMesh.position.z = zPos;
-        }
-        
-        // Update orientation based on team - ignore server orientation for now
-        let rotationY = 0;
-        if (player.team === 'A') {
-          rotationY = Math.PI / 2; // 90 degrees - face right (+X)
-        } else if (player.team === 'B') {
-          rotationY = 3 * Math.PI / 2; // 270 degrees - face left (-X)
-        }
-        
-        // TODO: Use orientation from game state when server-side orientation is fixed
-        // For now, always use team-based rotation
-        
-        // Only update rotation if not animating (animation system handles rotation during movement)
-        const isAnimating = scene.metadata.playerMovementAnimations.has(player.userId) && 
-                           scene.metadata.playerMovementAnimations.get(player.userId).isAnimating;
-        
-        if (!isAnimating) {
-          // Don't update rotation - it should stay as it was set during movement animation
-          // The rotation from the last movement step is preserved
-        }
-      }
-    } else {
-      // Create new model if it doesn't exist
-      const getModelPath = (characterClass) => {
-        const classId = characterClass?.toLowerCase() || 'warrior';
-        const validClasses = ['assassin', 'warrior', 'archer', 'mage'];
-        const normalizedClass = validClasses.includes(classId) ? classId : 'warrior';
-        return `/models/${normalizedClass}/master.glb`;
-      };
-
-      const createPlayerModel = async () => {
-        const modelPath = getModelPath(player.characterClass);
-        
-        try {
-          let modelRoot = null;
-          let animationGroups = [];
           
-          if (scene.metadata.modelCache.has(modelPath)) {
-            const cached = scene.metadata.modelCache.get(modelPath);
-            modelRoot = cached.root.clone(`player_${player.userId}`);
-            animationGroups = cached.animationGroups.map(ag => ag.clone(`anim_${player.userId}_${ag.name}`));
+          if (casterPos && (Math.abs(casterPos.x) > 0.01 || Math.abs(casterPos.z) > 0.01)) {
+            // Calculate spawn position in front of caster (0.3 units forward at character height)
+            const spawnOffset = 0.3;
+            // In Babylon.js: orientation 0 = +Z, PI/2 = +X, PI = -Z, -PI/2 = -X
+            // So cos(orientation) gives X direction, sin(orientation) gives Z direction
+            const spawnX = casterPos.x + Math.cos(casterOrientation) * spawnOffset;
+            const spawnZ = casterPos.z + Math.sin(casterOrientation) * spawnOffset;
+            const spawnY = casterPos.y + 0.3; // Slightly above character center
+            const spawnPos = new Vector3(spawnX, spawnY, spawnZ);
+            
+            // Convert target grid coordinates to world coordinates
+            // tileSize is 1 in Babylon.js, so grid coordinates = world coordinates
+            // But ensure we're using the correct coordinate system: game y -> Babylon z
+            const tileSize = 1; // Babylon.js uses 1 unit per tile
+            const targetWorldX = targetX * tileSize;
+            const targetWorldZ = targetY * tileSize; // game y maps to Babylon z
+            const targetPos = new Vector3(targetWorldX, 0.3, targetWorldZ); // Target at same height
+            console.log(`Playing VFX for spell ${spellId}: spawn at (${spawnPos.x.toFixed(2)}, ${spawnPos.y.toFixed(2)}, ${spawnPos.z.toFixed(2)}), target at (${targetPos.x.toFixed(2)}, ${targetPos.z.toFixed(2)}), orientation: ${casterOrientation.toFixed(2)}`);
+            playSpellVfx(scene, spellDef, spawnPos, targetPos, castStartTime);
           } else {
-            const result = await SceneLoader.ImportMeshAsync('', modelPath, '', scene);
-            modelRoot = result.meshes[0];
-            animationGroups = result.animationGroups || [];
-            scene.metadata.modelCache.set(modelPath, {
-              root: modelRoot,
-              animationGroups: animationGroups
-            });
-          }
-
-          if (modelRoot) {
-            const boundingInfo = modelRoot.getBoundingInfo();
-            const size = boundingInfo.boundingBox.extendSize;
-            modelRoot.position = new Vector3(xPos, size.y, zPos);
-            const scale = 0.8; // Increased from 0.5 to make models bigger
-            modelRoot.scaling = new Vector3(scale, scale, scale);
-            
-            // Create container for rotation
-            const characterContainer = new TransformNode(`characterContainer_${player.userId}`, scene);
-            
-            // Calculate rotation based on team - ignore server orientation for now
-            let rotationY = 0;
-            if (player.team === 'A') {
-              rotationY = Math.PI / 2; // 90 degrees - face right (+X)
-            } else if (player.team === 'B') {
-              rotationY = 3 * Math.PI / 2; // 270 degrees - face left (-X)
+            console.error(`Could not find valid caster position for VFX: ${castUserId}. Position: ${casterPos ? `(${casterPos.x}, ${casterPos.y}, ${casterPos.z})` : 'null'}. GameState: ${!!gameState}, Player meshes: ${!!(scene.metadata && scene.metadata.playerMeshes)}`);
+            if (scene.metadata && scene.metadata.playerMeshes) {
+              console.log('Available player meshes:', Array.from(scene.metadata.playerMeshes.keys()));
             }
-            
-            // TODO: Use orientation from game state when server-side orientation is fixed
-            // For now, always use team-based rotation
-            
-            console.log(`Rotating player ${player.userId} (team ${player.team}): rotation.y=${rotationY} radians (${(rotationY * 180 / Math.PI).toFixed(1)} degrees)`);
-            
-            // Apply rotation to container
-            characterContainer.rotation.y = rotationY;
-            characterContainer.position = new Vector3(xPos, size.y, zPos);
-            
-            // Parent model to container
-            modelRoot.parent = characterContainer;
-            modelRoot.position = Vector3.Zero();
-            modelRoot.rotation = Vector3.Zero();
-            
-            // Use container as root
-            const actualRoot = characterContainer;
-            
-            // Use original model materials - no team color tinting
-            
-            // Store all animation groups for this player
-            if (animationGroups.length > 0) {
-              // Store all animation groups in a map for easy access
-              const animMap = new Map();
-              animationGroups.forEach(ag => {
-                const animName = ag.name ? ag.name.toLowerCase() : '';
-                animMap.set(animName, ag);
-              });
-              scene.metadata.playerAnimationGroups.set(player.userId, animMap);
-              
-              // Start idle animation if available (with full weight)
-              const idleAnim = animationGroups.find(ag => {
-                const name = ag.name ? ag.name.toLowerCase() : '';
-                return name.includes('idle') || name.includes('stand');
-              });
-              if (idleAnim) {
-                idleAnim.setWeightForAllAnimatables(1.0);
-                idleAnim.play(true);
-              }
-            }
-            
-            actualRoot.metadata = {
-              userId: player.userId,
-              username: player.username,
-              team: player.team,
-              characterId: player.characterId,
-              isMyTeam: player.isMyTeam,
-              modelMesh: modelRoot
-            };
-            
-            scene.metadata.playerMeshes.set(player.userId, actualRoot);
           }
-        } catch (error) {
-          console.error(`Failed to load model for ${player.characterId}:`, error);
-          // Fallback to sphere
-          const sphere = MeshBuilder.CreateSphere(`player_${player.userId}`, {
-            diameter: 0.6,
-            segments: 16
-          }, scene);
-          sphere.position = new Vector3(xPos, 0.3, zPos);
-          const material = new StandardMaterial(`playerMaterial_${player.userId}`, scene);
-          material.diffuseColor = player.isMyTeam ? new Color3(0.2, 0.6, 1.0) : new Color3(1.0, 0.3, 0.3);
-          sphere.material = material;
-          sphere.metadata = {
-            userId: player.userId,
-            username: player.username,
-            team: player.team,
-            characterId: player.characterId,
-            isMyTeam: player.isMyTeam
-          };
-          scene.metadata.playerMeshes.set(player.userId, sphere);
-        }
-      };
-
-      loadPromises.push(createPlayerModel());
-    }
-  });
-
-  await Promise.all(loadPromises);
-  
-  // Update previous positions for movement detection
-  if (!scene.metadata.playerPreviousPositions) {
-    scene.metadata.playerPreviousPositions = new Map();
-  }
-  allPlayers.forEach(player => {
-    if (player.position && player.position.x !== undefined && player.position.y !== undefined) {
-      scene.metadata.playerPreviousPositions.set(player.userId, { 
-        x: player.position.x, 
-        y: player.position.y 
-      });
-    }
-  });
-
-  // Remove meshes for players that are no longer in the game
-  const currentPlayerIds = new Set(allPlayers.map(p => p.userId));
-  scene.metadata.playerMeshes.forEach((mesh, userId) => {
-    if (!currentPlayerIds.has(userId)) {
-      if (mesh.rootMesh) {
-        mesh.rootMesh.dispose();
-      } else {
-        mesh.dispose();
-      }
-      scene.metadata.playerMeshes.delete(userId);
-      
-      // Dispose animation groups
-      const animGroup = scene.metadata.playerAnimationGroups.get(userId);
-      if (animGroup) {
-        if (animGroup instanceof Map) {
-          // Dispose all animation groups in the map
-          animGroup.forEach(anim => {
-            if (anim && typeof anim.dispose === 'function') {
-              anim.dispose();
-            }
-          });
-        } else if (typeof animGroup.dispose === 'function') {
-          animGroup.dispose();
-        }
-        scene.metadata.playerAnimationGroups.delete(userId);
-      }
-      
-      // Clean up movement animation tracking
-      if (scene.metadata.playerPreviousPositions) {
-        scene.metadata.playerPreviousPositions.delete(userId);
-      }
-      if (scene.metadata.playerMovementAnimations) {
-        scene.metadata.playerMovementAnimations.delete(userId);
-      }
-    }
-  });
-}
-
-/**
- * Start movement animation for a character
- * @param {Scene} scene - Babylon.js scene
- * @param {string} userId - Player's user ID
- * @param {TransformNode|Mesh} characterMesh - Character mesh or container
- * @param {Array<{x: number, y: number}>} path - Path to follow
- * @param {string} animationType - 'walk' or 'run'
- * @param {number} tileSize - Size of each tile
- */
-function startMovementAnimation(scene, userId, characterMesh, path, animationType, tileSize) {
-  // Ensure metadata exists
-  if (!scene.metadata) {
-    scene.metadata = {};
-  }
-  if (!scene.metadata.playerMovementAnimations) {
-    scene.metadata.playerMovementAnimations = new Map();
-  }
-  
-  // Stop any existing movement animation and reset weights
-  const playerMovementAnimations = scene.metadata.playerMovementAnimations;
-  const existingAnim = playerMovementAnimations.get(userId);
-  if (existingAnim && existingAnim.isAnimating) {
-    // Reset weights before stopping
-    if (existingAnim.movementAnim) {
-      existingAnim.movementAnim.setWeightForAllAnimatables(0.0);
-      existingAnim.movementAnim.stop();
-    }
-    if (existingAnim.idleAnim) {
-      existingAnim.idleAnim.setWeightForAllAnimatables(1.0);
-    }
-    existingAnim.isAnimating = false;
-  }
-  
-  // Find animation groups for this player
-  // Animation groups are stored in scene metadata as a Map
-  let movementAnim = null;
-  
-  if (scene.metadata && scene.metadata.playerAnimationGroups) {
-    const playerAnims = scene.metadata.playerAnimationGroups.get(userId);
-    if (playerAnims instanceof Map) {
-      // Search for walk or run animation
-      for (const [animName, anim] of playerAnims) {
-        if (animName.includes(animationType) || 
-            (animationType === 'walk' && animName.includes('walk')) ||
-            (animationType === 'run' && animName.includes('run'))) {
-          movementAnim = anim;
-          break;
-        }
-      }
-    } else if (playerAnims) {
-      // Fallback: if stored as single animation group, check its name
-      const animName = playerAnims.name ? playerAnims.name.toLowerCase() : '';
-      if (animName.includes(animationType) || 
-          (animationType === 'walk' && animName.includes('walk')) ||
-          (animationType === 'run' && animName.includes('run'))) {
-        movementAnim = playerAnims;
-      }
-    }
-  }
-  
-  // If still not found, search all animation groups in the scene
-  if (!movementAnim && scene.animationGroups) {
-    for (const ag of scene.animationGroups) {
-      const animName = ag.name ? ag.name.toLowerCase() : '';
-      if (animName.includes(animationType) || 
-          (animationType === 'walk' && animName.includes('walk')) ||
-          (animationType === 'run' && animName.includes('run'))) {
-        movementAnim = ag;
-        break;
-      }
-    }
-  }
-  
-  // Animation timing
-  const timePerTile = animationType === 'walk' ? 0.5 : 0.3; // seconds per tile
-  const totalDuration = path.length * timePerTile;
-  
-  // Find idle animation for smooth transition
-  let idleAnim = null;
-  if (scene.metadata && scene.metadata.playerAnimationGroups) {
-    const playerAnims = scene.metadata.playerAnimationGroups.get(userId);
-    if (playerAnims instanceof Map) {
-      for (const [animName, anim] of playerAnims) {
-        if (animName.includes('idle') || animName.includes('stand')) {
-          idleAnim = anim;
-          break;
-        }
-      }
-    }
-  }
-  
-  // Store animation state
-  const animState = {
-    isAnimating: true,
-    animationType: animationType,
-    startTime: Date.now(),
-    path: path,
-    currentStep: 0,
-    characterMesh: characterMesh,
-    movementAnim: movementAnim,
-    idleAnim: idleAnim,
-    timePerTile: timePerTile,
-    transitionStartTime: null, // Will be set when starting transition
-    isTransitioning: false
-  };
-  
-  // Start movement animation with full weight
-  if (movementAnim) {
-    movementAnim.setWeightForAllAnimatables(1.0);
-    movementAnim.play(true);
-  }
-  
-  // Prepare idle animation for transition (start with weight 0)
-  if (idleAnim) {
-    idleAnim.setWeightForAllAnimatables(0.0);
-    idleAnim.play(true);
-  }
-  
-  playerMovementAnimations.set(userId, animState);
-}
-
-/**
- * Update movement animations in the render loop
- * @param {Scene} scene - Babylon.js scene
- */
-function updateMovementAnimations(scene) {
-  if (!scene.metadata || !scene.metadata.playerMovementAnimations) {
-    return;
-  }
-  
-  const playerMovementAnimations = scene.metadata.playerMovementAnimations;
-  const currentTime = Date.now();
-  
-  playerMovementAnimations.forEach((animState, userId) => {
-    if (!animState.isAnimating) return;
-    
-    const elapsed = (currentTime - animState.startTime) / 1000; // Convert to seconds
-    const totalDuration = animState.path.length * animState.timePerTile;
-    const transitionDuration = 0.3; // 300ms transition
-    // Different transition timing for walk vs run
-    const transitionStartOffset = animState.animationType === 'run' ? 0.1 : 0.2; // Run: 100ms, Walk: 200ms before movement completes
-    const transitionStartTime = totalDuration - transitionDuration - transitionStartOffset; // Start transition earlier
-    
-    // Start transition early (ease-out effect)
-    if (elapsed >= transitionStartTime && !animState.isTransitioning) {
-      animState.isTransitioning = true;
-      animState.transitionStartTime = currentTime - (elapsed - transitionStartTime) * 1000; // Adjust for smooth start
-    }
-    
-    // Handle smooth transition between movement and idle animations
-    if (animState.isTransitioning) {
-      const transitionElapsed = (currentTime - animState.transitionStartTime) / 1000;
-      
-      if (transitionElapsed < transitionDuration) {
-        // Ease-out function for smoother transition (easeOutQuad)
-        const t = transitionElapsed / transitionDuration;
-        const easeOutProgress = 1 - (1 - t) * (1 - t); // Quadratic ease-out
-        
-        // Blend between movement and idle animations
-        const movementWeight = 1.0 - easeOutProgress;
-        const idleWeight = easeOutProgress;
-        
-        if (animState.movementAnim) {
-          animState.movementAnim.setWeightForAllAnimatables(movementWeight);
-        }
-        if (animState.idleAnim) {
-          animState.idleAnim.setWeightForAllAnimatables(idleWeight);
-        }
-      } else {
-        // Transition complete - ensure weights are set correctly
-        if (animState.movementAnim) {
-          animState.movementAnim.setWeightForAllAnimatables(0.0);
-        }
-        if (animState.idleAnim) {
-          animState.idleAnim.setWeightForAllAnimatables(1.0);
-        }
-      }
-    }
-    
-    // Check if movement is complete
-    if (elapsed >= totalDuration) {
-      // Set final position
-      const finalPos = animState.path[animState.path.length - 1];
-      if (animState.characterMesh instanceof TransformNode) {
-        animState.characterMesh.position.x = finalPos.x * 1; // tileSize = 1
-        animState.characterMesh.position.z = finalPos.y * 1;
-      } else {
-        animState.characterMesh.position.x = finalPos.x * 1;
-        animState.characterMesh.position.z = finalPos.y * 1;
-      }
-      
-      // Stop movement animation if transition is complete
-      if (animState.isTransitioning) {
-        const transitionElapsed = (currentTime - animState.transitionStartTime) / 1000;
-        if (transitionElapsed >= transitionDuration) {
-          if (animState.movementAnim) {
-            animState.movementAnim.stop();
-          }
-          // Animation complete
-          animState.isAnimating = false;
-          animState.isTransitioning = false;
-        }
-      } else {
-        // If transition didn't start (very short movement), stop immediately
-        if (animState.movementAnim) {
-          animState.movementAnim.setWeightForAllAnimatables(0.0);
-          animState.movementAnim.stop();
-        }
-        if (animState.idleAnim) {
-          animState.idleAnim.setWeightForAllAnimatables(1.0);
-        }
-        animState.isAnimating = false;
-      }
-      
-      // Keep the final rotation from the last movement step
-      // Don't change rotation - it should stay as it was during movement
-      
-      return;
-    }
-    
-    // Calculate current step in path
-    const currentStep = Math.floor(elapsed / animState.timePerTile);
-    const stepProgress = (elapsed % animState.timePerTile) / animState.timePerTile;
-    
-    if (currentStep < animState.path.length - 1) {
-      // Interpolate between current and next step
-      const currentPos = animState.path[currentStep];
-      const nextPos = animState.path[currentStep + 1];
-      
-      const x = currentPos.x + (nextPos.x - currentPos.x) * stepProgress;
-      const y = currentPos.y + (nextPos.y - currentPos.y) * stepProgress;
-      
-      // Update position
-      if (animState.characterMesh instanceof TransformNode) {
-        animState.characterMesh.position.x = x * 1; // tileSize = 1
-        animState.characterMesh.position.z = y * 1;
-      } else {
-        animState.characterMesh.position.x = x * 1;
-        animState.characterMesh.position.z = y * 1;
-      }
-      
-      // Rotate character to face movement direction
-      const dx = nextPos.x - currentPos.x;
-      const dy = nextPos.y - currentPos.y;
-      if (dx !== 0 || dy !== 0) {
-        // Calculate rotation angle based on movement direction
-        // In our coordinate system:
-        // - X increases to the right
-        // - Y increases downward (in map coordinates, but Z increases in 3D)
-        // - Models face +Z by default (forward)
-        // 
-        // Movement directions:
-        // - Moving right (+X): rotation.y = PI/2 (90 degrees)
-        // - Moving left (-X): rotation.y = -PI/2 or 3*PI/2 (270 degrees)
-        // - Moving down (+Y, which is +Z in 3D): rotation.y = 0 (forward)
-        // - Moving up (-Y, which is -Z in 3D): rotation.y = PI (180 degrees)
-        
-        let targetAngle = 0;
-        if (dx > 0) {
-          // Moving right (+X)
-          targetAngle = Math.PI / 2;
-        } else if (dx < 0) {
-          // Moving left (-X)
-          targetAngle = -Math.PI / 2;
-        } else if (dy > 0) {
-          // Moving down (+Y, forward in Z)
-          targetAngle = 0;
-        } else if (dy < 0) {
-          // Moving up (-Y, backward in Z)
-          targetAngle = Math.PI;
-        }
-        
-        // Normalize to [0, 2*PI] range
-        while (targetAngle < 0) targetAngle += 2 * Math.PI;
-        while (targetAngle >= 2 * Math.PI) targetAngle -= 2 * Math.PI;
-        
-        // Smoothly rotate to the new angle
-        const currentRotation = animState.characterMesh.rotation.y;
-        
-        // Calculate shortest rotation path
-        let rotationDiff = targetAngle - currentRotation;
-        if (rotationDiff > Math.PI) rotationDiff -= 2 * Math.PI;
-        if (rotationDiff < -Math.PI) rotationDiff += 2 * Math.PI;
-        
-        // Smooth rotation with lerp (faster rotation for more responsive feel)
-        const rotationLerp = 0.5; // Higher = faster rotation
-        const newRotation = currentRotation + rotationDiff * rotationLerp;
-        
-        if (animState.characterMesh instanceof TransformNode) {
-          animState.characterMesh.rotation.y = newRotation;
         } else {
-          animState.characterMesh.rotation.y = newRotation;
+          if (!spellDef) {
+            console.warn(`No spell definition provided for VFX: ${spellId}`);
+          } else if (!spellDef.presentation) {
+            console.warn(`No presentation data in spell definition for: ${spellId}`);
+          } else if (targetX === null || targetY === null) {
+            console.warn(`Target coordinates missing: targetX=${targetX}, targetY=${targetY}`);
+          }
         }
+      } else {
+        console.warn(`Cannot play cast animation: cast animation definition not provided for spell "${spellId}"`);
       }
-      
-      animState.currentStep = currentStep;
+    },
+    playSpellPrepAnimation: (prepUserId, spellId, prepAnimDef) => {
+      // Play stance animation for any player (for observers)
+      if (prepAnimDef) {
+        startStanceAnimation(scene, prepUserId, prepAnimDef);
+      } else {
+        console.warn(`Cannot play prep animation: prep animation definition not provided for spell "${spellId}"`);
+      }
+    },
+    stopSpellPrepAnimation: (prepUserId) => {
+      // Stop stance animation for any player (for observers)
+      stopStanceAnimation(scene, prepUserId);
+    },
+    playHitAnimation: (targetUserId) => {
+      // Play hit animation for any player (for observers)
+      playHitAnimation(scene, targetUserId);
     }
-  });
+  };
 }
+
+// build3DMap moved to babylon/babylonMap.js
+
+// buildPlayerCharacters moved to babylon/babylonPlayers.js
+
+// updatePlayerCharacters moved to babylon/babylonPlayers.js
+// Animation functions (startMovementAnimation, startStanceAnimation, stopStanceAnimation, 
+// blendAnimations, updateMovementAnimations) are imported from './babylon/babylonAnimations'
+
+
+
 
 /**
  * Cleanup function to dispose of Babylon.js resources
@@ -1827,7 +1186,7 @@ export function disposeBabylonScene({ engine, scene, camera, handleResize }) {
   if (camera) {
     // Detach camera controls if the method exists
     if (typeof camera.detachControls === 'function') {
-      camera.detachControls();
+    camera.detachControls();
     } else if (camera.inputs && typeof camera.inputs.removeByType === 'function') {
       // Alternative method for some Babylon.js versions
       camera.inputs.removeByType('ArcRotateCameraPointersInput');

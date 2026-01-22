@@ -6,6 +6,8 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { SpellDefs, getSpell, validateSpellForCaster } from '../config/spelldefs.js';
+import { gameData } from '../config/classes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -46,8 +48,12 @@ class PlayerState extends Schema {
     this.health = 100;
     this.maxHealth = 100;
     this.ready = false; // For preparation phase
-    this.movementPoints = 0; // Total movement points available
+    this.movementPoints = 0; // Total movement points available (can exceed max during turn)
+    this.maxMovementPoints = 0; // Maximum movement points (base value from character class)
     this.usedMovementPoints = 0; // Movement points used this turn
+    this.movementPath = ''; // JSON string array of path coordinates [{x, y}, ...]
+    this.energy = 0; // Current energy
+    this.maxEnergy = 0; // Maximum energy
   }
 }
 
@@ -65,7 +71,11 @@ defineTypes(PlayerState, {
   maxHealth: 'number',
   ready: 'boolean',
   movementPoints: 'number',
-  usedMovementPoints: 'number'
+  maxMovementPoints: 'number',
+  usedMovementPoints: 'number',
+  movementPath: 'string', // JSON string array of path coordinates
+  energy: 'number',
+  maxEnergy: 'number'
 });
 
 class TeamState extends Schema {
@@ -125,6 +135,142 @@ defineTypes(GameState, {
   stats: 'string' // Will be serialized as JSON string
 });
 
+// TILE_TYPES constants (matching client)
+const TILE_TYPES = {
+  NONE: 0,
+  TILE: 1,
+  WALL: 2
+};
+
+/**
+ * A* pathfinding algorithm for grid movement (server-side)
+ * Simplified version without preferred path support
+ */
+function findPath(terrain, startX, startY, endX, endY, occupiedTiles = new Set()) {
+  const mapHeight = terrain.length;
+  const mapWidth = terrain[0]?.length || 0;
+  
+  // Check if coordinates are valid
+  if (startX < 0 || startX >= mapWidth || startY < 0 || startY >= mapHeight) {
+    return [];
+  }
+  if (endX < 0 || endX >= mapWidth || endY < 0 || endY >= mapHeight) {
+    return [];
+  }
+  
+  // Check if start and end are walkable
+  if (terrain[startY][startX] !== TILE_TYPES.TILE) {
+    return [];
+  }
+  if (terrain[endY][endX] !== TILE_TYPES.TILE) {
+    return [];
+  }
+  
+  // Check if end tile is occupied
+  const endKey = `${endX}_${endY}`;
+  if (occupiedTiles.has(endKey)) {
+    return [];
+  }
+  
+  // A* algorithm
+  const startKey = `${startX}_${startY}`;
+  const openSet = [{ x: startX, y: startY, g: 0, h: Math.abs(endX - startX) + Math.abs(endY - startY), f: 0 }];
+  const closedSet = new Set();
+  const cameFrom = new Map();
+  const gScore = new Map();
+  const fScore = new Map();
+  
+  gScore.set(startKey, 0);
+  fScore.set(startKey, Math.abs(endX - startX) + Math.abs(endY - startY));
+  
+  const neighbors = [
+    { x: 0, y: -1 }, // up
+    { x: 1, y: 0 },  // right
+    { x: 0, y: 1 },  // down
+    { x: -1, y: 0 }  // left
+  ];
+  
+  while (openSet.length > 0) {
+    // Sort by f score
+    openSet.sort((a, b) => a.f - b.f);
+    const current = openSet.shift();
+    const currentKey = `${current.x}_${current.y}`;
+    
+    if (current.x === endX && current.y === endY) {
+      // Reconstruct path
+      const path = [];
+      let node = { x: endX, y: endY };
+      path.push({ x: node.x, y: node.y });
+      
+      while (cameFrom.has(`${node.x}_${node.y}`)) {
+        node = cameFrom.get(`${node.x}_${node.y}`);
+        path.unshift({ x: node.x, y: node.y });
+      }
+      
+      return path;
+    }
+    
+    closedSet.add(currentKey);
+    
+    for (const dir of neighbors) {
+      const neighbor = { x: current.x + dir.x, y: current.y + dir.y };
+      const neighborKey = `${neighbor.x}_${neighbor.y}`;
+      
+      // Skip if out of bounds
+      if (neighbor.x < 0 || neighbor.x >= mapWidth || neighbor.y < 0 || neighbor.y >= mapHeight) {
+        continue;
+      }
+      
+      // Skip if not walkable
+      if (terrain[neighbor.y][neighbor.x] !== TILE_TYPES.TILE) {
+        continue;
+      }
+      
+      // Skip if occupied (except start position)
+      if (neighborKey !== startKey && occupiedTiles.has(neighborKey)) {
+        continue;
+      }
+      
+      // Skip if already evaluated
+      if (closedSet.has(neighborKey)) {
+        continue;
+      }
+      
+      // Calculate tentative g score
+      const tentativeG = gScore.get(currentKey) + 1;
+      
+      // Check if this path is better
+      const neighborG = gScore.get(neighborKey);
+      if (!neighborG || tentativeG < neighborG) {
+        cameFrom.set(neighborKey, current);
+        gScore.set(neighborKey, tentativeG);
+        const h = Math.abs(neighbor.x - endX) + Math.abs(neighbor.y - endY);
+        fScore.set(neighborKey, tentativeG + h);
+        
+        // Add to open set if not already there
+        const existing = openSet.find(n => n.x === neighbor.x && n.y === neighbor.y);
+        if (!existing) {
+          openSet.push({ 
+            x: neighbor.x, 
+            y: neighbor.y, 
+            g: tentativeG, 
+            h: h, 
+            f: tentativeG + h
+          });
+        } else {
+          // Update existing node
+          existing.g = tentativeG;
+          existing.h = h;
+          existing.f = tentativeG + h;
+        }
+      }
+    }
+  }
+  
+  // No path found
+  return [];
+}
+
 export class GameRoom extends Room {
   // Map to store user sessions: userId -> Set of sessionIds
   userSessions = new Map();
@@ -135,6 +281,8 @@ export class GameRoom extends Room {
   preparationDuration = 30000; // 30 seconds
   // Game phase tracking
   gameStartTime = null;
+  // Terrain data for pathfinding
+  terrain = null;
 
   async onCreate(options) {
     console.log('GameRoom created:', options.matchId);
@@ -178,6 +326,8 @@ export class GameRoom extends Room {
         const mapData = await readFile(mapPath, 'utf-8');
         const map = JSON.parse(mapData);
         startZones = map.startZones || null;
+        // Store terrain for pathfinding
+        this.terrain = map.terrain || null;
       } catch (error) {
         console.error('Failed to load map data:', error);
       }
@@ -202,6 +352,18 @@ export class GameRoom extends Room {
 
     this.onMessage('requestMovement', (client, message) => {
       this.handleMovementRequest(client, message);
+    });
+
+    this.onMessage('requestSpellCast', (client, message) => {
+      this.handleSpellCast(client, message);
+    });
+
+    this.onMessage('requestSpellPrep', (client, message) => {
+      this.handleSpellPrep(client, message);
+    });
+
+    this.onMessage('requestSpellPrepCancel', (client, message) => {
+      this.handleSpellPrepCancel(client, message);
     });
 
     this.onMessage('playerAction', (client, message) => {
@@ -236,9 +398,14 @@ export class GameRoom extends Room {
       const teamState = team === 'A' ? this.state.teamA : this.state.teamB;
       const player = teamState.players.get(userId);
       
-      if (player && (!player.characterClass || !player.spellLoadout || player.spellLoadout === '[]')) {
-        // Player exists but missing character data - fetch and restore it
-        await this.restorePlayerCharacterData(player, userId);
+      if (player) {
+        // Always ensure characterClass is set - restore if missing
+        if (!player.characterClass || !player.spellLoadout || player.spellLoadout === '[]') {
+          console.log(`Player ${userId} missing character data, restoring...`);
+          await this.restorePlayerCharacterData(player, userId);
+        }
+        // Log character data for debugging
+        console.log(`Player ${userId} characterClass: ${player.characterClass}, characterId: ${player.characterId}`);
       }
     } else {
       // Player not in any team - might be a rejoin after room was created
@@ -315,7 +482,9 @@ export class GameRoom extends Room {
           player.characterName = memberData.characterName || '';
           player.characterClass = memberData.characterClass;
           player.spellLoadout = memberData.spellLoadout;
-          console.log(`Restored character data for ${userId} from match data`);
+          console.log(`Restored character data for ${userId} from match data: class=${player.characterClass}`);
+          // Broadcast updated state to all clients
+          this.broadcastFilteredState();
           return;
         }
       }
@@ -330,12 +499,12 @@ export class GameRoom extends Room {
       if (characterData) {
         player.characterClass = characterData.classId || '';
         player.spellLoadout = JSON.stringify(characterData.spellLoadout || []);
-        console.log(`Restored character data for ${userId} from database`);
+        console.log(`Restored character data for ${userId} from database: class=${player.characterClass}, characterId=${player.characterId}`);
         
         // Broadcast updated state to all clients
         this.broadcastFilteredState();
       } else {
-        console.warn(`Could not restore character data for ${userId} - character not found`);
+        console.warn(`Could not restore character data for ${userId} - character not found. characterId=${player.characterId}`);
       }
     } catch (error) {
       console.error(`Error restoring character data for ${userId}:`, error);
@@ -377,8 +546,12 @@ export class GameRoom extends Room {
       player.spellLoadout = member.spellLoadout || '[]'; // JSON string array
       
       // If character data is missing, fetch it from database
-      if (player.characterId && (!player.characterClass || !player.spellLoadout || player.spellLoadout === '[]')) {
+      // Check for empty string as well as falsy values
+      if (player.characterId && (!player.characterClass || player.characterClass === '' || !player.spellLoadout || player.spellLoadout === '[]')) {
+        console.log(`Initializing Team A: Player ${member.id} missing character data, restoring...`);
         await this.restorePlayerCharacterData(player, member.id, member);
+      } else {
+        console.log(`Initializing Team A: Player ${member.id} has characterClass=${player.characterClass}, characterId=${player.characterId}`);
       }
       
       this.state.teamA.players.set(member.id, player);
@@ -398,8 +571,12 @@ export class GameRoom extends Room {
       player.spellLoadout = member.spellLoadout || '[]'; // JSON string array
       
       // If character data is missing, fetch it from database
-      if (player.characterId && (!player.characterClass || !player.spellLoadout || player.spellLoadout === '[]')) {
+      // Check for empty string as well as falsy values
+      if (player.characterId && (!player.characterClass || player.characterClass === '' || !player.spellLoadout || player.spellLoadout === '[]')) {
+        console.log(`Initializing Team B: Player ${member.id} missing character data, restoring...`);
         await this.restorePlayerCharacterData(player, member.id, member);
+      } else {
+        console.log(`Initializing Team B: Player ${member.id} has characterClass=${player.characterClass}, characterId=${player.characterId}`);
       }
       
       this.state.teamB.players.set(member.id, player);
@@ -525,6 +702,7 @@ export class GameRoom extends Room {
 
     // Initialize movement points for all players
     this.initializeMovementPoints();
+    this.initializeEnergy();
 
     // Set the first player's turn (alternate between teams)
     this.initializeTurnOrder();
@@ -540,26 +718,59 @@ export class GameRoom extends Room {
    * Initialize movement points for all players based on their character class
    */
   initializeMovementPoints() {
-    // Default movement points by class (can be customized)
-    const movementPointsByClass = {
-      'assassin': 6,
-      'warrior': 3,
-      'archer': 4,
-      'mage': 3
-    };
-
     // Set movement points for Team A
     this.state.teamA.players.forEach((player, userId) => {
-      const defaultMP = movementPointsByClass[player.characterClass?.toLowerCase()] || 3;
+      const classData = gameData.classes[player.characterClass?.toLowerCase()];
+      const defaultMP = classData?.baseStats?.movement || 3;
       player.movementPoints = defaultMP;
+      player.maxMovementPoints = defaultMP;
       player.usedMovementPoints = 0;
     });
 
     // Set movement points for Team B
     this.state.teamB.players.forEach((player, userId) => {
-      const defaultMP = movementPointsByClass[player.characterClass?.toLowerCase()] || 3;
+      const classData = gameData.classes[player.characterClass?.toLowerCase()];
+      const defaultMP = classData?.baseStats?.movement || 3;
       player.movementPoints = defaultMP;
+      player.maxMovementPoints = defaultMP;
       player.usedMovementPoints = 0;
+    });
+  }
+
+  /**
+   * Initialize energy and health for all players based on their character class
+   */
+  initializeEnergy() {
+    // Set energy and health for Team A
+    this.state.teamA.players.forEach((player, userId) => {
+      const classData = gameData.classes[player.characterClass?.toLowerCase()];
+      if (classData?.baseStats) {
+        player.energy = classData.baseStats.energy || 5;
+        player.maxEnergy = classData.baseStats.energy || 5;
+        player.health = classData.baseStats.hp || 20;
+        player.maxHealth = classData.baseStats.hp || 20;
+      } else {
+        player.energy = 5;
+        player.maxEnergy = 5;
+        player.health = 20;
+        player.maxHealth = 20;
+      }
+    });
+
+    // Set energy and health for Team B
+    this.state.teamB.players.forEach((player, userId) => {
+      const classData = gameData.classes[player.characterClass?.toLowerCase()];
+      if (classData?.baseStats) {
+        player.energy = classData.baseStats.energy || 5;
+        player.maxEnergy = classData.baseStats.energy || 5;
+        player.health = classData.baseStats.hp || 20;
+        player.maxHealth = classData.baseStats.hp || 20;
+      } else {
+        player.energy = 5;
+        player.maxEnergy = 5;
+        player.health = 20;
+        player.maxHealth = 20;
+      }
     });
   }
 
@@ -820,13 +1031,19 @@ export class GameRoom extends Room {
   getTeamData(teamState, includePositions = true) {
     const players = {};
     teamState.players.forEach((player, userId) => {
+      // Ensure characterClass is always included (even if empty, so client can detect and handle)
+      const characterClass = player.characterClass || '';
+      if (!characterClass) {
+        console.warn(`getTeamData: Player ${userId} (${player.username}) has empty characterClass`);
+      }
+      
       const playerData = {
         userId: player.userId,
         username: player.username,
         team: player.team,
         characterId: player.characterId,
         characterName: player.characterName,
-        characterClass: player.characterClass,
+        characterClass: characterClass, // Always include, even if empty
         spellLoadout: player.spellLoadout ? JSON.parse(player.spellLoadout) : [], // Parse JSON string to array
         position: includePositions ? { x: player.position.x, y: player.position.y } : undefined,
         orientation: player.orientation || 0, // Include orientation
@@ -834,7 +1051,11 @@ export class GameRoom extends Room {
         maxHealth: player.maxHealth,
         ready: player.ready,
         movementPoints: player.movementPoints || 0,
-        usedMovementPoints: player.usedMovementPoints || 0
+        maxMovementPoints: player.maxMovementPoints || 0,
+        usedMovementPoints: player.usedMovementPoints || 0,
+        movementPath: player.movementPath ? JSON.parse(player.movementPath) : null, // Parse JSON string to array
+        energy: player.energy || 0,
+        maxEnergy: player.maxEnergy || 0
       };
 
       // Position is now included in playerData above, orientation is always included
@@ -867,7 +1088,7 @@ export class GameRoom extends Room {
       return;
     }
     
-    const { x, y } = message;
+    const { x, y, path: clientPath } = message;
     if (x === undefined || y === undefined) {
       console.log(`Movement denied: invalid coordinates`);
       return;
@@ -879,34 +1100,462 @@ export class GameRoom extends Room {
       return;
     }
     
-    // Calculate movement cost (path length)
-    // For now, we'll use simple distance, but this should use pathfinding
     const currentX = player.position.x;
     const currentY = player.position.y;
-    const distance = Math.abs(x - currentX) + Math.abs(y - currentY); // Manhattan distance
+    
+    // Use the previsualized path from the client, or calculate if not provided
+    let path = [];
+    if (clientPath && Array.isArray(clientPath) && clientPath.length > 0) {
+      // Validate the client-provided path
+      const pathStart = clientPath[0];
+      const pathEnd = clientPath[clientPath.length - 1];
+      
+      // Verify path starts at current position and ends at target
+      if (pathStart.x === currentX && pathStart.y === currentY && 
+          pathEnd.x === x && pathEnd.y === y) {
+        path = clientPath;
+        console.log(`Using client-provided path, length: ${path.length}`);
+      } else {
+        console.log(`Movement denied: client path doesn't match start/end positions`);
+        return;
+      }
+    } else {
+      // Fallback: calculate path if client didn't provide one
+      if (!this.terrain) {
+        console.log(`Movement denied: terrain not loaded`);
+        return;
+      }
+      
+      // Get occupied tiles (excluding the moving player)
+      const occupiedTiles = new Set();
+      this.state.teamA.players.forEach((p, id) => {
+        if (id !== userId && p.position) {
+          occupiedTiles.add(`${p.position.x}_${p.position.y}`);
+        }
+      });
+      this.state.teamB.players.forEach((p, id) => {
+        if (p.position) {
+          occupiedTiles.add(`${p.position.x}_${p.position.y}`);
+        }
+      });
+      
+      // Calculate path
+      path = findPath(this.terrain, currentX, currentY, x, y, occupiedTiles);
+      
+      if (path.length === 0) {
+        console.log(`Movement denied: no valid path found`);
+        return;
+      }
+      console.log(`Calculated path server-side, length: ${path.length}`);
+    }
+    
+    // Validate path is walkable (security check)
+    if (this.terrain) {
+      for (const step of path) {
+        if (step.x < 0 || step.y < 0 || 
+            step.y >= this.terrain.length || 
+            step.x >= this.terrain[0].length ||
+            this.terrain[step.y][step.x] !== TILE_TYPES.TILE) {
+          console.log(`Movement denied: path contains unwalkable tile at (${step.x}, ${step.y})`);
+          return;
+        }
+      }
+    }
+    
+    // Path cost is path length - 1 (excluding start position)
+    const pathCost = path.length - 1;
     
     // Check if player has enough movement points
     const availableMP = player.movementPoints - player.usedMovementPoints;
-    if (distance > availableMP) {
-      console.log(`Movement denied: not enough movement points (need ${distance}, have ${availableMP})`);
+    if (pathCost > availableMP) {
+      console.log(`Movement denied: not enough movement points (need ${pathCost}, have ${availableMP})`);
       return;
     }
-    
-    // TODO: Validate path is walkable (no walls, no occupied tiles)
-    // For now, just check if target is walkable
-    // This should be done with proper pathfinding
     
     // Update position and used movement points
     player.position.x = x;
     player.position.y = y;
-    player.usedMovementPoints += distance;
+    player.usedMovementPoints += pathCost;
     
-    // Recalculate orientation to face movement direction
-    if (x !== currentX || y !== currentY) {
+    // Store the path for clients to use
+    player.movementPath = JSON.stringify(path);
+    
+    // Recalculate orientation to face movement direction (use last step of path)
+    if (path.length > 1) {
+      const lastStep = path[path.length - 1];
+      const secondLastStep = path[path.length - 2];
+      player.orientation = Math.atan2(lastStep.y - secondLastStep.y, lastStep.x - secondLastStep.x);
+    } else if (x !== currentX || y !== currentY) {
       player.orientation = Math.atan2(y - currentY, x - currentX);
     }
     
-    console.log(`Player ${userId} moved to (${x}, ${y}), used ${distance} MP (${player.usedMovementPoints}/${player.movementPoints})`);
+    console.log(`Player ${userId} moved to (${x}, ${y}), used ${pathCost} MP (${player.usedMovementPoints}/${player.movementPoints}), path length: ${path.length}`);
+    
+    this.broadcastFilteredState();
+    
+    // Clear movement path after a short delay (allows clients to receive it)
+    setTimeout(() => {
+      const updatedPlayer = this.getPlayerById(userId);
+      if (updatedPlayer) {
+        updatedPlayer.movementPath = '';
+      }
+    }, 100);
+  }
+
+  /**
+   * Handle spell cast request
+   */
+  /**
+   * Handle spell preparation (when player selects a spell)
+   */
+  handleSpellPrep(client, message) {
+    const userId = client.userId;
+    
+    if (this.state.phase !== GAME_PHASES.GAME) {
+      return;
+    }
+    
+    // Verify it's this player's turn
+    if (this.state.currentPlayerId !== userId) {
+      return;
+    }
+    
+    const { spellId } = message;
+    
+    // Get spell definition to include prep animation info
+    const spell = getSpell(spellId);
+    const prepAnimDef = spell?.animations?.prep || null;
+    
+    // Broadcast spell preparation to all clients with animation definition
+    this.broadcast('spellPrep', {
+      userId: userId,
+      spellId: spellId,
+      prepAnimDef: prepAnimDef // Include prep animation definition so clients don't need to look it up
+    });
+  }
+
+  /**
+   * Handle spell preparation cancellation (when player deselects a spell)
+   */
+  handleSpellPrepCancel(client, message) {
+    const userId = client.userId;
+    
+    if (this.state.phase !== GAME_PHASES.GAME) {
+      return;
+    }
+    
+    // Broadcast spell preparation cancellation to all clients
+    this.broadcast('spellPrepCancel', {
+      userId: userId
+    });
+  }
+
+  handleSpellCast(client, message) {
+    const userId = client.userId;
+    const team = this.userTeams.get(userId);
+    
+    // Only allow during game phase and if it's the player's turn
+    if (!team || this.state.phase !== GAME_PHASES.GAME) {
+      console.log(`Spell cast denied: not in game phase`);
+      return;
+    }
+    
+    if (this.state.currentPlayerId !== userId) {
+      console.log(`Spell cast denied: not ${userId}'s turn`);
+      return;
+    }
+    
+    const { spellId, targetX, targetY } = message;
+    if (!spellId || targetX === undefined || targetY === undefined) {
+      console.log(`Spell cast denied: invalid parameters`);
+      return;
+    }
+    
+    const player = this.getPlayerById(userId);
+    if (!player) {
+      console.log(`Spell cast denied: player not found`);
+      return;
+    }
+    
+    // Get spell definition
+    const spell = getSpell(spellId);
+    if (!spell) {
+      console.log(`Spell cast denied: spell "${spellId}" not found`);
+      return;
+    }
+    
+    // Parse spell loadout
+    const loadout = player.spellLoadout ? JSON.parse(player.spellLoadout) : [];
+    
+    // Validate spell can be cast
+    const validation = validateSpellForCaster(spellId, {
+      userId: player.userId,
+      loadout: loadout,
+      energyLeft: player.energy,
+      position: { x: player.position.x, y: player.position.y }
+    });
+    
+    if (!validation.valid) {
+      console.log(`Spell cast denied: ${validation.error}`);
+      return;
+    }
+    
+    // Validate target is in range
+    const targeting = spell.targeting || {};
+    const range = targeting.range || { min: 0, max: 10 };
+    const playerX = player.position.x;
+    const playerY = player.position.y;
+    const distance = Math.abs(targetX - playerX) + Math.abs(targetY - playerY);
+    
+    if (distance < range.min || distance > range.max) {
+      console.log(`Spell cast denied: target out of range (distance: ${distance}, range: ${range.min}-${range.max})`);
+      return;
+    }
+    
+    // Validate target tile is walkable (if targeting CELL)
+    if (targeting.targetType === 'CELL' && this.terrain) {
+      if (targetY < 0 || targetY >= this.terrain.length || 
+          targetX < 0 || targetX >= this.terrain[0].length) {
+        console.log(`Spell cast denied: target out of bounds`);
+        return;
+      }
+      
+      if (this.terrain[targetY][targetX] !== TILE_TYPES.TILE) {
+        console.log(`Spell cast denied: target tile is not walkable`);
+        return;
+      }
+    }
+    
+    // Deduct energy cost
+    player.energy -= spell.cost.energy;
+    if (player.energy < 0) {
+      player.energy = 0;
+    }
+    
+    // Track targets that take damage for hit animations
+    const damagedTargets = new Set();
+    
+    // Apply spell effects
+    if (spell.effects && spell.effects.length > 0) {
+      spell.effects.forEach(effect => {
+        if (effect.kind === 'DAMAGE') {
+          // Find target unit at the target position (if targeting UNIT)
+          if (targeting.targetType === 'UNIT') {
+            // Find unit at target position
+            let targetPlayer = null;
+            this.state.teamA.players.forEach((p, id) => {
+              if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                targetPlayer = p;
+              }
+            });
+            if (!targetPlayer) {
+              this.state.teamB.players.forEach((p, id) => {
+                if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                  targetPlayer = p;
+                }
+              });
+            }
+            
+            if (targetPlayer) {
+              // Apply damage
+              targetPlayer.health -= effect.amount;
+              if (targetPlayer.health < 0) {
+                targetPlayer.health = 0;
+              }
+              damagedTargets.add(targetPlayer.userId);
+              console.log(`Applied ${effect.amount} ${effect.damageType || 'damage'} to ${targetPlayer.username}, health now: ${targetPlayer.health}`);
+            }
+          } else if (targeting.targetType === 'CELL') {
+            // Area damage - find all units at target cell (for now, just single target)
+            // TODO: Implement area effects based on pattern
+            let targetPlayer = null;
+            this.state.teamA.players.forEach((p, id) => {
+              if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                targetPlayer = p;
+              }
+            });
+            if (!targetPlayer) {
+              this.state.teamB.players.forEach((p, id) => {
+                if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                  targetPlayer = p;
+                }
+              });
+            }
+            
+            if (targetPlayer) {
+              targetPlayer.health -= effect.amount;
+              if (targetPlayer.health < 0) {
+                targetPlayer.health = 0;
+              }
+              damagedTargets.add(targetPlayer.userId);
+              console.log(`Applied ${effect.amount} ${effect.damageType || 'damage'} to ${targetPlayer.username} at (${targetX}, ${targetY}), health now: ${targetPlayer.health}`);
+            }
+          }
+        } else if (effect.kind === 'HEAL') {
+          // Find target unit based on targeting type
+          let targetPlayer = null;
+          
+          if (targeting.targetType === 'SELF') {
+            // Heal the caster
+            targetPlayer = player;
+          } else if (targeting.targetType === 'UNIT') {
+            // Find unit at target position
+            if (targeting.unitFilter === 'ALLY') {
+              const playerTeam = this.userTeams.get(userId);
+              const teamState = playerTeam === 'A' ? this.state.teamA : this.state.teamB;
+              
+              teamState.players.forEach((p, id) => {
+                if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                  targetPlayer = p;
+                }
+              });
+            } else if (targeting.unitFilter === 'ANY') {
+              // Can target any unit (ally or enemy)
+              this.state.teamA.players.forEach((p, id) => {
+                if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                  targetPlayer = p;
+                }
+              });
+              if (!targetPlayer) {
+                this.state.teamB.players.forEach((p, id) => {
+                  if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                    targetPlayer = p;
+                  }
+                });
+              }
+            }
+          } else if (targeting.targetType === 'CELL') {
+            // Find unit at target cell (for area heals, currently just single target)
+            this.state.teamA.players.forEach((p, id) => {
+              if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                targetPlayer = p;
+              }
+            });
+            if (!targetPlayer) {
+              this.state.teamB.players.forEach((p, id) => {
+                if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                  targetPlayer = p;
+                }
+              });
+            }
+          }
+          
+          if (targetPlayer) {
+            targetPlayer.health += effect.amount;
+            if (targetPlayer.health > targetPlayer.maxHealth) {
+              targetPlayer.health = targetPlayer.maxHealth;
+            }
+            console.log(`Healed ${targetPlayer.username} for ${effect.amount}, health now: ${targetPlayer.health}/${targetPlayer.maxHealth}`);
+          }
+        } else if (effect.kind === 'MOVEMENT') {
+          // Find target unit based on targeting type
+          let targetPlayer = null;
+          
+          if (targeting.targetType === 'SELF') {
+            // Add movement points to the caster
+            targetPlayer = player;
+          } else if (targeting.targetType === 'UNIT') {
+            // Find unit at target position
+            if (targeting.unitFilter === 'ALLY') {
+              const playerTeam = this.userTeams.get(userId);
+              const teamState = playerTeam === 'A' ? this.state.teamA : this.state.teamB;
+              
+              teamState.players.forEach((p, id) => {
+                if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                  targetPlayer = p;
+                }
+              });
+            } else if (targeting.unitFilter === 'ANY') {
+              // Can target any unit (ally or enemy)
+              this.state.teamA.players.forEach((p, id) => {
+                if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                  targetPlayer = p;
+                }
+              });
+              if (!targetPlayer) {
+                this.state.teamB.players.forEach((p, id) => {
+                  if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                    targetPlayer = p;
+                  }
+                });
+              }
+            }
+          } else if (targeting.targetType === 'CELL') {
+            // Find unit at target cell
+            this.state.teamA.players.forEach((p, id) => {
+              if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                targetPlayer = p;
+              }
+            });
+            if (!targetPlayer) {
+              this.state.teamB.players.forEach((p, id) => {
+                if (p.position && p.position.x === targetX && p.position.y === targetY) {
+                  targetPlayer = p;
+                }
+              });
+            }
+          }
+          
+          if (targetPlayer) {
+            // Add movement points (can exceed max, will be capped at end of turn)
+            targetPlayer.movementPoints += effect.amount;
+            console.log(`Added ${effect.amount} movement points to ${targetPlayer.username}, movement points now: ${targetPlayer.movementPoints} (max: ${targetPlayer.maxMovementPoints})`);
+          }
+        }
+      });
+    }
+    
+    console.log(`Player ${userId} cast ${spellId} at (${targetX}, ${targetY}), energy now: ${player.energy}`);
+    
+    // Cancel spell preparation (stop stance animation) before casting
+    this.broadcast('spellPrepCancel', {
+      userId: userId
+    });
+    
+    // Get cast animation definition to include in broadcast
+    const castAnimDef = spell.animations?.cast || null;
+    
+    // Get VFX definitions to include in broadcast
+    const presentation = spell.presentation || {};
+    
+    // Broadcast spell cast event to all clients so they can play animations and VFX
+    this.broadcast('spellCast', {
+      userId: userId,
+      spellId: spellId,
+      targetX: targetX,
+      targetY: targetY,
+      castAnimDef: castAnimDef, // Include cast animation definition so clients don't need to look it up
+      presentation: {
+        projectileVfx: presentation.projectileVfx || null,
+        impactVfxDef: presentation.impactVfxDef || null,
+        groundEffectVfx: presentation.groundEffectVfx || null
+      }
+    });
+    
+    // Get hit delay from cast animation definition (impactDelayMs)
+    // This represents when the spell effect should visually occur relative to cast start
+    const hitDelayMs = castAnimDef?.impactDelayMs || 0;
+    
+    // Broadcast hit animations for all damaged targets after the delay
+    damagedTargets.forEach(targetUserId => {
+      if (hitDelayMs > 0) {
+        // Delay the hit animation broadcast for ranged attacks
+        setTimeout(() => {
+          this.broadcast('spellHit', {
+            targetUserId: targetUserId,
+            casterUserId: userId,
+            spellId: spellId
+          });
+        }, hitDelayMs);
+      } else {
+        // Immediate hit for melee attacks
+        this.broadcast('spellHit', {
+          targetUserId: targetUserId,
+          casterUserId: userId,
+          spellId: spellId
+        });
+      }
+    });
     
     this.broadcastFilteredState();
   }
@@ -1080,6 +1729,13 @@ export class GameRoom extends Room {
       return;
     }
 
+    // Cancel any active spell preparation for the current player
+    // This resets the character state and stops stance animations
+    this.broadcast('spellPrepCancel', {
+      userId: userId
+    });
+    console.log(`Cancelled spell preparation for ${userId} (ending turn)`);
+
     // Advance turn logic
     this.state.turn++;
     
@@ -1087,9 +1743,15 @@ export class GameRoom extends Room {
     const currentPlayer = this.getPlayerById(userId);
     if (currentPlayer) {
       currentPlayer.usedMovementPoints = 0;
+      // Cap movement points to max at end of turn (if they exceeded max from spells)
+      if (currentPlayer.movementPoints > currentPlayer.maxMovementPoints) {
+        currentPlayer.movementPoints = currentPlayer.maxMovementPoints;
+        console.log(`Capped movement points for ${currentPlayer.username} to max: ${currentPlayer.maxMovementPoints}`);
+      }
     }
     
-    // Find current player index in turn order
+    // Find next player and reset their used movement points
+    // Also restore energy to max for the next player
     const currentIndex = this.state.turnOrder.indexOf(userId);
     if (currentIndex === -1) {
       console.error(`Current player ${userId} not found in turn order`);
@@ -1101,10 +1763,15 @@ export class GameRoom extends Room {
     const nextPlayerId = this.state.turnOrder[nextIndex];
     this.state.currentPlayerId = nextPlayerId;
     
-    // Reset movement points for next player
+    // Reset movement points and restore energy for next player
     const nextPlayer = this.getPlayerById(nextPlayerId);
     if (nextPlayer) {
       nextPlayer.usedMovementPoints = 0;
+      nextPlayer.energy = nextPlayer.maxEnergy; // Restore energy to max at start of turn
+      // Ensure movement points are at max at start of turn (in case they were reduced)
+      if (nextPlayer.movementPoints < nextPlayer.maxMovementPoints) {
+        nextPlayer.movementPoints = nextPlayer.maxMovementPoints;
+      }
     }
     
     console.log(`Turn ${this.state.turn}: Now ${nextPlayerId}'s turn`);

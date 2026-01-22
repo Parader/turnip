@@ -14,7 +14,7 @@
 
 /**
  * @typedef {Object} EffectDef
- * @property {"DAMAGE" | "HEAL"} kind
+ * @property {"DAMAGE" | "HEAL" | "MOVEMENT"} kind
  * @property {number} amount
  * @property {"physical" | "magic"} [damageType] - Only for DAMAGE
  */
@@ -34,7 +34,55 @@
  * @property {number} blendInMs
  * @property {number} blendOutMs
  * @property {number} lockMs - Minimum time actor is "busy" to prevent overlapping actions
- * @property {number} impactDelayMs - When spell effect should visually occur relative to cast start
+ * @property {number} impactDelayMs - When spell effect should visually occur relative to cast start. Used to delay hit animations for ranged attacks (in milliseconds). 0 for instant melee hits.
+ */
+
+/**
+ * @typedef {Object} VfxDef
+ * @property {"SPHERE" | "CUBE" | "CYLINDER" | "PARTICLE" | "MESH"} type - Type of VFX geometry
+ * @property {number} [size] - Size/diameter of the VFX (default: 0.3)
+ * @property {Object} [color] - Color definition { r: number, g: number, b: number } (0-1 range)
+ * @property {number} [emissiveIntensity] - How much the VFX glows (0-1, default: 1)
+ * @property {number} [opacity] - Opacity/alpha (0-1, default: 1)
+ * @property {boolean} [animated] - Whether the VFX has animation (rotation, scale, etc.)
+ * @property {Object} [animation] - Animation properties { rotationSpeed?: number, scalePulse?: boolean, pulseSpeed?: number }
+ * @property {number} [duration] - How long the VFX lasts in milliseconds (0 = permanent until manually removed)
+ * @property {string} [meshPath] - Path to mesh file (for type: "MESH")
+ */
+
+/**
+ * @typedef {Object} ProjectileVfxDef
+ * @property {VfxDef} vfx - VFX definition for the projectile
+ * @property {number} speedCellsPerSec - Speed of projectile in cells per second
+ * @property {number} [startDelayMs] - Delay before projectile spawns (relative to cast start)
+ * @property {number} [heightOffset] - Height offset from ground (default: 0.5)
+ * @property {boolean} [trail] - Whether projectile leaves a trail
+ * @property {VfxDef} [trailVfx] - VFX definition for trail (if trail: true)
+ * @property {number} [trailLength] - Length of trail in cells (default: 0.5)
+ */
+
+/**
+ * @typedef {Object} ImpactVfxDef
+ * @property {VfxDef} vfx - VFX definition for the impact
+ * @property {number} [delayMs] - Delay before impact VFX appears (relative to projectile arrival)
+ * @property {number} [duration] - Duration of impact VFX in milliseconds (overrides vfx.duration)
+ * @property {number} [size] - Size of impact (overrides vfx.size)
+ * @property {boolean} [explosive] - Whether impact expands outward
+ * @property {number} [explosionRadius] - Radius of explosion in cells (if explosive: true)
+ * @property {number} [explosionDuration] - Duration of explosion expansion in milliseconds
+ */
+
+/**
+ * @typedef {Object} GroundEffectVfxDef
+ * @property {VfxDef} vfx - VFX definition for ground effect
+ * @property {number} [delayMs] - Delay before ground effect appears (relative to impact)
+ * @property {number} [duration] - Duration of ground effect in milliseconds (0 = permanent)
+ * @property {number} [radius] - Radius of ground effect in cells (default: 1)
+ * @property {boolean} [spread] - Whether effect spreads over time
+ * @property {number} [spreadSpeed] - Speed of spread in cells per second
+ * @property {number} [maxRadius] - Maximum radius if spreading (default: radius)
+ * @property {boolean} [fadeOut] - Whether effect fades out at end
+ * @property {number} [fadeOutDuration] - Duration of fade out in milliseconds
  */
 
 /**
@@ -50,8 +98,11 @@
  * @property {EffectDef[]} effects
  * @property {Object} presentation
  * @property {string} presentation.castAnim
- * @property {{ type: "NONE" | "BOLT" | "ARROW", speedCellsPerSec?: number }} [presentation.projectile]
- * @property {string} [presentation.impactVfx]
+ * @property {{ type: "NONE" | "BOLT" | "ARROW", speedCellsPerSec?: number }} [presentation.projectile] - Legacy projectile definition
+ * @property {ProjectileVfxDef} [presentation.projectileVfx] - New detailed projectile VFX definition
+ * @property {string} [presentation.impactVfx] - Legacy impact VFX string
+ * @property {ImpactVfxDef} [presentation.impactVfxDef] - New detailed impact VFX definition
+ * @property {GroundEffectVfxDef} [presentation.groundEffectVfx] - Ground effect VFX definition
  * @property {string} [presentation.sound]
  * @property {Object} animations
  * @property {PrepAnimDef} animations.prep
@@ -86,8 +137,87 @@ export const SpellDefs = {
       ],
       presentation: {
         castAnim: 'cast',
+        // Legacy projectile (kept for backward compatibility)
         projectile: { type: 'BOLT', speedCellsPerSec: 4 },
+        // New detailed VFX system
+        projectileVfx: {
+          vfx: {
+            type: 'SPHERE',
+            size: 0.4, // Diameter of fireball
+            color: { r: 1.0, g: 0.4, b: 0.0 }, // Bright orange-red
+            emissiveIntensity: 1.0, // Full glow
+            opacity: 0.9,
+            animated: true,
+            animation: {
+              rotationSpeed: 2.0, // Rotations per second
+              scalePulse: true, // Pulsing effect
+              pulseSpeed: 3.0 // Pulse cycles per second
+            },
+            duration: 0 // Lasts until impact
+          },
+          speedCellsPerSec: 4, // Speed in cells per second
+          startDelayMs: 200, // Spawn 200ms after cast animation starts
+          heightOffset: 0.6, // Float 0.6 units above ground
+          trail: true, // Leave a fire trail
+          trailVfx: {
+            type: 'SPHERE',
+            size: 0.15, // Smaller trail particles
+            color: { r: 1.0, g: 0.6, b: 0.0 }, // Yellow-orange
+            emissiveIntensity: 0.8,
+            opacity: 0.6,
+            animated: false,
+            duration: 300 // Trail particles fade after 300ms
+          },
+          trailLength: 0.8 // Trail extends 0.8 cells behind projectile
+        },
+        // Legacy impact VFX (kept for backward compatibility)
         impactVfx: 'explosion_small',
+        // New detailed impact VFX
+        impactVfxDef: {
+          vfx: {
+            type: 'SPHERE',
+            size: 0.2, // Starting size
+            color: { r: 1.0, g: 0.8, b: 0.0 }, // Bright yellow
+            emissiveIntensity: 1.0,
+            opacity: 1.0,
+            animated: true,
+            animation: {
+              scalePulse: false // No pulse, just expand
+            },
+            duration: 400 // Impact effect lasts 400ms
+          },
+          delayMs: 0, // Instant on impact
+          duration: 400,
+          size: 1.2, // Final explosion size (overrides vfx.size)
+          explosive: true, // Expands outward
+          explosionRadius: 1.5, // Explosion reaches 1.5 cells radius
+          explosionDuration: 300 // Expansion takes 300ms
+        },
+        // Hit animation delay to sync with explosion VFX
+        hitDelayMs: 1000, // Delay hit animation by 550ms to match explosion timing
+        // Ground effect: burning fire
+        groundEffectVfx: {
+          vfx: {
+            type: 'CYLINDER', // Flat cylinder for ground effect
+            size: 0.1, // Height of flame
+            color: { r: 1.0, g: 0.3, b: 0.0 }, // Deep red-orange
+            emissiveIntensity: 0.9,
+            opacity: 0.8,
+            animated: true,
+            animation: {
+              rotationSpeed: 0.5, // Slow rotation
+              scalePulse: true, // Flickering flames
+              pulseSpeed: 2.0 // Flicker speed
+            },
+            duration: 3000 // Burns for 3 seconds
+          },
+          delayMs: 100, // Appears 100ms after impact
+          duration: 3000, // Lasts 3 seconds
+          radius: 1.0, // Covers 1 cell radius
+          spread: false, // Doesn't spread (could be true for area spells)
+          fadeOut: true, // Fades out at end
+          fadeOutDuration: 500 // Fade out over 500ms
+        },
         sound: 'fireball_cast'
       },
       animations: {
@@ -202,21 +332,21 @@ export const SpellDefs = {
       description: 'Quickly move to an adjacent cell',
       targeting: {
         targetType: 'CELL',
-        range: { min: 1, max: 2 },
+        range: { min: 0, max: 0 },
         requiresLoS: true,
         allowBlockedCellTarget: false,
-        allowOccupiedCellTarget: false,
+        allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
       cost: { energy: 2 },
       effects: [
         {
-          kind: 'DAMAGE',
-          amount: 0 // Movement spell, no damage
+          kind: 'MOVEMENT',
+          amount: 3 // Movement spell, no damage
         }
       ],
       presentation: {
-        castAnim: 'dash',
+        castAnim: 'cast1',
         impactVfx: 'dash_trail',
         sound: 'dash_woosh'
       },
@@ -229,7 +359,7 @@ export const SpellDefs = {
           canMoveWhilePreparing: false
         },
         cast: {
-          name: 'dash',
+          name: 'cast1',
           blendInMs: 50,
           blendOutMs: 100,
           lockMs: 400,
@@ -391,7 +521,7 @@ export const SpellDefs = {
         }
       ],
       presentation: {
-        castAnim: 'melee',
+        castAnim: 'attack2',
         impactVfx: 'kick_impact',
         sound: 'kick_hit'
       },
@@ -404,7 +534,7 @@ export const SpellDefs = {
           canMoveWhilePreparing: false
         },
         cast: {
-          name: 'melee',
+          name: 'attack2',
           blendInMs: 50,
           blendOutMs: 150,
           lockMs: 500,
@@ -1506,7 +1636,8 @@ export const SpellDefs = {
         castAnim: spellDef.presentation.castAnim,
         projectile: spellDef.presentation.projectile,
         impactVfx: spellDef.presentation.impactVfx,
-        sound: spellDef.presentation.sound
+        sound: spellDef.presentation.sound,
+        hitDelayMs: spellDef.presentation.hitDelayMs
       },
       animations: {
         prep: spellDef.animations?.prep || null,
