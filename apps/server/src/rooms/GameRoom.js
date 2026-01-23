@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { SpellDefs, getSpell, validateSpellForCaster } from '../config/spelldefs.js';
 import { gameData } from '../config/classes.js';
+import { hasLOS, createTerrainBlocksFunction } from '../utils/lineOfSight.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1322,6 +1323,35 @@ export class GameRoom extends Room {
       
       if (this.terrain[targetY][targetX] !== TILE_TYPES.TILE) {
         console.log(`Spell cast denied: target tile is not walkable`);
+        return;
+      }
+    }
+    
+    // Validate line of sight if required
+    if (targeting.requiresLoS && this.terrain) {
+      // Collect all occupied tiles (player positions)
+      const occupiedTiles = new Set();
+      this.state.teamA.players.forEach((p, id) => {
+        if (p.position) {
+          occupiedTiles.add(`${p.position.x}_${p.position.y}`);
+        }
+      });
+      this.state.teamB.players.forEach((p, id) => {
+        if (p.position) {
+          occupiedTiles.add(`${p.position.x}_${p.position.y}`);
+        }
+      });
+      
+      // Create blocks function (exclude caster's position so they don't block their own LOS)
+      const blocks = createTerrainBlocksFunction(this.terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+      const hasLineOfSight = hasLOS(
+        { x: playerX, y: playerY },
+        { x: targetX, y: targetY },
+        blocks
+      );
+      
+      if (!hasLineOfSight) {
+        console.log(`Spell cast denied: no line of sight to target (${targetX}, ${targetY})`);
         return;
       }
     }

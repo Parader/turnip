@@ -6,6 +6,7 @@ import { build3DMap } from './babylon/babylonMap';
 import { buildPlayerCharacters, updatePlayerCharacters } from './babylon/babylonPlayers';
 import { startMovementAnimation, startStanceAnimation, stopStanceAnimation, playCastAnimation, playHitAnimation, updateMovementAnimations, blendAnimations } from './babylon/babylonAnimations';
 import { playSpellVfx } from './babylon/babylonVfx';
+import { hasLOS, createTerrainBlocksFunction } from './lineOfSight';
 
 // Helper to convert angle in radians to Babylon.js rotation (Y axis)
 // In Babylon.js, rotation around Y axis: 
@@ -289,6 +290,12 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   spellTargetMaterial.emissiveColor = new Color3(0.5, 0.1, 0.1);
   spellTargetMaterial.alpha = 0.7;
   
+  // Create material for disabled/invalid spell target tiles (dimmed)
+  let spellDisabledMaterial = new StandardMaterial('spellDisabledMaterial', scene);
+  spellDisabledMaterial.diffuseColor = new Color3(0.3, 0.3, 0.3); // Dark gray
+  spellDisabledMaterial.emissiveColor = new Color3(0.1, 0.1, 0.1); // Very dim
+  spellDisabledMaterial.alpha = 0.3; // More transparent
+  
   let spellRangeTiles = []; // Currently highlighted spell range tiles
   let spellTargetTiles = []; // Currently highlighted spell target tiles
   
@@ -365,7 +372,31 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       // Clear previous visualization
       clearSpellTargeting();
       
-      // Show spell range in light blue
+      // Collect all occupied tiles (player positions)
+      const occupiedTiles = new Set();
+      if (currentGameState) {
+        // Add all players from my team
+        if (currentGameState.myTeam && currentGameState.myTeam.players) {
+          Object.values(currentGameState.myTeam.players).forEach(player => {
+            if (player.position) {
+              occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+            }
+          });
+        }
+        // Add all players from enemy team
+        if (currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
+          Object.values(currentGameState.enemyTeam.players).forEach(player => {
+            if (player.position) {
+              occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+            }
+          });
+        }
+      }
+      
+      // Create blocks function for LOS checking (exclude caster's position)
+      const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+      
+      // Show spell range in light blue, with disabled tiles dimmed
       const rangeTiles = getSpellRangeTiles(playerX, playerY, range.min, range.max, terrain);
       rangeTiles.forEach(({ x, y }) => {
         const tileKey = `${x}_${y}`;
@@ -377,7 +408,63 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
           if (!tile.userData.originalMaterial) {
             tile.userData.originalMaterial = tile.material;
           }
-          tile.material = spellRangeMaterial;
+          
+          // Check if this tile is a valid target
+          let isValidTarget = true;
+          
+          // Check line of sight if required
+          if (targeting.requiresLoS) {
+            const hasLineOfSight = hasLOS(
+              { x: playerX, y: playerY },
+              { x, y },
+              blocks
+            );
+            if (!hasLineOfSight) {
+              isValidTarget = false;
+            }
+          }
+          
+          if (targeting.targetType === 'UNIT') {
+            // For UNIT targeting, must have a unit at the position that matches unitFilter
+            isValidTarget = false;
+            
+            // Find unit at target position
+            let targetUnit = null;
+            if (currentGameState && currentGameState.myTeam && currentGameState.myTeam.players) {
+              targetUnit = Object.values(currentGameState.myTeam.players).find(p => 
+                p.position && p.position.x === x && p.position.y === y
+              );
+            }
+            
+            if (!targetUnit && currentGameState && currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
+              targetUnit = Object.values(currentGameState.enemyTeam.players).find(p => 
+                p.position && p.position.x === x && p.position.y === y
+              );
+            }
+            
+            if (targetUnit) {
+              // Check if unit matches the filter
+              const isAlly = currentGameState && currentGameState.myTeam && 
+                            currentGameState.myTeam.players && 
+                            Object.values(currentGameState.myTeam.players).some(p => p.userId === targetUnit.userId);
+              const isEnemy = !isAlly;
+              
+              const unitFilter = targeting.unitFilter || 'ANY';
+              if (unitFilter === 'ALLY' && isAlly) {
+                isValidTarget = true;
+              } else if (unitFilter === 'ENEMY' && isEnemy) {
+                isValidTarget = true;
+              } else if (unitFilter === 'ANY') {
+                isValidTarget = true;
+              }
+            }
+          } else if (targeting.targetType === 'SELF') {
+            // For SELF targeting, only valid if targeting the caster's own position
+            isValidTarget = (x === playerX && y === playerY);
+          }
+          
+          // Use disabled material for invalid targets, normal range material for valid ones
+          tile.material = isValidTarget ? spellRangeMaterial : spellDisabledMaterial;
           spellRangeTiles.push(tileKey);
         }
       });
@@ -401,27 +488,105 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         
         // Check if target is in range
         if (distance >= range.min && distance <= range.max) {
-          // Highlight target tile in red (overrides range blue)
-          const tileKey = `${tileX}_${tileY}`;
-          const tile = allTiles.get(tileKey);
-          if (tile) {
-            if (!tile.userData) {
-              tile.userData = {};
+          // Check if target is valid based on targeting type and unitFilter
+          let isValidTarget = true;
+          
+          // Check line of sight if required
+          if (targeting.requiresLoS) {
+            // Collect all occupied tiles (player positions) for this check
+            const occupiedTilesForCheck = new Set();
+            if (currentGameState) {
+              if (currentGameState.myTeam && currentGameState.myTeam.players) {
+                Object.values(currentGameState.myTeam.players).forEach(player => {
+                  if (player.position) {
+                    occupiedTilesForCheck.add(`${player.position.x}_${player.position.y}`);
+                  }
+                });
+              }
+              if (currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
+                Object.values(currentGameState.enemyTeam.players).forEach(player => {
+                  if (player.position) {
+                    occupiedTilesForCheck.add(`${player.position.x}_${player.position.y}`);
+                  }
+                });
+              }
             }
-            // Don't overwrite originalMaterial if already set
-            if (!tile.userData.originalMaterial) {
-              tile.userData.originalMaterial = tile.material;
+            const blocksForCheck = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTilesForCheck, { x: playerX, y: playerY });
+            const hasLineOfSight = hasLOS(
+              { x: playerX, y: playerY },
+              { x: tileX, y: tileY },
+              blocksForCheck
+            );
+            if (!hasLineOfSight) {
+              isValidTarget = false;
             }
-            tile.material = spellTargetMaterial;
-            spellTargetTiles.push(tileKey);
           }
           
-          // Handle spell cast on click
-          if (isLeftClick) {
-            // Send spell cast request to server
-            // The server will broadcast to all clients (including this one) to play the animation
-            if (onSpellCast) {
-              onSpellCast(spellDef.spellId || spellDef.name, tileX, tileY);
+          if (targeting.targetType === 'UNIT') {
+            // For UNIT targeting, must have a unit at the position that matches unitFilter
+            isValidTarget = false;
+            
+            // Find unit at target position
+            let targetUnit = null;
+            if (currentGameState && currentGameState.myTeam && currentGameState.myTeam.players) {
+              targetUnit = Object.values(currentGameState.myTeam.players).find(p => 
+                p.position && p.position.x === tileX && p.position.y === tileY
+              );
+            }
+            
+            if (!targetUnit && currentGameState && currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
+              targetUnit = Object.values(currentGameState.enemyTeam.players).find(p => 
+                p.position && p.position.x === tileX && p.position.y === tileY
+              );
+            }
+            
+            if (targetUnit) {
+              // Check if unit matches the filter
+              const isAlly = currentGameState && currentGameState.myTeam && 
+                            currentGameState.myTeam.players && 
+                            Object.values(currentGameState.myTeam.players).some(p => p.userId === targetUnit.userId);
+              const isEnemy = !isAlly;
+              
+              const unitFilter = targeting.unitFilter || 'ANY';
+              if (unitFilter === 'ALLY' && isAlly) {
+                isValidTarget = true;
+              } else if (unitFilter === 'ENEMY' && isEnemy) {
+                isValidTarget = true;
+              } else if (unitFilter === 'ANY') {
+                isValidTarget = true;
+              }
+            }
+            // If no unit found, isValidTarget remains false
+          } else if (targeting.targetType === 'SELF') {
+            // For SELF targeting, only valid if targeting the caster's own position
+            isValidTarget = (tileX === playerX && tileY === playerY);
+          }
+          // For CELL targeting, any tile in range is valid (isValidTarget stays true)
+          
+          // Only highlight if target is valid
+          if (isValidTarget) {
+            // Highlight target tile in red (overrides range blue)
+            const tileKey = `${tileX}_${tileY}`;
+            const tile = allTiles.get(tileKey);
+            if (tile) {
+              if (!tile.userData) {
+                tile.userData = {};
+              }
+              // Don't overwrite originalMaterial if already set
+              if (!tile.userData.originalMaterial) {
+                tile.userData.originalMaterial = tile.material;
+              }
+              tile.material = spellTargetMaterial;
+              spellTargetTiles.push(tileKey);
+            }
+            
+            // Handle spell cast on click
+            if (isLeftClick) {
+              // Send spell cast request to server
+              // The server will broadcast to all clients (including this one) to play the animation
+              if (onSpellCast) {
+                onSpellCast(spellDef.spellId || spellDef.name, tileX, tileY);
+              }
             }
           }
         }
@@ -853,7 +1018,31 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             // Clear previous visualization
             clearSpellTargeting();
             
-            // Show spell range in light blue
+            // Show spell range with dimmed invalid tiles
+            // Collect all occupied tiles (player positions)
+            const occupiedTiles = new Set();
+            if (currentGameState) {
+              // Add all players from my team
+              if (currentGameState.myTeam && currentGameState.myTeam.players) {
+                Object.values(currentGameState.myTeam.players).forEach(player => {
+                  if (player.position) {
+                    occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+                  }
+                });
+              }
+              // Add all players from enemy team
+              if (currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
+                Object.values(currentGameState.enemyTeam.players).forEach(player => {
+                  if (player.position) {
+                    occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+                  }
+                });
+              }
+            }
+            
+            // Create blocks function for LOS checking (exclude caster's position)
+            const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+            
             const rangeTiles = getSpellRangeTiles(playerX, playerY, range.min, range.max, terrain);
             rangeTiles.forEach(({ x, y }) => {
               const tileKey = `${x}_${y}`;
@@ -865,7 +1054,63 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                 if (!tile.userData.originalMaterial) {
                   tile.userData.originalMaterial = tile.material;
                 }
-                tile.material = spellRangeMaterial;
+                
+                // Check if this tile is a valid target
+                let isValidTarget = true;
+                
+                // Check line of sight if required
+                if (targeting.requiresLoS) {
+                  const hasLineOfSight = hasLOS(
+                    { x: playerX, y: playerY },
+                    { x, y },
+                    blocks
+                  );
+                  if (!hasLineOfSight) {
+                    isValidTarget = false;
+                  }
+                }
+                
+                if (targeting.targetType === 'UNIT') {
+                  // For UNIT targeting, must have a unit at the position that matches unitFilter
+                  isValidTarget = false;
+                  
+                  // Find unit at target position
+                  let targetUnit = null;
+                  if (currentGameState && currentGameState.myTeam && currentGameState.myTeam.players) {
+                    targetUnit = Object.values(currentGameState.myTeam.players).find(p => 
+                      p.position && p.position.x === x && p.position.y === y
+                    );
+                  }
+                  
+                  if (!targetUnit && currentGameState && currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
+                    targetUnit = Object.values(currentGameState.enemyTeam.players).find(p => 
+                      p.position && p.position.x === x && p.position.y === y
+                    );
+                  }
+                  
+                  if (targetUnit) {
+                    // Check if unit matches the filter
+                    const isAlly = currentGameState && currentGameState.myTeam && 
+                                  currentGameState.myTeam.players && 
+                                  Object.values(currentGameState.myTeam.players).some(p => p.userId === targetUnit.userId);
+                    const isEnemy = !isAlly;
+                    
+                    const unitFilter = targeting.unitFilter || 'ANY';
+                    if (unitFilter === 'ALLY' && isAlly) {
+                      isValidTarget = true;
+                    } else if (unitFilter === 'ENEMY' && isEnemy) {
+                      isValidTarget = true;
+                    } else if (unitFilter === 'ANY') {
+                      isValidTarget = true;
+                    }
+                  }
+                } else if (targeting.targetType === 'SELF') {
+                  // For SELF targeting, only valid if targeting the caster's own position
+                  isValidTarget = (x === playerX && y === playerY);
+                }
+                
+                // Use disabled material for invalid targets, normal range material for valid ones
+                tile.material = isValidTarget ? spellRangeMaterial : spellDisabledMaterial;
                 spellRangeTiles.push(tileKey);
               }
             });
@@ -1138,6 +1383,10 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     playHitAnimation: (targetUserId) => {
       // Play hit animation for any player (for observers)
       playHitAnimation(scene, targetUserId);
+    },
+    clearMovementVisualization: () => {
+      // Clear movement visualization
+      clearMovementVisualization();
     }
   };
 }

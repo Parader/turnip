@@ -600,6 +600,199 @@ export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime
 }
 
 /**
+ * Create heal particles that move upward from the ground
+ * @param {Vector3} position - Position on ground
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Object} config - Particle configuration
+ * @returns {ParticleSystem} Particle system
+ */
+function createHealParticles(position, scene, config = {}) {
+  // Create invisible emitter at ground level
+  const emitterMesh = MeshBuilder.CreateSphere('heal_emitter', { diameter: 0.1 }, scene);
+  emitterMesh.position = position.clone();
+  emitterMesh.position.y = 0.1; // Slightly above ground
+  emitterMesh.isVisible = false;
+  
+  const particleSystem = new ParticleSystem('heal_particles', 150, scene);
+  
+  // Use the same particle texture as fireball
+  particleSystem.particleTexture = createParticleTexture(scene);
+  
+  // Emit from the position
+  particleSystem.emitter = emitterMesh;
+  particleSystem.minEmitBox = new Vector3(-0.2, 0, -0.2);
+  particleSystem.maxEmitBox = new Vector3(0.2, 0, 0.2);
+  
+  // Particle colors (green colors, more transparent)
+  particleSystem.color1 = new Color4(0.3, 1.0, 0.4, 0.6); // Light green, 60% opacity
+  particleSystem.color2 = new Color4(0.5, 1.0, 0.6, 0.8); // Brighter green, 80% opacity
+  particleSystem.colorDead = new Color4(0.2, 0.8, 0.3, 0.0); // Fade to dark green
+  
+  // Particle size
+  particleSystem.minSize = config.minSize || 0.1;
+  particleSystem.maxSize = config.maxSize || 0.2;
+  
+  // Particle lifetime
+  particleSystem.minLifeTime = config.minLifeTime || 0.8;
+  particleSystem.maxLifeTime = config.maxLifeTime || 1.5;
+  
+  // Emission rate
+  particleSystem.emitRate = config.emitRate || 50;
+  
+  // Direction - particles move upward
+  particleSystem.direction1 = new Vector3(-0.3, 1.0, -0.3); // Upward and slightly outward
+  particleSystem.direction2 = new Vector3(0.3, 1.5, 0.3); // More upward
+  particleSystem.minEmitPower = config.minEmitPower || 0.5;
+  particleSystem.maxEmitPower = config.maxEmitPower || 1.2;
+  particleSystem.updateSpeed = 0.02;
+  
+  // Gravity (slight upward drift to keep particles floating)
+  particleSystem.gravity = new Vector3(0, 0.2, 0);
+  
+  // Blend mode for soft glow effect
+  particleSystem.blendMode = ParticleSystem.BLENDMODE_STANDARD;
+  
+  // Emit for a duration then stop
+  const emitDuration = config.emitDuration || 1.0; // 1 second
+  particleSystem.targetStopDuration = emitDuration;
+  
+  // Start the particle system
+  particleSystem.start();
+  
+  // Clean up emitter and particle system after particles fade
+  const cleanupTime = (particleSystem.maxLifeTime + emitDuration) * 1000;
+  setTimeout(() => {
+    particleSystem.dispose();
+    emitterMesh.dispose();
+  }, cleanupTime);
+  
+  return particleSystem;
+}
+
+/**
+ * Create expanding green sphere on the ground
+ * @param {Vector3} position - Position on ground
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Object} config - Sphere configuration
+ * @returns {Mesh} Sphere mesh
+ */
+function createHealCircle(position, scene, config = {}) {
+  const radius = config.radius || 0.5;
+  const maxRadius = config.maxRadius || 1.5;
+  const duration = config.duration || 1000; // 1 second
+  
+  // Create a sphere for the expanding effect
+  const circleMesh = MeshBuilder.CreateSphere('heal_circle', {
+    diameter: radius,
+    segments: 32
+  }, scene);
+  
+  // Position on ground (center the sphere at ground level)
+  circleMesh.position = new Vector3(position.x, radius / 2, position.z);
+  
+  // Create green material
+  const material = new StandardMaterial('heal_circle_material', scene);
+  material.diffuseColor = new Color3(0.2, 1.0, 0.4); // Green
+  material.emissiveColor = new Color3(0.1, 0.5, 0.2); // Dim green glow
+  material.alpha = 0.08; // 8% opacity
+  material.transparencyMode = Material.MATERIAL_ALPHABLEND;
+  material.backFaceCulling = false;
+  material.disableDepthWrite = true;
+  
+  circleMesh.material = material;
+  circleMesh.isPickable = false;
+  
+  // Animate expansion
+  const startTime = Date.now();
+  const observer = scene.onBeforeRenderObservable.add(() => {
+    const elapsed = Date.now() - startTime;
+    const progress = Math.min(elapsed / duration, 1.0);
+    
+    // Expand from radius to maxRadius (uniform scaling for sphere)
+    const currentRadius = radius + (maxRadius - radius) * progress;
+    const scale = currentRadius / radius;
+    circleMesh.scaling = new Vector3(scale, scale, scale);
+    
+    // Update Y position to keep sphere centered at ground level as it expands
+    circleMesh.position.y = currentRadius / 2;
+    
+    // Fade out as it expands
+    const fadeStart = 0.5; // Start fading at 50% progress
+    if (progress > fadeStart) {
+      const fadeProgress = (progress - fadeStart) / (1 - fadeStart);
+      material.alpha = 0.08 * (1 - fadeProgress); // Fade from 8% to 0%
+    }
+    
+    // Clean up when done
+    if (progress >= 1.0) {
+      scene.onBeforeRenderObservable.remove(observer);
+      circleMesh.dispose();
+    }
+  });
+  
+  return circleMesh;
+}
+
+/**
+ * Play heal VFX
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Object} spellDef - Spell definition
+ * @param {Vector3} startPos - Start position (caster)
+ * @param {Vector3} endPos - End position (target)
+ * @param {number} castStartTime - Timestamp when cast started
+ */
+export function playHealVfx(scene, spellDef, startPos, endPos, castStartTime) {
+  const presentation = spellDef.presentation;
+  if (!presentation) {
+    console.warn('Heal VFX: No presentation data found in spell definition');
+    return;
+  }
+  
+  const impactVfx = presentation.impactVfxDef;
+  
+  console.log('Playing heal VFX:', {
+    hasImpact: !!impactVfx,
+    startPos: { x: startPos.x, y: startPos.y, z: startPos.z },
+    endPos: { x: endPos.x, y: endPos.y, z: endPos.z }
+  });
+  
+  // Calculate delay based on cast animation timing
+  const baseDelay = 600; // Match character animation
+  const impactDelay = impactVfx ? (impactVfx.delayMs || 0) : 0;
+  const startDelay = baseDelay + impactDelay;
+  const actualStartTime = castStartTime + startDelay;
+  const now = Date.now();
+  const delay = Math.max(0, actualStartTime - now);
+  
+  setTimeout(() => {
+    // Use values from impactVfxDef if available, otherwise use defaults
+    const circleRadius = impactVfx?.vfx?.size || 0.3;
+    const maxRadius = impactVfx?.explosionRadius || 1.2;
+    const circleDuration = impactVfx?.explosionDuration || impactVfx?.duration || 1000;
+    
+    // Create expanding green circle on the ground
+    createHealCircle(endPos, scene, {
+      radius: circleRadius,
+      maxRadius: maxRadius,
+      duration: circleDuration
+    });
+    
+    // Create upward-moving green particles
+    const particleDuration = impactVfx?.duration || 1000;
+    createHealParticles(endPos, scene, {
+      minSize: 0.1,
+      maxSize: 0.2,
+      minLifeTime: 0.8,
+      maxLifeTime: 1.5,
+      emitRate: 50, // Reduced from 100
+      minEmitPower: 0.5,
+      maxEmitPower: 1.2,
+      emitDuration: particleDuration / 1000 // Convert ms to seconds
+    });
+  }, delay);
+}
+
+/**
  * Play spell VFX based on spell definition
  * @param {Scene} scene - Babylon.js scene
  * @param {Object} spellDef - Spell definition
@@ -611,6 +804,8 @@ export function playSpellVfx(scene, spellDef, startPos, endPos, castStartTime) {
   // Route to specific spell VFX handler
   if (spellDef.spellId === 'fireball') {
     playFireballVfx(scene, spellDef, startPos, endPos, castStartTime);
+  } else if (spellDef.spellId === 'heal') {
+    playHealVfx(scene, spellDef, startPos, endPos, castStartTime);
   } else {
     console.warn(`VFX not implemented for spell: ${spellDef.spellId}`);
   }

@@ -558,6 +558,7 @@ const Game = () => {
             // Update local state when spell bar selection changes
             setSelectedSpell(spellId);
           }}
+          clearMovementVisualization={babylonResourcesRef.current?.clearMovementVisualization}
         />
       )}
       

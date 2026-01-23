@@ -4,7 +4,7 @@ import '../styles/spellActionBar.scss';
 const KEYBINDS = ['1', '2', '3', '4', '5'];
 const MAX_SLOTS = 5;
 
-const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}, selectedSpell: externalSelectedSpell }) => {
+const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}, selectedSpell: externalSelectedSpell, clearMovementVisualization }) => {
   // Use external selected spell if provided, otherwise manage internally
   const [internalSelectedSpell, setInternalSelectedSpell] = useState(null);
   const selectedSpell = externalSelectedSpell !== undefined ? externalSelectedSpell : internalSelectedSpell;
@@ -100,6 +100,12 @@ const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}
         <div
           className={`spell-slot ${spellId ? 'has-spell' : 'empty'} ${isSelected ? 'selected' : ''} ${!canAfford && spellId ? 'insufficient-energy' : ''} ${isOnCooldown ? 'on-cooldown' : ''}`}
           onClick={() => handleSpellClick(spellId, i)}
+          onMouseEnter={() => {
+            // Clear movement visualization when hovering over spell slots
+            if (clearMovementVisualization) {
+              clearMovementVisualization();
+            }
+          }}
           title={spell ? `${spell.name} - ${spell.description || ''} (Cost: ${spell.cost?.energy || 0} Energy)` : 'Empty Slot'}
         >
         {spell && (

@@ -187,13 +187,24 @@ export class FriendRoom extends Room {
         f.userId.toString() === userId ? f.friendId.toString() : f.userId.toString()
       );
 
-      // Send status of all online friends
+      // Send status of all online friends and their lobby status
       for (const friendId of friendIds) {
         const isOnline = this.userSessions.has(friendId);
         client.send('friendStatusUpdate', {
           friendId: friendId,
           isOnline: isOnline,
         });
+        
+        // Also send lobby status if friend is online and in lobby
+        if (isOnline) {
+          const isInLobby = this.usersInLobby.get(friendId) === true;
+          if (isInLobby) {
+            client.send('lobbyStatusUpdate', {
+              friendId: friendId,
+              inLobby: true
+            });
+          }
+        }
       }
     } catch (error) {
       console.error('Error sending initial friend statuses:', error);

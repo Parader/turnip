@@ -122,7 +122,7 @@ export const SpellDefs = {
       targeting: {
         targetType: 'CELL',
         range: { min: 2, max: 6 },
-        requiresLoS: false, // MVP: no LoS initially
+        requiresLoS: true, // MVP: no LoS initially
         allowBlockedCellTarget: false,
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
@@ -289,7 +289,7 @@ export const SpellDefs = {
       targeting: {
         targetType: 'UNIT',
         unitFilter: 'ALLY',
-        range: { min: 1, max: 4 },
+        range: { min: 0, max: 4 },
         requiresLoS: true,
         allowBlockedCellTarget: false,
         allowOccupiedCellTarget: true,
@@ -303,8 +303,32 @@ export const SpellDefs = {
         }
       ],
       presentation: {
-        castAnim: 'cast',
+        castAnim: 'cast2',
+        // Legacy impact VFX (kept for backward compatibility)
         impactVfx: 'heal_glow',
+        // New detailed impact VFX
+        impactVfxDef: {
+          vfx: {
+            type: 'CYLINDER', // Flat circle on ground
+            size: 0.05, // Height of circle
+            color: { r: 0.2, g: 1.0, b: 0.4 }, // Green
+            emissiveIntensity: 0.5, // Dim green glow
+            opacity: 0.4, // 40% opacity
+            animated: true,
+            animation: {
+              scalePulse: false // No pulse, just expand
+            },
+            duration: 1000 // Effect lasts 1 second
+          },
+          delayMs: 0, // Instant on impact
+          duration: 1000,
+          size: 1.2, // Final circle size (overrides vfx.size)
+          explosive: false, // Expands but not explosive
+          explosionRadius: 1.2, // Circle reaches 1.2 cells radius
+          explosionDuration: 1000 // Expansion takes 1 second
+        },
+        // Hit animation delay to sync with heal VFX
+        hitDelayMs: 600, // Delay hit animation to match heal timing
         sound: 'heal_cast'
       },
       animations: {
@@ -316,7 +340,7 @@ export const SpellDefs = {
           canMoveWhilePreparing: false
         },
         cast: {
-          name: 'cast',
+          name: 'cast2',
           blendInMs: 100,
           blendOutMs: 200,
           lockMs: 1000,
