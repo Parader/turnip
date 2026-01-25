@@ -1,12 +1,7 @@
 export const gameData = {
     classes: {
       assassin: {
-        starterSpells: ['dash', 'smoke_trap', 'backstab', 'poison_dagger', 'kick'],
-        unlocks: [
-          { spellId: 'dodge', level: 5 },
-          { spellId: 'shadowstep', level: 8 },
-          { spellId: 'invisibility', level: 10 }
-        ],
+        starterSpells: ['dash', 'backstab', 'poison_dagger', 'kick', 'trap'],
         baseStats: {
           movement: 6,
           energy: 6,
@@ -17,12 +12,7 @@ export const gameData = {
         }
       },
       warrior: {
-        starterSpells: ['slash', 'cut', 'shield', 'taunt', 'rage'],
-        unlocks: [
-          { spellId: 'unstoppable', level: 5 },
-          { spellId: 'break_walls', level: 8 },
-          { spellId: 'spin', level: 10 }
-        ],
+        starterSpells: ['taunt', 'slash', 'heal', 'rage', 'spin'],
         baseStats: {
           movement: 4,
           energy: 5,
@@ -33,12 +23,7 @@ export const gameData = {
         }
       },
       archer: {
-        starterSpells: ['shoot_arrow', 'stun_trap', 'push_shot', 'raining_arrows', 'incapacitating_shot'],
-        unlocks: [
-          { spellId: 'reveal', level: 5 },
-          { spellId: 'morale_boost', level: 8 },
-          { spellId: 'rapid_shot', level: 10 }
-        ],
+        starterSpells: ['shoot_arrow', 'stun_trap', 'raining_arrows', 'morale_boost', 'push_shot'],
         baseStats: {
           movement: 5,
           energy: 6,
@@ -49,12 +34,7 @@ export const gameData = {
         }
       },
       mage: {
-        starterSpells: ['fireball', 'earth_wall', 'heal', 'arcane_explosion', 'entangle'],
-        unlocks: [
-          { spellId: 'teleportation', level: 5 },
-          { spellId: 'shield', level: 8 },
-          { spellId: 'ice_spikes', level: 10 }
-        ],
+        starterSpells: ['fireball', 'earth_block', 'heal', 'arcane_missile', 'teleportation'],
         baseStats: {
           movement: 3,
           energy: 7,

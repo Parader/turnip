@@ -214,8 +214,7 @@ router.get('/info/classes', (req, res) => {
         id: classId,
         name: classId.charAt(0).toUpperCase() + classId.slice(1),
         starterSpells: classData.starterSpells,
-        baseStats: classData.baseStats,
-        unlocks: classData.unlocks
+        baseStats: classData.baseStats
       };
     });
     res.json({ classes });
@@ -236,45 +235,21 @@ router.get('/info/spells/:classId', (req, res) => {
       return res.status(404).json({ error: 'Class not found' });
     }
 
-    // Get all spells for this class (starter + all unlocks)
+    // Get all spells for this class (only starter spells now)
     const allSpellIds = [...classData.starterSpells];
-    classData.unlocks.forEach(unlock => {
-      if (!allSpellIds.includes(unlock.spellId)) {
-        allSpellIds.push(unlock.spellId);
-      }
-    });
-
-    const characterLevel = level ? parseInt(level) : null;
     const availableSpellIds = [...classData.starterSpells];
-    
-    // Add unlocked spells if level is provided
-    if (characterLevel !== null) {
-      classData.unlocks.forEach(unlock => {
-        if (characterLevel >= unlock.level && !availableSpellIds.includes(unlock.spellId)) {
-          availableSpellIds.push(unlock.spellId);
-        }
-      });
-    } else {
-      // If no level provided, include all unlocks (for class preview)
-      classData.unlocks.forEach(unlock => {
-        if (!availableSpellIds.includes(unlock.spellId)) {
-          availableSpellIds.push(unlock.spellId);
-        }
-      });
-    }
 
     // Get spell details from SpellDefs and mark availability
     const spells = allSpellIds
       .filter(spellId => SpellDefs[spellId])
       .map(spellId => {
         const isAvailable = availableSpellIds.includes(spellId);
-        const unlockInfo = classData.unlocks.find(u => u.spellId === spellId);
         
         return {
           id: spellId,
           ...SpellDefs[spellId],
           available: isAvailable,
-          unlockLevel: unlockInfo ? unlockInfo.level : null
+          unlockLevel: null
         };
       });
 

@@ -186,12 +186,40 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
     }
   }
   
+  // Create a large ground plane below all tiles to prevent seeing through the ground
+  // This is "map decor" - can be replaced with a GLB file later
+  const groundPlaneSize = Math.max(mapWidth, mapHeight) * 2; // Make it much larger than the map
+  const mapDecor = MeshBuilder.CreateGround('mapDecor', {
+    width: groundPlaneSize,
+    height: groundPlaneSize,
+    subdivisions: 1
+  }, scene);
+  mapDecor.position = new Vector3(
+    (mapWidth * tileSize) / 2 - tileSize / 2, // Center X
+    -0.02, // Position close to tiles (just below them)
+    (mapHeight * tileSize) / 2 - tileSize / 2  // Center Z
+  );
+  
+  // Create a simple material for the ground plane
+  const groundMaterial = new StandardMaterial('groundMaterial', scene);
+  groundMaterial.diffuseColor = new Color3(0.2, 0.15, 0.1); // Dark brown/earth color
+  groundMaterial.specularColor = new Color3(0.1, 0.1, 0.1);
+  mapDecor.material = groundMaterial;
+  mapDecor.parent = mapContainer;
+  
+  // Store reference to map decor for potential replacement with GLB later
+  if (!scene.metadata) {
+    scene.metadata = {};
+  }
+  scene.metadata.mapDecor = mapDecor;
+  
   return {
     interactiveTiles: startPositionTiles, // Tiles that can be clicked (player team only)
     allStartTiles: allStartPositionTiles, // All starting position tiles (player + enemy) for visibility
     allTiles: allTiles, // All tiles for movement range highlighting
     playerStartMaterial: playerStartMaterial, // Material for player team starting positions
     enemyStartMaterial: enemyStartMaterial, // Material for enemy team starting positions
-    createTileMaterial: createTileMaterial // Function to create regular tile material
+    createTileMaterial: createTileMaterial, // Function to create regular tile material
+    mapDecor: mapDecor // Ground plane mesh (can be replaced with GLB later)
   };
 }

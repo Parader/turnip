@@ -1,4 +1,4 @@
-import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput } from '@babylonjs/core';
+import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput, Animation, DynamicTexture } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
 import { TILE_TYPES } from './mapRenderer';
 import { findPath, getMovementRange } from './pathfinding';
@@ -136,6 +136,15 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   // Build player characters (spheres) if game state is available
   if (gameState) {
     buildPlayerCharacters(scene, gameState, userId, mapWidth, mapHeight);
+    buildSpawnedEntities(scene, gameState, mapWidth, mapHeight);
+  }
+  
+  // Initialize entity meshes storage
+  if (!scene.metadata) {
+    scene.metadata = {};
+  }
+  if (!scene.metadata.entityMeshes) {
+    scene.metadata.entityMeshes = new Map(); // entityId -> mesh
   }
 
   // Store last camera target for smoothing
@@ -229,7 +238,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
 
   // Set up pointer picking for starting position tiles
   let hoveredTile = null;
-  let currentGameState = gameState; // Store current game state
+  let currentGameState = gameState; // Store current game state (will be updated via updatePlayers callback)
   const hoverMaterial = new StandardMaterial('hoverMaterial', scene);
   hoverMaterial.diffuseColor = new Color3(0.5, 0.7, 1.0); // Brighter blue
   hoverMaterial.emissiveColor = new Color3(0.3, 0.5, 1.0);
@@ -263,6 +272,11 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   let movementPathMaterial = null; // Material for path tiles
   let onMovementRequest = null; // Callback for movement requests
   let onSpellCast = null; // Callback for spell cast requests
+  
+  // Multi-target spell system state
+  let selectedTargets = []; // Array of {x, y} for multi-target spells
+  let multiTargetSpell = null; // Reference to spell definition for multi-target spells
+  let targetMarkers = new Map(); // Map of tileKey -> Array of marker meshes
   
   // Initialize scene metadata for pending movement paths
   if (!scene.metadata) {
@@ -332,6 +346,97 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     spellTargetTiles = [];
   };
   
+  // Function to update target markers (white circles) for multi-target spells
+  const updateTargetMarkers = () => {
+    // Clear existing markers
+    targetMarkers.forEach((markers, tileKey) => {
+      markers.forEach(marker => {
+        if (marker && !marker.isDisposed()) {
+          marker.dispose();
+        }
+      });
+    });
+    targetMarkers.clear();
+    
+    // Count selections per tile
+    const selectionCounts = new Map(); // tileKey -> count
+    selectedTargets.forEach(target => {
+      const tileKey = `${target.x}_${target.y}`;
+      selectionCounts.set(tileKey, (selectionCounts.get(tileKey) || 0) + 1);
+    });
+    
+    // Create markers for each selected tile
+    selectionCounts.forEach((count, tileKey) => {
+      const [x, y] = tileKey.split('_').map(Number);
+      const markers = [];
+      
+      // Create multiple circles that stack (smaller for each additional selection)
+      const baseSize = 0.6; // Base circle size
+      const sizeDecrement = 0.15; // How much smaller each additional circle is
+      const heightOffset = 0.02; // Height above ground
+      
+      for (let i = 0; i < count; i++) {
+        const size = baseSize - (i * sizeDecrement);
+        const height = heightOffset + (i * 0.01); // Stack slightly higher
+        
+        // Create white circle marker (using plane for flat circle)
+        const marker = MeshBuilder.CreatePlane(`targetMarker_${tileKey}_${i}`, {
+          size: size,
+          sideOrientation: 2 // Double-sided
+        }, scene);
+        
+        // Position marker above the tile
+        marker.position.x = x;
+        marker.position.y = height;
+        marker.position.z = y; // game y maps to Babylon z
+        
+        // Rotate plane to be flat on the ground (rotate 90 degrees around X axis)
+        marker.rotation.x = Math.PI / 2;
+        
+        // Create white material with circle texture
+        const markerMaterial = new StandardMaterial(`targetMarkerMaterial_${tileKey}_${i}`, scene);
+        markerMaterial.diffuseColor = new Color3(1, 1, 1); // White
+        markerMaterial.emissiveColor = new Color3(0.8, 0.8, 0.8); // Slight glow
+        markerMaterial.alpha = 0.9;
+        markerMaterial.backFaceCulling = false; // Show from both sides
+        
+        // Create a simple circle texture using DynamicTexture
+        const textureSize = 64;
+        const texture = new DynamicTexture(`targetMarkerTexture_${tileKey}_${i}`, textureSize, scene, false);
+        const context = texture.getContext();
+        
+        // Draw white circle with transparent background
+        const center = textureSize / 2;
+        const radius = (textureSize / 2) - 2;
+        
+        // Clear with transparent
+        context.clearRect(0, 0, textureSize, textureSize);
+        
+        // Draw white circle outline (ring)
+        context.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+        context.lineWidth = 3;
+        context.beginPath();
+        context.arc(center, center, radius, 0, Math.PI * 2);
+        context.stroke();
+        
+        texture.update();
+        markerMaterial.diffuseTexture = texture;
+        markerMaterial.emissiveTexture = texture;
+        
+        marker.material = markerMaterial;
+        markers.push(marker);
+      }
+      
+      targetMarkers.set(tileKey, markers);
+    });
+    
+    // Store in scene metadata for cleanup
+    if (!scene.metadata) {
+      scene.metadata = {};
+    }
+    scene.metadata.targetMarkers = targetMarkers;
+  };
+  
   // Function to get all tiles within spell range
   const getSpellRangeTiles = (startX, startY, minRange, maxRange, terrain) => {
     const rangeTiles = [];
@@ -367,34 +472,70 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     const playerX = currentPlayer.position.x;
     const playerY = currentPlayer.position.y;
     
+    // Check if this is a multi-target spell
+    const isMultiTarget = targeting.multiTarget === true;
+    const maxTargets = targeting.maxTargets || 1;
+    
+    // Initialize multi-target state if this is a multi-target spell
+    if (isMultiTarget && !multiTargetSpell) {
+      multiTargetSpell = spellDef;
+      selectedTargets = [];
+      console.log(`Multi-target spell selected: ${spellDef.spellId}, max targets: ${maxTargets}`);
+    } else if (!isMultiTarget) {
+      // Clear multi-target state if switching to single-target spell
+      selectedTargets = [];
+      multiTargetSpell = null;
+      updateTargetMarkers(); // Clear markers
+    }
+    
+    // Get the latest game state from scene metadata (always up-to-date)
+    const latestGameState = scene.metadata?.gameState || currentGameState;
+    
+    // Build occupied tiles set ONCE at the start - used for ALL LOS calculations in this function
+    // This ensures entities and players are calculated at the same time for all checks
+    const occupiedTiles = new Set();
+    if (latestGameState) {
+      // Add all players from my team
+      if (latestGameState.myTeam && latestGameState.myTeam.players) {
+        Object.values(latestGameState.myTeam.players).forEach(player => {
+          if (player.position) {
+            occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+          }
+        });
+      }
+      // Add all players from enemy team
+      if (latestGameState.enemyTeam && latestGameState.enemyTeam.players) {
+        Object.values(latestGameState.enemyTeam.players).forEach(player => {
+          if (player.position) {
+            occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+          }
+        });
+      }
+      // Add spawned entities that block vision - calculated at the same time as players
+      if (latestGameState.spawnedEntities) {
+        Object.values(latestGameState.spawnedEntities).forEach(entity => {
+          if (entity.position) {
+            try {
+              const entityData = JSON.parse(entity.data || '{}');
+              if (entityData.blocksVision) {
+                occupiedTiles.add(`${entity.position.x}_${entity.position.y}`);
+              }
+            } catch (error) {
+              // Ignore parse errors
+            }
+          }
+        });
+      }
+    }
+    
+    // Create blocks function for LOS checking ONCE (exclude caster's position)
+    // This blocks function is used for ALL LOS checks: spell range visualization AND individual tile checks
+    const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+    
     // Always show spell range when in cast mode
     if (isHover || isLeftClick) {
       // Clear previous visualization
       clearSpellTargeting();
-      
-      // Collect all occupied tiles (player positions)
-      const occupiedTiles = new Set();
-      if (currentGameState) {
-        // Add all players from my team
-        if (currentGameState.myTeam && currentGameState.myTeam.players) {
-          Object.values(currentGameState.myTeam.players).forEach(player => {
-            if (player.position) {
-              occupiedTiles.add(`${player.position.x}_${player.position.y}`);
-            }
-          });
-        }
-        // Add all players from enemy team
-        if (currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
-          Object.values(currentGameState.enemyTeam.players).forEach(player => {
-            if (player.position) {
-              occupiedTiles.add(`${player.position.x}_${player.position.y}`);
-            }
-          });
-        }
-      }
-      
-      // Create blocks function for LOS checking (exclude caster's position)
-      const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
       
       // Show spell range in light blue, with disabled tiles dimmed
       const rangeTiles = getSpellRangeTiles(playerX, playerY, range.min, range.max, terrain);
@@ -492,30 +633,13 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
           let isValidTarget = true;
           
           // Check line of sight if required
+          // Use the SAME blocks function that was created above for spell range visualization
+          // This ensures entities and players are calculated at the same time
           if (targeting.requiresLoS) {
-            // Collect all occupied tiles (player positions) for this check
-            const occupiedTilesForCheck = new Set();
-            if (currentGameState) {
-              if (currentGameState.myTeam && currentGameState.myTeam.players) {
-                Object.values(currentGameState.myTeam.players).forEach(player => {
-                  if (player.position) {
-                    occupiedTilesForCheck.add(`${player.position.x}_${player.position.y}`);
-                  }
-                });
-              }
-              if (currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
-                Object.values(currentGameState.enemyTeam.players).forEach(player => {
-                  if (player.position) {
-                    occupiedTilesForCheck.add(`${player.position.x}_${player.position.y}`);
-                  }
-                });
-              }
-            }
-            const blocksForCheck = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTilesForCheck, { x: playerX, y: playerY });
             const hasLineOfSight = hasLOS(
               { x: playerX, y: playerY },
               { x: tileX, y: tileY },
-              blocksForCheck
+              blocks  // Reuse the same blocks function from above
             );
             if (!hasLineOfSight) {
               isValidTarget = false;
@@ -582,10 +706,44 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             
             // Handle spell cast on click
             if (isLeftClick) {
-              // Send spell cast request to server
-              // The server will broadcast to all clients (including this one) to play the animation
-              if (onSpellCast) {
-                onSpellCast(spellDef.spellId || spellDef.name, tileX, tileY);
+              if (isMultiTarget) {
+                // Multi-target spell: add target to selection
+                if (selectedTargets.length < maxTargets) {
+                  selectedTargets.push({ x: tileX, y: tileY });
+                  console.log(`Added target (${tileX}, ${tileY}), total: ${selectedTargets.length}/${maxTargets}`);
+                  updateTargetMarkers(); // Update visual markers
+                  
+                  // If we've reached max targets, send spell cast request to server
+                  if (selectedTargets.length >= maxTargets) {
+                    console.log(`Multi-target spell complete, casting with ${selectedTargets.length} targets`);
+                    
+                    // Send spell cast request to server with targets array
+                    if (onSpellCast) {
+                      onSpellCast(spellDef.spellId || spellDef.name, selectedTargets);
+                    }
+                    
+                    // Clear selection after sending request
+                    selectedTargets = [];
+                    multiTargetSpell = null;
+                    updateTargetMarkers(); // Clear markers
+                    
+                    // Clear spell selection
+                    selectedSpell = null;
+                    selectedSpellDef = null;
+                    if (scene.metadata) {
+                      scene.metadata.selectedSpell = null;
+                      scene.metadata.selectedSpellDef = null;
+                    }
+                    clearSpellTargeting();
+                  }
+                } else {
+                  console.log(`Max targets (${maxTargets}) reached, cannot add more`);
+                }
+              } else {
+                // Single-target spell: cast immediately
+                if (onSpellCast) {
+                  onSpellCast(spellDef.spellId || spellDef.name, tileX, tileY);
+                }
               }
             }
           }
@@ -631,19 +789,38 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       // Calculate available movement points
       const availableMP = (currentPlayer.movementPoints || 0) - (currentPlayer.usedMovementPoints || 0);
       
+      // Get the latest game state from scene metadata (always up-to-date)
+      const latestGameStateForMovement = scene.metadata?.gameState || currentGameState;
+      
       // Get all occupied tiles
       const occupiedTiles = new Set();
-      if (currentGameState.myTeam && currentGameState.myTeam.players) {
-        Object.values(currentGameState.myTeam.players).forEach(player => {
+      if (latestGameStateForMovement.myTeam && latestGameStateForMovement.myTeam.players) {
+        Object.values(latestGameStateForMovement.myTeam.players).forEach(player => {
           if (player.position && player.userId !== userId) {
             occupiedTiles.add(`${player.position.x}_${player.position.y}`);
           }
         });
       }
-      if (currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
-        Object.values(currentGameState.enemyTeam.players).forEach(player => {
+      if (latestGameStateForMovement.enemyTeam && latestGameStateForMovement.enemyTeam.players) {
+        Object.values(latestGameStateForMovement.enemyTeam.players).forEach(player => {
           if (player.position) {
             occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+          }
+        });
+      }
+      
+      // Add spawned entities that block movement
+      if (latestGameStateForMovement.spawnedEntities) {
+        Object.values(latestGameStateForMovement.spawnedEntities).forEach(entity => {
+          if (entity.position) {
+            try {
+              const entityData = JSON.parse(entity.data || '{}');
+              if (entityData.blocksMovement) {
+                occupiedTiles.add(`${entity.position.x}_${entity.position.y}`);
+              }
+            } catch (error) {
+              // Ignore parse errors
+            }
           }
         });
       }
@@ -781,8 +958,8 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     }
     
     // Check if current player is ready - if so, disable tile interaction
-    const currentPlayer = currentGameState.myTeam && Object.values(currentGameState.myTeam.players || {}).find(p => p.userId === userId);
-    const isPlayerReady = currentPlayer?.ready || false;
+    const prepPhasePlayer = currentGameState.myTeam && Object.values(currentGameState.myTeam.players || {}).find(p => p.userId === userId);
+    const isPlayerReady = prepPhasePlayer?.ready || false;
     
     if (isPlayerReady) {
       // Player is ready - restore hover and disable interaction
@@ -917,6 +1094,137 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         scene.metadata.gameState = newGameState;
         
         updatePlayerCharacters(scene, newGameState, userId, mapWidth, mapHeight);
+        updateSpawnedEntities(scene, newGameState, mapWidth, mapHeight);
+        
+        // If player is in cast mode, recalculate spell range to include newly spawned entities
+        if (selectedSpell && selectedSpellDef && newGameState.phase === 'game') {
+          const currentPlayer = newGameState.myTeam && 
+            Object.values(newGameState.myTeam.players || {}).find(p => p.userId === userId);
+          
+          if (currentPlayer && currentPlayer.position && terrain) {
+            const targeting = selectedSpellDef.targeting || {};
+            const range = targeting.range || { min: 0, max: 10 };
+            const playerX = currentPlayer.position.x;
+            const playerY = currentPlayer.position.y;
+            
+            // Get the latest game state (should be newGameState, but use scene.metadata to be safe)
+            const latestGameState = scene.metadata?.gameState || newGameState;
+            
+            // Build occupied tiles set with entities included
+            const occupiedTiles = new Set();
+            if (latestGameState) {
+              // Add all players from my team
+              if (latestGameState.myTeam && latestGameState.myTeam.players) {
+                Object.values(latestGameState.myTeam.players).forEach(player => {
+                  if (player.position) {
+                    occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+                  }
+                });
+              }
+              // Add all players from enemy team
+              if (latestGameState.enemyTeam && latestGameState.enemyTeam.players) {
+                Object.values(latestGameState.enemyTeam.players).forEach(player => {
+                  if (player.position) {
+                    occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+                  }
+                });
+              }
+              // Add spawned entities that block vision - calculated at the same time as players
+              if (latestGameState.spawnedEntities) {
+                Object.values(latestGameState.spawnedEntities).forEach(entity => {
+                  if (entity.position) {
+                    try {
+                      const entityData = JSON.parse(entity.data || '{}');
+                      if (entityData.blocksVision) {
+                        occupiedTiles.add(`${entity.position.x}_${entity.position.y}`);
+                      }
+                    } catch (error) {
+                      // Ignore parse errors
+                    }
+                  }
+                });
+              }
+            }
+            
+            // Create blocks function for LOS checking
+            const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+            
+            // Clear and recalculate spell range
+            clearSpellTargeting();
+            
+            const rangeTiles = getSpellRangeTiles(playerX, playerY, range.min, range.max, terrain);
+            rangeTiles.forEach(({ x, y }) => {
+              const tileKey = `${x}_${y}`;
+              const tile = allTiles.get(tileKey);
+              if (tile) {
+                if (!tile.userData) {
+                  tile.userData = {};
+                }
+                if (!tile.userData.originalMaterial) {
+                  tile.userData.originalMaterial = tile.material;
+                }
+                
+                // Check if this tile is a valid target
+                let isValidTarget = true;
+                
+                // Check line of sight if required
+                if (targeting.requiresLoS) {
+                  const hasLineOfSight = hasLOS(
+                    { x: playerX, y: playerY },
+                    { x, y },
+                    blocks
+                  );
+                  if (!hasLineOfSight) {
+                    isValidTarget = false;
+                  }
+                }
+                
+                if (targeting.targetType === 'UNIT') {
+                  // For UNIT targeting, must have a unit at the position that matches unitFilter
+                  isValidTarget = false;
+                  
+                  // Find unit at target position
+                  let targetUnit = null;
+                  if (latestGameState && latestGameState.myTeam && latestGameState.myTeam.players) {
+                    targetUnit = Object.values(latestGameState.myTeam.players).find(p => 
+                      p.position && p.position.x === x && p.position.y === y
+                    );
+                  }
+                  
+                  if (!targetUnit && latestGameState && latestGameState.enemyTeam && latestGameState.enemyTeam.players) {
+                    targetUnit = Object.values(latestGameState.enemyTeam.players).find(p => 
+                      p.position && p.position.x === x && p.position.y === y
+                    );
+                  }
+                  
+                  if (targetUnit) {
+                    // Check if unit matches the filter
+                    const isAlly = latestGameState && latestGameState.myTeam && 
+                                  latestGameState.myTeam.players && 
+                                  Object.values(latestGameState.myTeam.players).some(p => p.userId === targetUnit.userId);
+                    const isEnemy = !isAlly;
+                    
+                    const unitFilter = targeting.unitFilter || 'ANY';
+                    if (unitFilter === 'ALLY' && isAlly) {
+                      isValidTarget = true;
+                    } else if (unitFilter === 'ENEMY' && isEnemy) {
+                      isValidTarget = true;
+                    } else if (unitFilter === 'ANY') {
+                      isValidTarget = true;
+                    }
+                  }
+                } else if (targeting.targetType === 'SELF') {
+                  // For SELF targeting, only valid if targeting the caster's own position
+                  isValidTarget = (x === playerX && y === playerY);
+                }
+                
+                // Use disabled material for invalid targets, normal range material for valid ones
+                tile.material = isValidTarget ? spellRangeMaterial : spellDisabledMaterial;
+                spellRangeTiles.push(tileKey);
+              }
+            });
+          }
+        }
         
         // Update starting position tiles material based on phase
         // During preparation: show colored tiles (blue/red)
@@ -993,6 +1301,20 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       selectedSpell = spellId;
       selectedSpellDef = spellDef;
       
+      // Reset multi-target state when spell changes
+      selectedTargets = [];
+      multiTargetSpell = null;
+      
+      // Clear target markers
+      targetMarkers.forEach((markers, tileKey) => {
+        markers.forEach(marker => {
+          if (marker && !marker.isDisposed()) {
+            marker.dispose();
+          }
+        });
+      });
+      targetMarkers.clear();
+      
       // Store in scene metadata
       if (!scene.metadata) {
         scene.metadata = {};
@@ -1019,22 +1341,41 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             clearSpellTargeting();
             
             // Show spell range with dimmed invalid tiles
-            // Collect all occupied tiles (player positions)
+            // Get the latest game state from scene metadata (always up-to-date)
+            const latestGameState = scene.metadata?.gameState || currentGameState;
+            
+            // Collect all occupied tiles (player positions and blocking entities)
+            // This ensures entities and players are calculated at the same time
             const occupiedTiles = new Set();
-            if (currentGameState) {
+            if (latestGameState) {
               // Add all players from my team
-              if (currentGameState.myTeam && currentGameState.myTeam.players) {
-                Object.values(currentGameState.myTeam.players).forEach(player => {
+              if (latestGameState.myTeam && latestGameState.myTeam.players) {
+                Object.values(latestGameState.myTeam.players).forEach(player => {
                   if (player.position) {
                     occupiedTiles.add(`${player.position.x}_${player.position.y}`);
                   }
                 });
               }
               // Add all players from enemy team
-              if (currentGameState.enemyTeam && currentGameState.enemyTeam.players) {
-                Object.values(currentGameState.enemyTeam.players).forEach(player => {
+              if (latestGameState.enemyTeam && latestGameState.enemyTeam.players) {
+                Object.values(latestGameState.enemyTeam.players).forEach(player => {
                   if (player.position) {
                     occupiedTiles.add(`${player.position.x}_${player.position.y}`);
+                  }
+                });
+              }
+              // Add spawned entities that block vision - calculated at the same time as players
+              if (latestGameState.spawnedEntities) {
+                Object.values(latestGameState.spawnedEntities).forEach(entity => {
+                  if (entity.position) {
+                    try {
+                      const entityData = JSON.parse(entity.data || '{}');
+                      if (entityData.blocksVision) {
+                        occupiedTiles.add(`${entity.position.x}_${entity.position.y}`);
+                      }
+                    } catch (error) {
+                      // Ignore parse errors
+                    }
                   }
                 });
               }
@@ -1126,9 +1467,16 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       // Clear movement visualization when switching modes
       clearMovementVisualization();
     },
-    playSpellCastAnimation: (castUserId, spellId, castAnimDef, spellDef = null, targetX = null, targetY = null) => {
+    playSpellCastAnimation: (castUserId, spellId, castAnimDef, spellDef = null, targetX = null, targetY = null, targets = null) => {
+      // Determine if this is a multi-target spell
+      const isMultiTarget = Array.isArray(targets) && targets.length > 0;
+      
+      // For rotation, use first target if multi-target, or single target
+      const rotationTargetX = isMultiTarget ? (targets[0]?.x ?? null) : targetX;
+      const rotationTargetY = isMultiTarget ? (targets[0]?.y ?? null) : targetY;
+      
       // Rotate player to face target before casting
-      if (targetX !== null && targetY !== null && scene.metadata && scene.metadata.playerMeshes) {
+      if (rotationTargetX !== null && rotationTargetY !== null && scene.metadata && scene.metadata.playerMeshes) {
         const playerMesh = scene.metadata.playerMeshes.get(castUserId);
         if (playerMesh) {
           // Get caster position from game state or mesh
@@ -1161,13 +1509,13 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
           
           if (casterX !== null && casterY !== null) {
             // Check if this is a self-cast (target is same as caster position)
-            const isSelfCast = Math.abs(targetX - casterX) < 0.1 && Math.abs(targetY - casterY) < 0.1;
+            const isSelfCast = Math.abs(rotationTargetX - casterX) < 0.1 && Math.abs(rotationTargetY - casterY) < 0.1;
             
             // Only rotate if not self-casting
             if (!isSelfCast) {
               // Calculate direction from caster to target
-              const dx = targetX - casterX;
-              const dy = targetY - casterY;
+              const dx = rotationTargetX - casterX;
+              const dy = rotationTargetY - casterY;
               
               // Calculate target angle using atan2
               // In game coordinates: dx = X difference, dy = Y difference
@@ -1272,7 +1620,10 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
           spellDef.spellId = spellId;
         }
         
-        if (spellDef && spellDef.presentation && (spellDef.presentation.projectileVfx || spellDef.presentation.impactVfxDef || spellDef.presentation.groundEffectVfx) && targetX !== null && targetY !== null) {
+        // Play VFX for each target
+        const targetsToProcess = isMultiTarget ? targets : (targetX !== null && targetY !== null ? [{ x: targetX, y: targetY }] : []);
+        
+        if (spellDef && spellDef.presentation && (spellDef.presentation.projectileVfx || spellDef.presentation.impactVfxDef || spellDef.presentation.groundEffectVfx) && targetsToProcess.length > 0) {
           // Get caster position - prioritize player mesh (most accurate)
           let casterPos = null;
           let casterOrientation = 0;
@@ -1340,15 +1691,28 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             const spawnY = casterPos.y + 0.3; // Slightly above character center
             const spawnPos = new Vector3(spawnX, spawnY, spawnZ);
             
-            // Convert target grid coordinates to world coordinates
-            // tileSize is 1 in Babylon.js, so grid coordinates = world coordinates
-            // But ensure we're using the correct coordinate system: game y -> Babylon z
-            const tileSize = 1; // Babylon.js uses 1 unit per tile
-            const targetWorldX = targetX * tileSize;
-            const targetWorldZ = targetY * tileSize; // game y maps to Babylon z
-            const targetPos = new Vector3(targetWorldX, 0.3, targetWorldZ); // Target at same height
-            console.log(`Playing VFX for spell ${spellId}: spawn at (${spawnPos.x.toFixed(2)}, ${spawnPos.y.toFixed(2)}, ${spawnPos.z.toFixed(2)}), target at (${targetPos.x.toFixed(2)}, ${targetPos.z.toFixed(2)}), orientation: ${casterOrientation.toFixed(2)}`);
-            playSpellVfx(scene, spellDef, spawnPos, targetPos, castStartTime);
+            // Process each target
+            targetsToProcess.forEach((target, index) => {
+              // Convert target grid coordinates to world coordinates
+              // tileSize is 1 in Babylon.js, so grid coordinates = world coordinates
+              // But ensure we're using the correct coordinate system: game y -> Babylon z
+              const tileSize = 1; // Babylon.js uses 1 unit per tile
+              const targetWorldX = target.x * tileSize;
+              const targetWorldZ = target.y * tileSize; // game y maps to Babylon z
+              const targetPos = new Vector3(targetWorldX, 0.3, targetWorldZ); // Target at same height
+              
+              // Delay each projectile slightly for multi-target spells
+              const delay = index * 150; // 150ms delay between each projectile
+              setTimeout(() => {
+                console.log(`Playing VFX for spell ${spellId} target ${index + 1}/${targetsToProcess.length}: spawn at (${spawnPos.x.toFixed(2)}, ${spawnPos.y.toFixed(2)}, ${spawnPos.z.toFixed(2)}), target at (${targetPos.x.toFixed(2)}, ${targetPos.z.toFixed(2)}), orientation: ${casterOrientation.toFixed(2)}`);
+                // Use appropriate VFX based on spell
+                const vfxSpellDef = {
+                  spellId: spellId, // Use actual spell ID so it routes correctly
+                  presentation: spellDef.presentation || {}
+                };
+                playSpellVfx(scene, vfxSpellDef, spawnPos, targetPos, castStartTime);
+              }, delay);
+            });
           } else {
             console.error(`Could not find valid caster position for VFX: ${castUserId}. Position: ${casterPos ? `(${casterPos.x}, ${casterPos.y}, ${casterPos.z})` : 'null'}. GameState: ${!!gameState}, Player meshes: ${!!(scene.metadata && scene.metadata.playerMeshes)}`);
             if (scene.metadata && scene.metadata.playerMeshes) {
@@ -1360,8 +1724,8 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             console.warn(`No spell definition provided for VFX: ${spellId}`);
           } else if (!spellDef.presentation) {
             console.warn(`No presentation data in spell definition for: ${spellId}`);
-          } else if (targetX === null || targetY === null) {
-            console.warn(`Target coordinates missing: targetX=${targetX}, targetY=${targetY}`);
+          } else if (targetsToProcess.length === 0) {
+            console.warn(`No targets provided for VFX: targetsToProcess=${targetsToProcess.length}`);
           }
         }
       } else {
@@ -1389,6 +1753,475 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       clearMovementVisualization();
     }
   };
+}
+
+/**
+ * Create a mesh for a spawned entity
+ * @param {Object} entity - Entity data
+ * @param {Scene} scene - Babylon.js scene
+ * @param {number} tileSize - Size of each tile
+ * @returns {Promise<Mesh>} Created mesh
+ */
+async function createEntityMesh(entity, scene, tileSize) {
+  const xPos = entity.position.x * tileSize;
+  const zPos = entity.position.y * tileSize;
+  
+  let mesh = null;
+  const entityId = entity.entityId;
+  
+  // Create mesh based on entity type
+  switch (entity.entityType) {
+    case 'earth_block':
+      // Load rock model from assets
+      try {
+        const modelPath = '/assets/rock.glb';
+        console.log(`Loading rock model for earth_block entity ${entityId} from: ${modelPath}`);
+        const result = await SceneLoader.ImportMeshAsync('', modelPath, '', scene);
+        
+        console.log(`Rock model loaded: ${result.meshes.length} meshes found`);
+        
+        if (result.meshes && result.meshes.length > 0) {
+          // Find the root mesh (one without a parent, or use the first one)
+          let rootMesh = result.meshes.find(m => !m.parent) || result.meshes[0];
+          
+          // Create a TransformNode container to handle rotation reliably
+          const entityContainer = new TransformNode(`entityContainer_${entityId}`, scene);
+          
+          // Make the root mesh a child of the container
+          rootMesh.parent = entityContainer;
+          rootMesh.position = Vector3.Zero();
+          rootMesh.rotation = Vector3.Zero();
+          
+          // Use container as the mesh reference
+          mesh = entityContainer;
+          mesh.name = `entity_${entityId}`;
+          
+          // Store reference to the actual model mesh
+          mesh.metadata = mesh.metadata || {};
+          mesh.metadata.modelMesh = rootMesh;
+          
+          // Make all child meshes non-pickable
+          result.meshes.forEach(m => {
+            m.isPickable = false;
+          });
+          
+          // Compute bounding box from all meshes
+          // Sometimes the root mesh doesn't have proper bounding info, so we compute it from all meshes
+          let minX = Infinity, minY = Infinity, minZ = Infinity;
+          let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+          
+          result.meshes.forEach(m => {
+            if (m.getBoundingInfo) {
+              const info = m.getBoundingInfo();
+              if (info && info.boundingBox) {
+                const min = info.boundingBox.minimum;
+                const max = info.boundingBox.maximum;
+                minX = Math.min(minX, min.x);
+                minY = Math.min(minY, min.y);
+                minZ = Math.min(minZ, min.z);
+                maxX = Math.max(maxX, max.x);
+                maxY = Math.max(maxY, max.y);
+                maxZ = Math.max(maxZ, max.z);
+              }
+            }
+          });
+          
+          // If bounding box is still invalid, use default size
+          let size, maxSize;
+          if (minX === Infinity || maxX === -Infinity) {
+            console.warn('Could not compute bounding box from meshes, using default size');
+            size = { x: 1, y: 1, z: 1 };
+            maxSize = 1;
+          } else {
+            size = {
+              x: maxX - minX,
+              y: maxY - minY,
+              z: maxZ - minZ
+            };
+            maxSize = Math.max(size.x, size.y, size.z);
+          }
+          
+          console.log(`Rock model size: ${size.x}, ${size.y}, ${size.z}, max: ${maxSize}`);
+          
+          // Scale to fit within tile, then make it bigger (4x for more presence)
+          const targetSize = tileSize * 0.8;
+          const baseScale = maxSize > 0 ? targetSize / maxSize : 0.8;
+          const scale = baseScale * 4; // Make it bigger
+          // Apply scaling to the actual model mesh, not the container
+          rootMesh.scaling = new Vector3(scale, scale, scale);
+          
+          console.log(`Rock model scaled by: ${scale} (base: ${baseScale} * 4), target size: ${targetSize}`);
+          
+          // Refresh bounding info after scaling to get accurate dimensions (use rootMesh for bounding box)
+          rootMesh.refreshBoundingInfo();
+          const boundingInfoAfterScale = rootMesh.getBoundingInfo();
+          const meshMinY = boundingInfoAfterScale.boundingBox.minimum.y;
+          const meshMaxY = boundingInfoAfterScale.boundingBox.maximum.y;
+          const modelHeight = meshMaxY - meshMinY;
+          
+          // Position so the bottom of the rock is slightly below ground level
+          // The mesh origin is at (0,0,0) relative to the mesh, but the bounding box minY tells us
+          // where the bottom is relative to the origin. To place the bottom at ground level (Y=0),
+          // we need to offset by -meshMinY. Then add a small offset to sink it slightly.
+          const groundOffset = -0.05; // Lower it a bit more into the ground
+          const finalY = -meshMinY + groundOffset; // This positions the bottom slightly below Y=0
+          
+          // Start position well below ground for animation
+          // Make sure startY is significantly different from finalY
+          let startY = finalY - Math.max(modelHeight * 6, 3.0); // Start at least 3.0 units below, or 6x model height
+          
+          // Ensure mesh is visible
+          mesh.isVisible = true;
+          mesh.setEnabled(true);
+          
+          // Set initial position below ground
+          mesh.position = new Vector3(xPos, startY, zPos);
+          
+          // Apply random rotation to make each rock look different (different each time spell is cast)
+          // Apply rotation to the container (TransformNode) - this will rotate all child meshes
+          const randomRotationY = Math.random() * Math.PI * 2; // Random rotation around Y axis (0 to 360 degrees)
+          mesh.rotation.y = randomRotationY;
+          
+          // Store rotation and animation data in metadata
+          if (!mesh.metadata) {
+            mesh.metadata = {};
+          }
+          mesh.metadata.initialRotationY = randomRotationY;
+          mesh.metadata.animationStartY = startY;
+          mesh.metadata.animationFinalY = finalY;
+          mesh.metadata.animationXPos = xPos;
+          mesh.metadata.animationZPos = zPos;
+          
+          console.log(`Rock ${entityId} rotated randomly: ${(randomRotationY * 180 / Math.PI).toFixed(1)} degrees, container.rotation.y = ${mesh.rotation.y}`);
+          
+          console.log(`Rock model - modelHeight: ${modelHeight}, meshMinY: ${meshMinY}, meshMaxY: ${meshMaxY}`);
+          console.log(`Rock model - finalY: ${finalY}, startY: ${startY}, difference: ${finalY - startY}`);
+          console.log(`Rock model positioned at: (${xPos}, ${startY} -> ${finalY}, ${zPos})`);
+          
+          // Ensure startY is actually different from finalY
+          if (Math.abs(finalY - startY) < 0.01) {
+            console.warn(`Warning: startY and finalY are too close! Using fallback values.`);
+            const fallbackStartY = finalY - 0.5; // Force at least 0.5 units difference
+            console.log(`Using fallback startY: ${fallbackStartY}`);
+            startY = fallbackStartY;
+          }
+          
+          console.log(`Starting rock rise animation from Y=${startY} to Y=${finalY}`);
+          
+          // Mark as animating (metadata already stored above)
+          mesh.metadata.isAnimating = true;
+          
+          // Animate rock rising from ground using scene render loop for reliability
+          // Delay animation start by 0.8 seconds for dramatic effect
+          setTimeout(() => {
+            const animationDuration = 2.0; // 2 seconds (slower movement)
+            const animationStartTime = Date.now();
+            const shakeIntensity = 0.04; // Shake intensity (increased for more shake)
+            
+            console.log(`Rock animation starting now, mesh Y position: ${mesh.position.y}`);
+            
+            const observer = scene.onBeforeRenderObservable.add(() => {
+              if (!mesh || mesh.isDisposed()) {
+                scene.onBeforeRenderObservable.remove(observer);
+                return;
+              }
+              
+              const elapsed = (Date.now() - animationStartTime) / 1000; // Convert to seconds
+              const progress = Math.min(elapsed / animationDuration, 1.0);
+              
+              // Ease-out function for smooth animation
+              const easedProgress = 1 - Math.pow(1 - progress, 3);
+              
+              // Interpolate Y position (main movement)
+              const currentY = startY + (finalY - startY) * easedProgress;
+              
+              // Add shaking effect (random small offsets that decrease as rock reaches top)
+              const shakeFactor = 1 - progress; // Shake less as it reaches top
+              const shakeX = (Math.random() - 0.5) * shakeIntensity * shakeFactor;
+              const shakeY = (Math.random() - 0.5) * shakeIntensity * 0.5 * shakeFactor; // Vertical shake (smaller)
+              const shakeZ = (Math.random() - 0.5) * shakeIntensity * shakeFactor;
+              
+              // Apply position with shake (rotation is already set and should persist)
+              mesh.position.x = xPos + shakeX;
+              mesh.position.y = currentY + shakeY;
+              mesh.position.z = zPos + shakeZ;
+              
+              // Ensure rotation persists during animation
+              if (mesh.rotation.y === 0 && mesh.metadata?.initialRotationY !== undefined) {
+                mesh.rotation.y = mesh.metadata.initialRotationY;
+              }
+              
+              // Remove observer when animation completes
+              if (progress >= 1.0) {
+                scene.onBeforeRenderObservable.remove(observer);
+                // Ensure final position is exact (no shake)
+                mesh.position.x = xPos;
+                mesh.position.y = finalY;
+                mesh.position.z = zPos;
+                if (mesh.metadata) {
+                  mesh.metadata.isAnimating = false;
+                }
+                console.log(`Rock rise animation completed, final position: ${finalY}`);
+              }
+            });
+            
+            console.log(`Rock animation observer registered, mesh visible: ${mesh.isVisible}`);
+          }, 800); // Delay animation start by 0.8 seconds
+          
+          // Check and preserve textures/materials from GLB
+          // GLB loader should preserve materials, but we verify they're loaded
+          result.meshes.forEach(m => {
+            if (m.material) {
+              console.log(`Mesh ${m.name} has material: ${m.material.name}, type: ${m.material.getClassName()}`);
+              // If it's a PBR material, check textures
+              if (m.material.getClassName() === 'PBRMaterial') {
+                const pbrMat = m.material;
+                console.log(`PBR Material - Albedo texture: ${pbrMat.albedoTexture ? pbrMat.albedoTexture.name : 'none'}`);
+                console.log(`PBR Material - Normal texture: ${pbrMat.normalTexture ? pbrMat.normalTexture.name : 'none'}`);
+                // Ensure material is not disposed
+                pbrMat.doNotSerialize = false;
+              } else if (m.material.getClassName() === 'StandardMaterial') {
+                const stdMat = m.material;
+                console.log(`Standard Material - Diffuse texture: ${stdMat.diffuseTexture ? stdMat.diffuseTexture.name : 'none'}`);
+              }
+            } else {
+              console.warn(`Mesh ${m.name} has no material - textures may be missing`);
+              // If no material, the GLB might not have materials embedded
+              // In that case, textures would need to be loaded separately
+            }
+          });
+        } else {
+          throw new Error('No meshes found in rock model');
+        }
+      } catch (error) {
+        console.error(`Failed to load rock model for earth_block entity ${entityId}:`, error);
+        console.warn(`Using fallback cube instead`);
+        // Fallback to cube if model fails to load
+        mesh = MeshBuilder.CreateBox(`entity_${entityId}`, {
+          size: tileSize * 0.8,
+          height: tileSize * 0.6
+        }, scene);
+        
+        const material = new StandardMaterial(`entity_material_${entityId}`, scene);
+        material.diffuseColor = new Color3(0.4, 0.25, 0.15);
+        material.specularColor = new Color3(0.2, 0.1, 0.05);
+        material.emissiveColor = new Color3(0.05, 0.03, 0.02);
+        mesh.material = material;
+        mesh.position = new Vector3(xPos, (tileSize * 0.6) / 2, zPos);
+      }
+      break;
+      
+    default:
+      // Default: create a simple sphere
+      mesh = MeshBuilder.CreateSphere(`entity_${entityId}`, {
+        diameter: tileSize * 0.5,
+        segments: 16
+      }, scene);
+      
+      const defaultMaterial = new StandardMaterial(`entity_material_${entityId}`, scene);
+      defaultMaterial.diffuseColor = new Color3(0.5, 0.5, 0.5);
+      mesh.material = defaultMaterial;
+      mesh.position = new Vector3(xPos, tileSize * 0.25, zPos);
+  }
+  
+  // Store entity metadata (merge with existing metadata to preserve animation state)
+  if (!mesh.metadata) {
+    mesh.metadata = {};
+  }
+  mesh.metadata.entityId = entityId;
+  mesh.metadata.entityType = entity.entityType;
+  
+  // Make entity non-pickable (so it doesn't interfere with tile picking)
+  mesh.isPickable = false;
+  
+  return mesh;
+}
+
+/**
+ * Build all spawned entities in the scene
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Object} gameState - Game state with spawned entities
+ * @param {number} mapWidth - Map width
+ * @param {number} mapHeight - Map height
+ */
+function buildSpawnedEntities(scene, gameState, mapWidth, mapHeight) {
+  if (!gameState || !gameState.spawnedEntities) {
+    return;
+  }
+  
+  const tileSize = 1; // Match the tile size used in map rendering
+  
+  // Initialize entity meshes storage if not exists
+  if (!scene.metadata) {
+    scene.metadata = {};
+  }
+  if (!scene.metadata.entityMeshes) {
+    scene.metadata.entityMeshes = new Map();
+  }
+  
+  // Create meshes for all entities (async)
+  const loadPromises = [];
+  Object.values(gameState.spawnedEntities).forEach(entity => {
+    if (entity.position && !scene.metadata.entityMeshes.has(entity.entityId)) {
+      loadPromises.push(
+        createEntityMesh(entity, scene, tileSize).then(mesh => {
+          if (mesh) {
+            scene.metadata.entityMeshes.set(entity.entityId, mesh);
+          }
+        }).catch(error => {
+          console.error(`Failed to create mesh for entity ${entity.entityId}:`, error);
+        })
+      );
+    }
+  });
+  
+  // Wait for all entities to load (but don't block)
+  Promise.all(loadPromises).catch(error => {
+    console.error('Error loading entity meshes:', error);
+  });
+}
+
+/**
+ * Update spawned entities when game state changes
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Object} gameState - Updated game state
+ * @param {number} mapWidth - Map width
+ * @param {number} mapHeight - Map height
+ */
+function updateSpawnedEntities(scene, gameState, mapWidth, mapHeight) {
+  if (!scene.metadata || !scene.metadata.entityMeshes) {
+    scene.metadata = scene.metadata || {};
+    scene.metadata.entityMeshes = new Map();
+  }
+  
+  const tileSize = 1;
+  const currentEntityIds = new Set();
+  
+  // Update or create entities
+  if (gameState && gameState.spawnedEntities) {
+    Object.values(gameState.spawnedEntities).forEach(entity => {
+      if (entity.position) {
+        currentEntityIds.add(entity.entityId);
+        
+        const existingMesh = scene.metadata.entityMeshes.get(entity.entityId);
+        if (existingMesh) {
+          // Update position if it changed (but don't override Y if animating)
+          const xPos = entity.position.x * tileSize;
+          const zPos = entity.position.y * tileSize;
+          existingMesh.position.x = xPos;
+          existingMesh.position.z = zPos;
+          // Don't update Y position if animation is in progress
+          if (existingMesh.metadata && existingMesh.metadata.isAnimating) {
+            // Skip Y position update during animation
+          } else {
+            // Y position can be updated if not animating
+          }
+        } else {
+          // Create new mesh (async)
+          createEntityMesh(entity, scene, tileSize).then(mesh => {
+            if (mesh) {
+              scene.metadata.entityMeshes.set(entity.entityId, mesh);
+            }
+          }).catch(error => {
+            console.error(`Failed to create mesh for entity ${entity.entityId}:`, error);
+          });
+        }
+      }
+    });
+  }
+  
+  // Remove meshes for entities that no longer exist
+  scene.metadata.entityMeshes.forEach((mesh, entityId) => {
+    if (!currentEntityIds.has(entityId)) {
+      // Check if this is an earth_block that needs to animate out
+      const entityType = mesh.metadata?.entityType;
+      const isEarthBlock = entityType === 'earth_block';
+      
+      if (isEarthBlock && mesh.metadata?.animationFinalY !== undefined) {
+        // Animate the rock sinking back into the ground
+        animateEarthBlockRemoval(mesh, scene, entityId);
+      } else {
+        // For other entities, dispose immediately
+        mesh.dispose();
+        scene.metadata.entityMeshes.delete(entityId);
+      }
+    }
+  });
+}
+
+/**
+ * Animate earth block removal - sink it back into the ground
+ * @param {Mesh|TransformNode} mesh - The entity mesh/container
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} entityId - Entity ID
+ */
+function animateEarthBlockRemoval(mesh, scene, entityId) {
+  const metadata = mesh.metadata;
+  if (!metadata || metadata.animationFinalY === undefined) {
+    // No animation data, dispose immediately
+    mesh.dispose();
+    if (scene.metadata && scene.metadata.entityMeshes) {
+      scene.metadata.entityMeshes.delete(entityId);
+    }
+    return;
+  }
+  
+  const finalY = metadata.animationFinalY;
+  const startY = metadata.animationStartY || (finalY - 3.0); // Fallback if startY not stored
+  const xPos = metadata.animationXPos || mesh.position.x;
+  const zPos = metadata.animationZPos || mesh.position.z;
+  
+  // Mark as animating removal
+  metadata.isAnimatingRemoval = true;
+  
+  console.log(`Animating earth block removal: ${entityId} from Y=${finalY} to Y=${startY}`);
+  
+  // Animate sinking back into ground (reverse of spawn animation)
+  const animationDuration = 2.0; // Same duration as spawn (2 seconds)
+  const animationStartTime = Date.now();
+  const shakeIntensity = 0.04; // Same shake intensity
+  
+  const observer = scene.onBeforeRenderObservable.add(() => {
+    if (!mesh || mesh.isDisposed()) {
+      scene.onBeforeRenderObservable.remove(observer);
+      return;
+    }
+    
+    const elapsed = (Date.now() - animationStartTime) / 1000; // Convert to seconds
+    const progress = Math.min(elapsed / animationDuration, 1.0);
+    
+    // Ease-in function for smooth animation (reverse of ease-out)
+    const easedProgress = Math.pow(progress, 3);
+    
+    // Interpolate Y position (sinking down)
+    const currentY = finalY - (finalY - startY) * easedProgress;
+    
+    // Add shaking effect (random small offsets that decrease as it sinks)
+    const shakeFactor = 1 - progress; // Shake less as it reaches bottom
+    const shakeX = (Math.random() - 0.5) * shakeIntensity * shakeFactor;
+    const shakeY = (Math.random() - 0.5) * shakeIntensity * 0.5 * shakeFactor; // Vertical shake (smaller)
+    const shakeZ = (Math.random() - 0.5) * shakeIntensity * shakeFactor;
+    
+    // Apply position with shake (rotation persists)
+    mesh.position.x = xPos + shakeX;
+    mesh.position.y = currentY + shakeY;
+    mesh.position.z = zPos + shakeZ;
+    
+    // Remove observer and dispose when animation completes
+    if (progress >= 1.0) {
+      scene.onBeforeRenderObservable.remove(observer);
+      // Dispose the mesh and all its children
+      if (mesh.metadata?.modelMesh) {
+        // If it's a container, dispose the model mesh first
+        mesh.metadata.modelMesh.dispose();
+      }
+      mesh.dispose();
+      if (scene.metadata && scene.metadata.entityMeshes) {
+        scene.metadata.entityMeshes.delete(entityId);
+      }
+      console.log(`Earth block removal animation completed, disposed: ${entityId}`);
+    }
+  });
 }
 
 // build3DMap moved to babylon/babylonMap.js

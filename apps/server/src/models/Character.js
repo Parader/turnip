@@ -30,17 +30,10 @@ export class Character {
       throw new Error('Spell loadout must contain exactly 5 spells');
     }
 
-    // Check if character name already exists globally (case insensitive)
-    const nameLower = trimmedName.toLowerCase();
-    const existing = await db.collection(COLLECTION_NAME).findOne({
-      nameLower: nameLower
-    });
-
-    if (existing) {
-      throw new Error('Character name already exists');
-    }
-
     // Create character document
+    // Note: We rely on the unique index on nameLower to prevent duplicates
+    // This avoids race conditions that can occur with a pre-check
+    const nameLower = trimmedName.toLowerCase();
     const character = {
       ownerId: new ObjectId(ownerId),
       name: trimmedName,

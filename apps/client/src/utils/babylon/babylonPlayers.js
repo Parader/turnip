@@ -430,6 +430,23 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
                 }
               });
               
+              // Add spawned entities that block movement
+              const gameState = scene.metadata.gameState;
+              if (gameState && gameState.spawnedEntities) {
+                Object.values(gameState.spawnedEntities).forEach(entity => {
+                  if (entity.position) {
+                    try {
+                      const entityData = JSON.parse(entity.data || '{}');
+                      if (entityData.blocksMovement) {
+                        occupiedTiles.add(`${entity.position.x}_${entity.position.y}`);
+                      }
+                    } catch (error) {
+                      // Ignore parse errors
+                    }
+                  }
+                });
+              }
+              
               const calculatedPath = findPath(
                 scene.metadata.terrain,
                 startX,

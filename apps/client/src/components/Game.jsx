@@ -277,11 +277,18 @@ const Game = () => {
   // Set up spell cast handler
   useEffect(() => {
     if (babylonResourcesRef.current && babylonResourcesRef.current.setOnSpellCast && gameRoomRef.current) {
-      babylonResourcesRef.current.setOnSpellCast((spellId, targetX, targetY) => {
+      babylonResourcesRef.current.setOnSpellCast((spellId, targetXOrTargets, targetY) => {
         // Send spell cast request to server
         // The server will broadcast to all clients (including this one) to play the animation
         if (gameRoomRef.current && gameState?.phase === 'game' && gameState?.currentPlayerId === user?.id) {
-          gameRoomRef.current.send('requestSpellCast', { spellId, targetX, targetY });
+          // Check if this is a multi-target spell (targetXOrTargets is an array)
+          if (Array.isArray(targetXOrTargets)) {
+            // Multi-target spell: send array of targets
+            gameRoomRef.current.send('requestSpellCast', { spellId, targets: targetXOrTargets });
+          } else {
+            // Single-target spell: send targetX and targetY
+            gameRoomRef.current.send('requestSpellCast', { spellId, targetX: targetXOrTargets, targetY });
+          }
           // Clear spell selection after casting (this will also clear from spell bar)
           setSelectedSpell(null);
           if (babylonResourcesRef.current && babylonResourcesRef.current.setSelectedSpell) {
@@ -348,14 +355,30 @@ const Game = () => {
       if (babylonResourcesRef.current && babylonResourcesRef.current.playSpellCastAnimation) {
         if (castAnimDef) {
           console.log('handleSpellCast: Calling playSpellCastAnimation with:', message.userId, message.spellId, castAnimDef);
-          babylonResourcesRef.current.playSpellCastAnimation(
-            message.userId, 
-            message.spellId, 
-            castAnimDef,
-            spellDef, // Pass full spell definition for VFX
-            message.targetX, // Target X coordinate
-            message.targetY  // Target Y coordinate
-          );
+          
+          // Check if this is a multi-target spell
+          if (message.targets && Array.isArray(message.targets)) {
+            // Multi-target spell: pass targets array
+            babylonResourcesRef.current.playSpellCastAnimation(
+              message.userId, 
+              message.spellId, 
+              castAnimDef,
+              spellDef, // Pass full spell definition for VFX
+              null, // targetX (not used for multi-target)
+              null, // targetY (not used for multi-target)
+              message.targets // Pass targets array
+            );
+          } else {
+            // Single-target spell: pass targetX and targetY
+            babylonResourcesRef.current.playSpellCastAnimation(
+              message.userId, 
+              message.spellId, 
+              castAnimDef,
+              spellDef, // Pass full spell definition for VFX
+              message.targetX, // Target X coordinate
+              message.targetY  // Target Y coordinate
+            );
+          }
         } else {
           console.warn(`Cast animation not found for spell "${message.spellId}". castAnimDef from server:`, message.castAnimDef);
         }

@@ -34,6 +34,27 @@ defineTypes(PositionState, {
   y: 'number'
 });
 
+class StatusEffectState extends Schema {
+  constructor() {
+    super();
+    this.effectId = ''; // e.g., 'bleed', 'burn', 'shield', 'rage'
+    this.sourceSpellId = ''; // Spell that applied this effect
+    this.sourceUserId = ''; // Who cast the spell
+    this.duration = 0; // Turns remaining
+    this.stacks = 1; // For stackable effects
+    this.data = ''; // JSON string for effect-specific data (damage per turn, stat modifiers, etc.)
+  }
+}
+
+defineTypes(StatusEffectState, {
+  effectId: 'string',
+  sourceSpellId: 'string',
+  sourceUserId: 'string',
+  duration: 'number',
+  stacks: 'number',
+  data: 'string' // JSON string
+});
+
 class PlayerState extends Schema {
   constructor() {
     super();
@@ -55,6 +76,10 @@ class PlayerState extends Schema {
     this.movementPath = ''; // JSON string array of path coordinates [{x, y}, ...]
     this.energy = 0; // Current energy
     this.maxEnergy = 0; // Maximum energy
+    this.statusEffects = new MapSchema(); // Map of effectId -> StatusEffectState
+    this.isInvisible = false; // Whether player is invisible
+    this.invisibilitySource = ''; // Spell or effect that granted invisibility
+    this.invisibilityDuration = 0; // Turns remaining
   }
 }
 
@@ -76,7 +101,11 @@ defineTypes(PlayerState, {
   usedMovementPoints: 'number',
   movementPath: 'string', // JSON string array of path coordinates
   energy: 'number',
-  maxEnergy: 'number'
+  maxEnergy: 'number',
+  statusEffects: { map: StatusEffectState },
+  isInvisible: 'boolean',
+  invisibilitySource: 'string',
+  invisibilityDuration: 'number'
 });
 
 class TeamState extends Schema {
@@ -107,6 +136,83 @@ defineTypes(TeamState, {
   startZone: [StartPositionState]
 });
 
+class GroundEffectState extends Schema {
+  constructor() {
+    super();
+    this.effectId = ''; // e.g., 'burning_ground', 'poison_cloud', 'healing_zone'
+    this.sourceSpellId = ''; // Spell that created this
+    this.sourceUserId = ''; // Who cast the spell
+    this.x = 0;
+    this.y = 0;
+    this.radius = 1; // Cells affected (1 = single cell, 2 = 3x3, etc.)
+    this.duration = 0; // Turns remaining (0 = permanent)
+    this.data = ''; // JSON string for effect-specific data
+  }
+}
+
+defineTypes(GroundEffectState, {
+  effectId: 'string',
+  sourceSpellId: 'string',
+  sourceUserId: 'string',
+  x: 'number',
+  y: 'number',
+  radius: 'number',
+  duration: 'number',
+  data: 'string'
+});
+
+class TerrainModState extends Schema {
+  constructor() {
+    super();
+    this.x = 0;
+    this.y = 0;
+    this.originalType = 0; // TILE_TYPES value before modification
+    this.newType = 0; // TILE_TYPES value after modification
+    this.duration = 0; // Turns until reversion (0 = permanent)
+    this.sourceSpellId = '';
+    this.sourceUserId = '';
+  }
+}
+
+defineTypes(TerrainModState, {
+  x: 'number',
+  y: 'number',
+  originalType: 'number',
+  newType: 'number',
+  duration: 'number',
+  sourceSpellId: 'string',
+  sourceUserId: 'string'
+});
+
+class SpawnedEntityState extends Schema {
+  constructor() {
+    super();
+    this.entityId = ''; // Unique ID
+    this.entityType = ''; // e.g., 'trap', 'totem'
+    this.sourceSpellId = '';
+    this.sourceUserId = '';
+    this.team = ''; // 'A' or 'B' - which team owns this entity
+    this.position = new PositionState();
+    this.health = 0;
+    this.maxHealth = 0;
+    this.duration = 0; // Turns remaining (0 = permanent)
+    this.data = ''; // JSON string for entity-specific data (triggers, effects, etc.)
+  }
+}
+
+defineTypes(SpawnedEntityState, {
+  entityId: 'string',
+  entityType: 'string',
+  sourceSpellId: 'string',
+  sourceUserId: 'string',
+  team: 'string',
+  position: PositionState,
+  health: 'number',
+  maxHealth: 'number',
+  duration: 'number',
+  data: 'string'
+});
+
 class GameState extends Schema {
   constructor() {
     super();
@@ -120,6 +226,9 @@ class GameState extends Schema {
     this.currentPlayerId = '';
     this.turnOrder = new ArraySchema(); // Array of userIds in playing order
     this.stats = ''; // For stats phase - stored as JSON string
+    this.groundEffects = new MapSchema(); // Map of "x_y" -> GroundEffectState
+    this.terrainModifications = new MapSchema(); // Map of "x_y" -> TerrainModState
+    this.spawnedEntities = new MapSchema(); // Map of entityId -> SpawnedEntityState
   }
 }
 
@@ -133,7 +242,10 @@ defineTypes(GameState, {
   turn: 'number',
   currentPlayerId: 'string',
   turnOrder: ['string'], // Array of userIds
-  stats: 'string' // Will be serialized as JSON string
+  stats: 'string', // Will be serialized as JSON string
+  groundEffects: { map: GroundEffectState },
+  terrainModifications: { map: TerrainModState },
+  spawnedEntities: { map: SpawnedEntityState }
 });
 
 // TILE_TYPES constants (matching client)
@@ -146,8 +258,15 @@ const TILE_TYPES = {
 /**
  * A* pathfinding algorithm for grid movement (server-side)
  * Simplified version without preferred path support
+ * @param {Array<Array<number>>} terrain - Terrain array
+ * @param {number} startX - Start X coordinate
+ * @param {number} startY - Start Y coordinate
+ * @param {number} endX - End X coordinate
+ * @param {number} endY - End Y coordinate
+ * @param {Set<string>} occupiedTiles - Set of occupied tile keys
+ * @param {GameRoom} [gameRoom] - Optional GameRoom instance for checking ground effects and terrain modifications
  */
-function findPath(terrain, startX, startY, endX, endY, occupiedTiles = new Set()) {
+function findPath(terrain, startX, startY, endX, endY, occupiedTiles = new Set(), gameRoom = null) {
   const mapHeight = terrain.length;
   const mapWidth = terrain[0]?.length || 0;
   
@@ -159,12 +278,31 @@ function findPath(terrain, startX, startY, endX, endY, occupiedTiles = new Set()
     return [];
   }
   
-  // Check if start and end are walkable
-  if (terrain[startY][startX] !== TILE_TYPES.TILE) {
+  // Check if start and end are walkable (accounting for terrain modifications)
+  const startTerrain = gameRoom ? getTerrainType(gameRoom, startX, startY) : terrain[startY][startX];
+  const endTerrain = gameRoom ? getTerrainType(gameRoom, endX, endY) : terrain[endY][endX];
+  
+  if (startTerrain !== TILE_TYPES.TILE) {
     return [];
   }
-  if (terrain[endY][endX] !== TILE_TYPES.TILE) {
+  if (endTerrain !== TILE_TYPES.TILE) {
     return [];
+  }
+  
+  // Check if end has a ground effect that blocks movement
+  if (gameRoom) {
+    const endKey = `${endX}_${endY}`;
+    const groundEffect = gameRoom.state.groundEffects.get(endKey);
+    if (groundEffect) {
+      try {
+        const effectData = JSON.parse(groundEffect.data || '{}');
+        if (effectData.blocksMovement) {
+          return []; // Cannot move to blocked cell
+        }
+      } catch (error) {
+        // Ignore parse errors
+      }
+    }
   }
   
   // Check if end tile is occupied
@@ -222,9 +360,26 @@ function findPath(terrain, startX, startY, endX, endY, occupiedTiles = new Set()
         continue;
       }
       
-      // Skip if not walkable
-      if (terrain[neighbor.y][neighbor.x] !== TILE_TYPES.TILE) {
+      // Skip if not walkable (accounting for terrain modifications)
+      const neighborTerrain = gameRoom ? getTerrainType(gameRoom, neighbor.x, neighbor.y) : terrain[neighbor.y][neighbor.x];
+      if (neighborTerrain !== TILE_TYPES.TILE) {
         continue;
+      }
+      
+      // Check if neighbor has a ground effect that blocks movement
+      if (gameRoom) {
+        const neighborKey = `${neighbor.x}_${neighbor.y}`;
+        const groundEffect = gameRoom.state.groundEffects.get(neighborKey);
+        if (groundEffect) {
+          try {
+            const effectData = JSON.parse(groundEffect.data || '{}');
+            if (effectData.blocksMovement) {
+              continue; // Skip blocked cells
+            }
+          } catch (error) {
+            // Ignore parse errors
+          }
+        }
       }
       
       // Skip if occupied (except start position)
@@ -270,6 +425,165 @@ function findPath(terrain, startX, startY, endX, endY, occupiedTiles = new Set()
   
   // No path found
   return [];
+}
+
+/**
+ * Get all cells affected by a spell pattern
+ * @param {number} centerX - Center X coordinate
+ * @param {number} centerY - Center Y coordinate
+ * @param {string} pattern - Pattern type ('SINGLE', 'CIRCLE1', 'LINE3', etc.)
+ * @param {number} [radius] - Radius for circle patterns
+ * @param {number} [casterX] - Caster X position (for LINE patterns)
+ * @param {number} [casterY] - Caster Y position (for LINE patterns)
+ * @returns {Array<{x: number, y: number}>} Array of affected cells
+ */
+function getPatternCells(centerX, centerY, pattern, radius = 1, casterX = null, casterY = null) {
+  const cells = [];
+  
+  switch (pattern) {
+    case 'SINGLE':
+      cells.push({ x: centerX, y: centerY });
+      break;
+      
+    case 'CIRCLE1':
+      // 3x3 circle (8 surrounding cells + center)
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          cells.push({ x: centerX + dx, y: centerY + dy });
+        }
+      }
+      break;
+      
+    case 'CIRCLE2':
+      // 5x5 circle (2-cell radius)
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dy = -2; dy <= 2; dy++) {
+          const dist = Math.abs(dx) + Math.abs(dy);
+          if (dist <= 2) {
+            cells.push({ x: centerX + dx, y: centerY + dy });
+          }
+        }
+      }
+      break;
+      
+    case 'LINE3':
+      // 3-cell line in direction from caster to target
+      if (casterX !== null && casterY !== null) {
+        const dx = centerX - casterX;
+        const dy = centerY - casterY;
+        
+        // Normalize direction (get unit vector)
+        const length = Math.max(Math.abs(dx), Math.abs(dy));
+        if (length > 0) {
+          const dirX = Math.sign(dx);
+          const dirY = Math.sign(dy);
+          
+          // Add center and 2 cells in direction
+          cells.push({ x: centerX, y: centerY });
+          cells.push({ x: centerX + dirX, y: centerY + dirY });
+          cells.push({ x: centerX + dirX * 2, y: centerY + dirY * 2 });
+        } else {
+          // Same cell, just add center
+          cells.push({ x: centerX, y: centerY });
+        }
+      } else {
+        // Fallback to single if no caster position
+        cells.push({ x: centerX, y: centerY });
+      }
+      break;
+      
+    default:
+      cells.push({ x: centerX, y: centerY });
+  }
+  
+  return cells;
+}
+
+/**
+ * Get all units in a pattern area
+ * @param {GameRoom} gameRoom - GameRoom instance (for accessing state)
+ * @param {number} centerX - Center X coordinate
+ * @param {number} centerY - Center Y coordinate
+ * @param {string} pattern - Pattern type
+ * @param {string} [unitFilter] - 'ENEMY', 'ALLY', 'ANY'
+ * @param {string} casterTeam - Team of caster ('A' or 'B')
+ * @param {number} [casterX] - Caster X position (for LINE patterns)
+ * @param {number} [casterY] - Caster Y position (for LINE patterns)
+ * @returns {Array<PlayerState>} Array of affected players
+ */
+function getUnitsInPattern(gameRoom, centerX, centerY, pattern, unitFilter, casterTeam, casterX = null, casterY = null) {
+  const cells = getPatternCells(centerX, centerY, pattern, 1, casterX, casterY);
+  const affectedUnits = [];
+  
+  cells.forEach(cell => {
+    // Check Team A
+    gameRoom.state.teamA.players.forEach((player, userId) => {
+      if (player.position && player.position.x === cell.x && player.position.y === cell.y) {
+        if (!unitFilter || unitFilter === 'ANY' || 
+            (unitFilter === 'ENEMY' && casterTeam !== 'A') ||
+            (unitFilter === 'ALLY' && casterTeam === 'A')) {
+          affectedUnits.push(player);
+        }
+      }
+    });
+    
+    // Check Team B
+    gameRoom.state.teamB.players.forEach((player, userId) => {
+      if (player.position && player.position.x === cell.x && player.position.y === cell.y) {
+        if (!unitFilter || unitFilter === 'ANY' || 
+            (unitFilter === 'ENEMY' && casterTeam !== 'B') ||
+            (unitFilter === 'ALLY' && casterTeam === 'B')) {
+          affectedUnits.push(player);
+        }
+      }
+    });
+  });
+  
+  return affectedUnits;
+}
+
+/**
+ * Get all cells in a radius around a center point
+ * @param {number} centerX - Center X coordinate
+ * @param {number} centerY - Center Y coordinate
+ * @param {number} radius - Radius in cells
+ * @returns {Array<{x: number, y: number}>} Array of cells in radius
+ */
+function getCellsInRadius(centerX, centerY, radius) {
+  const cells = [];
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dy = -radius; dy <= radius; dy++) {
+      const dist = Math.abs(dx) + Math.abs(dy);
+      if (dist <= radius) {
+        cells.push({ x: centerX + dx, y: centerY + dy });
+      }
+    }
+  }
+  return cells;
+}
+
+/**
+ * Get terrain type at a position, accounting for modifications
+ * @param {GameRoom} gameRoom - GameRoom instance
+ * @param {number} x - X coordinate
+ * @param {number} y - Y coordinate
+ * @returns {number} Terrain type (TILE_TYPES value)
+ */
+function getTerrainType(gameRoom, x, y) {
+  // Check for terrain modifications first
+  const modKey = `${x}_${y}`;
+  const terrainMod = gameRoom.state.terrainModifications.get(modKey);
+  if (terrainMod) {
+    return terrainMod.newType;
+  }
+  
+  // Return original terrain
+  if (gameRoom.terrain && y >= 0 && y < gameRoom.terrain.length && 
+      x >= 0 && x < gameRoom.terrain[0].length) {
+    return gameRoom.terrain[y][x];
+  }
+  
+  return TILE_TYPES.NONE;
 }
 
 export class GameRoom extends Room {
@@ -979,6 +1293,52 @@ export class GameRoom extends Room {
    * Get filtered state based on phase and user's team
    */
   getFilteredState(userId, userTeam) {
+    // Convert ground effects to object for client
+    const groundEffects = {};
+    this.state.groundEffects.forEach((effect, key) => {
+      groundEffects[key] = {
+        effectId: effect.effectId,
+        sourceSpellId: effect.sourceSpellId,
+        sourceUserId: effect.sourceUserId,
+        x: effect.x,
+        y: effect.y,
+        radius: effect.radius,
+        duration: effect.duration,
+        data: effect.data
+      };
+    });
+    
+    // Convert terrain modifications to object for client
+    const terrainModifications = {};
+    this.state.terrainModifications.forEach((mod, key) => {
+      terrainModifications[key] = {
+        x: mod.x,
+        y: mod.y,
+        originalType: mod.originalType,
+        newType: mod.newType,
+        duration: mod.duration,
+        sourceSpellId: mod.sourceSpellId,
+        sourceUserId: mod.sourceUserId
+      };
+    });
+    
+    // Convert spawned entities to object for client
+    const spawnedEntities = {};
+    this.state.spawnedEntities.forEach((entity, entityId) => {
+      spawnedEntities[entityId] = {
+        entityId: entity.entityId,
+        entityType: entity.entityType,
+        sourceSpellId: entity.sourceSpellId,
+        sourceUserId: entity.sourceUserId,
+        team: entity.team,
+        position: { x: entity.position.x, y: entity.position.y },
+        health: entity.health,
+        maxHealth: entity.maxHealth,
+        duration: entity.duration,
+        data: entity.data
+      };
+    });
+    
     const baseState = {
       matchId: this.state.matchId,
       mapId: this.state.mapId,
@@ -986,7 +1346,10 @@ export class GameRoom extends Room {
       phase: this.state.phase,
       turn: this.state.turn,
       currentPlayerId: this.state.currentPlayerId,
-      turnOrder: Array.from(this.state.turnOrder) // Convert ArraySchema to regular array
+      turnOrder: Array.from(this.state.turnOrder), // Convert ArraySchema to regular array
+      groundEffects: groundEffects,
+      terrainModifications: terrainModifications,
+      spawnedEntities: spawnedEntities
     };
 
     if (this.state.phase === GAME_PHASES.PREPARATION) {
@@ -999,11 +1362,11 @@ export class GameRoom extends Room {
         enemyTeam: null // Explicitly null - no enemy team data at all during preparation
       };
     } else if (this.state.phase === GAME_PHASES.GAME) {
-      // Game phase: send all players' data with positions
+      // Game phase: send all players' data with positions (respect invisibility)
       return {
         ...baseState,
-        myTeam: userTeam === 'A' ? this.getTeamData(this.state.teamA, true) : this.getTeamData(this.state.teamB, true),
-        enemyTeam: userTeam === 'A' ? this.getTeamData(this.state.teamB, true) : this.getTeamData(this.state.teamA, true)
+        myTeam: userTeam === 'A' ? this.getTeamData(this.state.teamA, true, userTeam) : this.getTeamData(this.state.teamB, true, userTeam),
+        enemyTeam: userTeam === 'A' ? this.getTeamData(this.state.teamB, true, userTeam) : this.getTeamData(this.state.teamA, true, userTeam)
       };
     } else if (this.state.phase === GAME_PHASES.STATS) {
       // Stats phase: send match recap with positions
@@ -1029,9 +1392,31 @@ export class GameRoom extends Room {
    * @param {TeamState} teamState - The team state to serialize
    * @param {boolean} includePositions - Whether to include player positions (false during preparation)
    */
-  getTeamData(teamState, includePositions = true) {
+  getTeamData(teamState, includePositions = true, viewerTeam = null) {
     const players = {};
     teamState.players.forEach((player, userId) => {
+      // Check visibility - hide invisible enemies from enemy team
+      if (viewerTeam && player.team !== viewerTeam && player.isInvisible) {
+        // Check if player is revealed by status effects
+        let isRevealed = false;
+        if (player.statusEffects) {
+          player.statusEffects.forEach((effect, effectId) => {
+            try {
+              const effectData = JSON.parse(effect.data || '{}');
+              if (effectData.blocksInvisibility) {
+                isRevealed = true;
+              }
+            } catch (error) {
+              // Ignore parse errors
+            }
+          });
+        }
+        if (!isRevealed) {
+          // Hide invisible enemy - don't include in state
+          return;
+        }
+      }
+      
       // Ensure characterClass is always included (even if empty, so client can detect and handle)
       const characterClass = player.characterClass || '';
       if (!characterClass) {
@@ -1056,7 +1441,25 @@ export class GameRoom extends Room {
         usedMovementPoints: player.usedMovementPoints || 0,
         movementPath: player.movementPath ? JSON.parse(player.movementPath) : null, // Parse JSON string to array
         energy: player.energy || 0,
-        maxEnergy: player.maxEnergy || 0
+        maxEnergy: player.maxEnergy || 0,
+        statusEffects: player.statusEffects ? (() => {
+          // Convert MapSchema to object for client
+          const effects = {};
+          player.statusEffects.forEach((effect, effectId) => {
+            effects[effectId] = {
+              effectId: effect.effectId,
+              sourceSpellId: effect.sourceSpellId,
+              sourceUserId: effect.sourceUserId,
+              duration: effect.duration,
+              stacks: effect.stacks,
+              data: effect.data // Client can parse JSON if needed
+            };
+          });
+          return effects;
+        })() : {},
+        isInvisible: player.isInvisible || false,
+        invisibilitySource: player.invisibilitySource || '',
+        invisibilityDuration: player.invisibilityDuration || 0
       };
 
       // Position is now included in playerData above, orientation is always included
@@ -1140,8 +1543,24 @@ export class GameRoom extends Room {
         }
       });
       
-      // Calculate path
-      path = findPath(this.terrain, currentX, currentY, x, y, occupiedTiles);
+      // Add spawned entities that block movement
+      this.state.spawnedEntities.forEach((entity, entityId) => {
+        if (entity.position) {
+          try {
+            const entityData = JSON.parse(entity.data || '{}');
+            if (entityData.blocksMovement) {
+              const tileKey = `${entity.position.x}_${entity.position.y}`;
+              occupiedTiles.add(tileKey);
+              console.log(`Entity ${entityId} at (${entity.position.x}, ${entity.position.y}) blocks movement`);
+            }
+          } catch (error) {
+            console.warn(`Failed to parse entity data for ${entityId}:`, error);
+          }
+        }
+      });
+      
+      // Calculate path (pass gameRoom to check ground effects and terrain modifications)
+      path = findPath(this.terrain, currentX, currentY, x, y, occupiedTiles, this);
       
       if (path.length === 0) {
         console.log(`Movement denied: no valid path found`);
@@ -1177,6 +1596,33 @@ export class GameRoom extends Room {
     player.position.x = x;
     player.position.y = y;
     player.usedMovementPoints += pathCost;
+    
+    // Check for ground effect at new position (onEnter)
+    const newPosKey = `${x}_${y}`;
+    const groundEffect = this.state.groundEffects.get(newPosKey);
+    if (groundEffect) {
+      try {
+        const effectData = JSON.parse(groundEffect.data || '{}');
+        if (effectData.onEnter) {
+          if (effectData.onEnter.damage) {
+            player.health -= effectData.onEnter.damage;
+            if (player.health < 0) player.health = 0;
+            console.log(`Player ${userId} entered ground effect ${groundEffect.effectId}, took ${effectData.onEnter.damage} damage, health now: ${player.health}`);
+          }
+          if (effectData.onEnter.heal) {
+            player.health += effectData.onEnter.heal;
+            if (player.health > player.maxHealth) player.health = player.maxHealth;
+            console.log(`Player ${userId} entered ground effect ${groundEffect.effectId}, healed ${effectData.onEnter.heal}, health now: ${player.health}`);
+          }
+          // Apply status effect if specified
+          if (effectData.onEnter.statusEffect) {
+            this.applyStatusEffect(player, effectData.onEnter.statusEffect, groundEffect.sourceSpellId, groundEffect.sourceUserId);
+          }
+        }
+      } catch (error) {
+        console.error(`Error processing ground effect onEnter for ${userId}:`, error);
+      }
+    }
     
     // Store the path for clients to use
     player.movementPath = JSON.stringify(path);
@@ -1266,9 +1712,23 @@ export class GameRoom extends Room {
       return;
     }
     
-    const { spellId, targetX, targetY } = message;
-    if (!spellId || targetX === undefined || targetY === undefined) {
-      console.log(`Spell cast denied: invalid parameters`);
+    const { spellId, targetX, targetY, targets } = message;
+    
+    // Check if this is a multi-target spell
+    const isMultiTarget = Array.isArray(targets) && targets.length > 0;
+    
+    if (!spellId) {
+      console.log(`Spell cast denied: invalid spellId`);
+      return;
+    }
+    
+    if (!isMultiTarget && (targetX === undefined || targetY === undefined)) {
+      console.log(`Spell cast denied: invalid parameters (single target)`);
+      return;
+    }
+    
+    if (isMultiTarget && targets.length === 0) {
+      console.log(`Spell cast denied: invalid parameters (multi-target with empty array)`);
       return;
     }
     
@@ -1301,58 +1761,80 @@ export class GameRoom extends Room {
       return;
     }
     
-    // Validate target is in range
+    // Validate targets
     const targeting = spell.targeting || {};
     const range = targeting.range || { min: 0, max: 10 };
     const playerX = player.position.x;
     const playerY = player.position.y;
-    const distance = Math.abs(targetX - playerX) + Math.abs(targetY - playerY);
     
-    if (distance < range.min || distance > range.max) {
-      console.log(`Spell cast denied: target out of range (distance: ${distance}, range: ${range.min}-${range.max})`);
-      return;
-    }
+    // Prepare targets array for processing
+    const targetsToProcess = isMultiTarget ? targets : [{ x: targetX, y: targetY }];
     
-    // Validate target tile is walkable (if targeting CELL)
-    if (targeting.targetType === 'CELL' && this.terrain) {
-      if (targetY < 0 || targetY >= this.terrain.length || 
-          targetX < 0 || targetX >= this.terrain[0].length) {
-        console.log(`Spell cast denied: target out of bounds`);
+    // Validate all targets are in range and valid
+    for (const target of targetsToProcess) {
+      const distance = Math.abs(target.x - playerX) + Math.abs(target.y - playerY);
+      
+      if (distance < range.min || distance > range.max) {
+        console.log(`Spell cast denied: target (${target.x}, ${target.y}) out of range (distance: ${distance}, range: ${range.min}-${range.max})`);
         return;
       }
       
-      if (this.terrain[targetY][targetX] !== TILE_TYPES.TILE) {
-        console.log(`Spell cast denied: target tile is not walkable`);
-        return;
+      // Validate target tile is walkable (if targeting CELL)
+      if (targeting.targetType === 'CELL' && this.terrain) {
+        if (target.y < 0 || target.y >= this.terrain.length || 
+            target.x < 0 || target.x >= this.terrain[0].length) {
+          console.log(`Spell cast denied: target (${target.x}, ${target.y}) out of bounds`);
+          return;
+        }
+        
+        if (this.terrain[target.y][target.x] !== TILE_TYPES.TILE) {
+          console.log(`Spell cast denied: target tile (${target.x}, ${target.y}) is not walkable`);
+          return;
+        }
       }
-    }
-    
-    // Validate line of sight if required
-    if (targeting.requiresLoS && this.terrain) {
-      // Collect all occupied tiles (player positions)
-      const occupiedTiles = new Set();
-      this.state.teamA.players.forEach((p, id) => {
-        if (p.position) {
-          occupiedTiles.add(`${p.position.x}_${p.position.y}`);
-        }
-      });
-      this.state.teamB.players.forEach((p, id) => {
-        if (p.position) {
-          occupiedTiles.add(`${p.position.x}_${p.position.y}`);
-        }
-      });
       
-      // Create blocks function (exclude caster's position so they don't block their own LOS)
-      const blocks = createTerrainBlocksFunction(this.terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
-      const hasLineOfSight = hasLOS(
-        { x: playerX, y: playerY },
-        { x: targetX, y: targetY },
-        blocks
-      );
-      
-      if (!hasLineOfSight) {
-        console.log(`Spell cast denied: no line of sight to target (${targetX}, ${targetY})`);
-        return;
+      // Validate line of sight if required
+      if (targeting.requiresLoS && this.terrain) {
+        // Collect all occupied tiles (player positions and blocking entities)
+        const occupiedTiles = new Set();
+        this.state.teamA.players.forEach((p, id) => {
+          if (p.position) {
+            occupiedTiles.add(`${p.position.x}_${p.position.y}`);
+          }
+        });
+        this.state.teamB.players.forEach((p, id) => {
+          if (p.position) {
+            occupiedTiles.add(`${p.position.x}_${p.position.y}`);
+          }
+        });
+        
+        // Add spawned entities that block vision
+        this.state.spawnedEntities.forEach((entity, entityId) => {
+          if (entity.position) {
+            try {
+              const entityData = JSON.parse(entity.data || '{}');
+              if (entityData.blocksVision) {
+                const tileKey = `${entity.position.x}_${entity.position.y}`;
+                occupiedTiles.add(tileKey);
+              }
+            } catch (error) {
+              // Ignore parse errors
+            }
+          }
+        });
+        
+        // Create blocks function (exclude caster's position so they don't block their own LOS)
+        const blocks = createTerrainBlocksFunction(this.terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+        const hasLineOfSight = hasLOS(
+          { x: playerX, y: playerY },
+          { x: target.x, y: target.y },
+          blocks
+        );
+        
+        if (!hasLineOfSight) {
+          console.log(`Spell cast denied: no line of sight to target (${target.x}, ${target.y})`);
+          return;
+        }
       }
     }
     
@@ -1365,177 +1847,130 @@ export class GameRoom extends Room {
     // Track targets that take damage for hit animations
     const damagedTargets = new Set();
     
-    // Apply spell effects
-    if (spell.effects && spell.effects.length > 0) {
-      spell.effects.forEach(effect => {
-        if (effect.kind === 'DAMAGE') {
-          // Find target unit at the target position (if targeting UNIT)
-          if (targeting.targetType === 'UNIT') {
-            // Find unit at target position
-            let targetPlayer = null;
-            this.state.teamA.players.forEach((p, id) => {
-              if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                targetPlayer = p;
-              }
-            });
-            if (!targetPlayer) {
-              this.state.teamB.players.forEach((p, id) => {
-                if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                  targetPlayer = p;
+    // Get pattern for area effects
+    const pattern = targeting.pattern || 'SINGLE';
+    
+    // Process each target (for multi-target spells, process each one)
+    targetsToProcess.forEach(target => {
+      // Get all affected units based on pattern for this target
+      let affectedUnits = [];
+      if (targeting.targetType === 'SELF') {
+        // Self-targeting: only affect caster
+        affectedUnits = [player];
+      } else if (targeting.targetType === 'UNIT') {
+        // Unit targeting: find unit at target position
+        let targetPlayer = null;
+        this.state.teamA.players.forEach((p, id) => {
+          if (p.position && p.position.x === target.x && p.position.y === target.y) {
+            targetPlayer = p;
+          }
+        });
+        if (!targetPlayer) {
+          this.state.teamB.players.forEach((p, id) => {
+            if (p.position && p.position.x === target.x && p.position.y === target.y) {
+              targetPlayer = p;
+            }
+          });
+        }
+        if (targetPlayer) {
+          // Check invisibility - can't target invisible enemies unless spell ignores invisibility
+          if (targetPlayer.team !== team && targetPlayer.isInvisible) {
+            // Check if target is revealed
+            let isRevealed = false;
+            if (targetPlayer.statusEffects) {
+              targetPlayer.statusEffects.forEach((effect, effectId) => {
+                try {
+                  const effectData = JSON.parse(effect.data || '{}');
+                  if (effectData.blocksInvisibility) {
+                    isRevealed = true;
+                  }
+                } catch (error) {
+                  // Ignore parse errors
                 }
               });
             }
-            
-            if (targetPlayer) {
-              // Apply damage
+            if (!isRevealed && !spell.ignoresInvisibility) {
+              console.log(`Spell cast denied: target ${targetPlayer.username} is invisible`);
+              return; // Skip this target
+            }
+          }
+          affectedUnits = [targetPlayer];
+        }
+      } else if (targeting.targetType === 'CELL') {
+        // Cell targeting: use pattern to find all units in area
+        affectedUnits = getUnitsInPattern(
+          this,
+          target.x,
+          target.y,
+          pattern,
+          targeting.unitFilter || 'ANY',
+          team,
+          playerX,
+          playerY
+        );
+      }
+      
+      // Apply spell effects to all affected units for this target
+      if (spell.effects && spell.effects.length > 0) {
+        spell.effects.forEach(effect => {
+          if (effect.kind === 'DAMAGE') {
+            // Apply damage to all affected units
+            affectedUnits.forEach(targetPlayer => {
               targetPlayer.health -= effect.amount;
               if (targetPlayer.health < 0) {
                 targetPlayer.health = 0;
               }
               damagedTargets.add(targetPlayer.userId);
               console.log(`Applied ${effect.amount} ${effect.damageType || 'damage'} to ${targetPlayer.username}, health now: ${targetPlayer.health}`);
-            }
-          } else if (targeting.targetType === 'CELL') {
-            // Area damage - find all units at target cell (for now, just single target)
-            // TODO: Implement area effects based on pattern
-            let targetPlayer = null;
-            this.state.teamA.players.forEach((p, id) => {
-              if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                targetPlayer = p;
-              }
             });
-            if (!targetPlayer) {
-              this.state.teamB.players.forEach((p, id) => {
-                if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                  targetPlayer = p;
-                }
-              });
-            }
-            
-            if (targetPlayer) {
-              targetPlayer.health -= effect.amount;
-              if (targetPlayer.health < 0) {
-                targetPlayer.health = 0;
+          } else if (effect.kind === 'HEAL') {
+            // Apply heal to all affected units
+            affectedUnits.forEach(targetPlayer => {
+              targetPlayer.health += effect.amount;
+              if (targetPlayer.health > targetPlayer.maxHealth) {
+                targetPlayer.health = targetPlayer.maxHealth;
               }
-              damagedTargets.add(targetPlayer.userId);
-              console.log(`Applied ${effect.amount} ${effect.damageType || 'damage'} to ${targetPlayer.username} at (${targetX}, ${targetY}), health now: ${targetPlayer.health}`);
-            }
-          }
-        } else if (effect.kind === 'HEAL') {
-          // Find target unit based on targeting type
-          let targetPlayer = null;
-          
-          if (targeting.targetType === 'SELF') {
-            // Heal the caster
-            targetPlayer = player;
-          } else if (targeting.targetType === 'UNIT') {
-            // Find unit at target position
-            if (targeting.unitFilter === 'ALLY') {
-              const playerTeam = this.userTeams.get(userId);
-              const teamState = playerTeam === 'A' ? this.state.teamA : this.state.teamB;
-              
-              teamState.players.forEach((p, id) => {
-                if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                  targetPlayer = p;
-                }
-              });
-            } else if (targeting.unitFilter === 'ANY') {
-              // Can target any unit (ally or enemy)
-              this.state.teamA.players.forEach((p, id) => {
-                if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                  targetPlayer = p;
-                }
-              });
-              if (!targetPlayer) {
-                this.state.teamB.players.forEach((p, id) => {
-                  if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                    targetPlayer = p;
-                  }
-                });
-              }
-            }
-          } else if (targeting.targetType === 'CELL') {
-            // Find unit at target cell (for area heals, currently just single target)
-            this.state.teamA.players.forEach((p, id) => {
-              if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                targetPlayer = p;
-              }
+              console.log(`Healed ${targetPlayer.username} for ${effect.amount}, health now: ${targetPlayer.health}/${targetPlayer.maxHealth}`);
             });
-            if (!targetPlayer) {
-              this.state.teamB.players.forEach((p, id) => {
-                if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                  targetPlayer = p;
-                }
-              });
-            }
-          }
-          
-          if (targetPlayer) {
-            targetPlayer.health += effect.amount;
-            if (targetPlayer.health > targetPlayer.maxHealth) {
-              targetPlayer.health = targetPlayer.maxHealth;
-            }
-            console.log(`Healed ${targetPlayer.username} for ${effect.amount}, health now: ${targetPlayer.health}/${targetPlayer.maxHealth}`);
-          }
-        } else if (effect.kind === 'MOVEMENT') {
-          // Find target unit based on targeting type
-          let targetPlayer = null;
-          
-          if (targeting.targetType === 'SELF') {
-            // Add movement points to the caster
-            targetPlayer = player;
-          } else if (targeting.targetType === 'UNIT') {
-            // Find unit at target position
-            if (targeting.unitFilter === 'ALLY') {
-              const playerTeam = this.userTeams.get(userId);
-              const teamState = playerTeam === 'A' ? this.state.teamA : this.state.teamB;
-              
-              teamState.players.forEach((p, id) => {
-                if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                  targetPlayer = p;
-                }
-              });
-            } else if (targeting.unitFilter === 'ANY') {
-              // Can target any unit (ally or enemy)
-              this.state.teamA.players.forEach((p, id) => {
-                if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                  targetPlayer = p;
-                }
-              });
-              if (!targetPlayer) {
-                this.state.teamB.players.forEach((p, id) => {
-                  if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                    targetPlayer = p;
-                  }
-                });
-              }
-            }
-          } else if (targeting.targetType === 'CELL') {
-            // Find unit at target cell
-            this.state.teamA.players.forEach((p, id) => {
-              if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                targetPlayer = p;
-              }
+          } else if (effect.kind === 'MOVEMENT') {
+            // Apply movement points to all affected units
+            affectedUnits.forEach(targetPlayer => {
+              // Add movement points (can exceed max, will be capped at end of turn)
+              targetPlayer.movementPoints += effect.amount;
+              console.log(`Added ${effect.amount} movement points to ${targetPlayer.username}, movement points now: ${targetPlayer.movementPoints} (max: ${targetPlayer.maxMovementPoints})`);
             });
-            if (!targetPlayer) {
-              this.state.teamB.players.forEach((p, id) => {
-                if (p.position && p.position.x === targetX && p.position.y === targetY) {
-                  targetPlayer = p;
-                }
+          } else if (effect.kind === 'STATUS_EFFECT') {
+            // Apply status effect to all affected units
+            if (effect.statusEffect) {
+              const statusDef = effect.statusEffect;
+              affectedUnits.forEach(targetPlayer => {
+                this.applyStatusEffect(targetPlayer, statusDef, spellId, userId);
               });
             }
+          } else if (effect.kind === 'GROUND_EFFECT') {
+            // Apply ground effect at target location
+            if (effect.groundEffect) {
+              this.applyGroundEffect(target.x, target.y, effect.groundEffect, spellId, userId);
+            }
+          } else if (effect.kind === 'TERRAIN_CHANGE') {
+            // Apply terrain modification at target location
+            if (effect.terrainChange) {
+              this.applyTerrainModification(target.x, target.y, effect.terrainChange, spellId, userId);
+            }
+          } else if (effect.kind === 'SPAWN_ENTITY') {
+            // Spawn entity at target location
+            if (effect.spawnEntity) {
+              this.spawnEntity(target.x, target.y, effect.spawnEntity, spellId, userId, team);
+            }
           }
-          
-          if (targetPlayer) {
-            // Add movement points (can exceed max, will be capped at end of turn)
-            targetPlayer.movementPoints += effect.amount;
-            console.log(`Added ${effect.amount} movement points to ${targetPlayer.username}, movement points now: ${targetPlayer.movementPoints} (max: ${targetPlayer.maxMovementPoints})`);
-          }
-        }
-      });
-    }
+        });
+      }
+    });
     
-    console.log(`Player ${userId} cast ${spellId} at (${targetX}, ${targetY}), energy now: ${player.energy}`);
+    const targetDescription = isMultiTarget 
+      ? `${targetsToProcess.length} targets: ${targetsToProcess.map(t => `(${t.x}, ${t.y})`).join(', ')}`
+      : `(${targetX}, ${targetY})`;
+    console.log(`Player ${userId} cast ${spellId} at ${targetDescription}, energy now: ${player.energy}`);
     
     // Cancel spell preparation (stop stance animation) before casting
     this.broadcast('spellPrepCancel', {
@@ -1549,18 +1984,26 @@ export class GameRoom extends Room {
     const presentation = spell.presentation || {};
     
     // Broadcast spell cast event to all clients so they can play animations and VFX
-    this.broadcast('spellCast', {
+    const broadcastMessage = {
       userId: userId,
       spellId: spellId,
-      targetX: targetX,
-      targetY: targetY,
       castAnimDef: castAnimDef, // Include cast animation definition so clients don't need to look it up
       presentation: {
         projectileVfx: presentation.projectileVfx || null,
         impactVfxDef: presentation.impactVfxDef || null,
         groundEffectVfx: presentation.groundEffectVfx || null
       }
-    });
+    };
+    
+    // Include targets array for multi-target spells, or single targetX/targetY for backward compatibility
+    if (isMultiTarget) {
+      broadcastMessage.targets = targetsToProcess;
+    } else {
+      broadcastMessage.targetX = targetX;
+      broadcastMessage.targetY = targetY;
+    }
+    
+    this.broadcast('spellCast', broadcastMessage);
     
     // Get hit delay from cast animation definition (impactDelayMs)
     // This represents when the spell effect should visually occur relative to cast start
@@ -1744,6 +2187,663 @@ export class GameRoom extends Room {
   }
 
   /**
+   * Apply a ground effect at a location
+   * @param {number} x - X coordinate
+   * @param {number} y - Y coordinate
+   * @param {Object} groundDef - Ground effect definition
+   * @param {string} sourceSpellId - Spell that created this
+   * @param {string} sourceUserId - User who cast the spell
+   */
+  applyGroundEffect(x, y, groundDef, sourceSpellId, sourceUserId) {
+    const radius = groundDef.radius || 1;
+    const cells = getCellsInRadius(x, y, radius);
+    
+    cells.forEach(cell => {
+      const cellKey = `${cell.x}_${cell.y}`;
+      
+      // Check if terrain is valid (not a wall unless allowed)
+      if (this.terrain) {
+        if (cell.y < 0 || cell.y >= this.terrain.length || 
+            cell.x < 0 || cell.x >= this.terrain[0].length) {
+          return; // Skip out of bounds
+        }
+        
+        // Only apply to walkable tiles (unless ground effect can be on walls)
+        if (this.terrain[cell.y][cell.x] !== TILE_TYPES.TILE) {
+          return; // Skip non-walkable tiles
+        }
+      }
+      
+      // Create or update ground effect
+      let groundEffect = this.state.groundEffects.get(cellKey);
+      
+      if (!groundEffect) {
+        groundEffect = new GroundEffectState();
+        groundEffect.x = cell.x;
+        groundEffect.y = cell.y;
+        this.state.groundEffects.set(cellKey, groundEffect);
+      }
+      
+      groundEffect.effectId = groundDef.effectId;
+      groundEffect.sourceSpellId = sourceSpellId;
+      groundEffect.sourceUserId = sourceUserId;
+      groundEffect.radius = 1; // Each cell has radius 1 (the effect covers the cell)
+      groundEffect.duration = groundDef.duration || 0;
+      
+      // Store effect data as JSON
+      const effectData = {
+        onEnter: groundDef.onEnter || {},
+        onTurnStart: groundDef.onTurnStart || {},
+        onTurnEnd: groundDef.onTurnEnd || {},
+        blocksMovement: groundDef.blocksMovement || false,
+        blocksVision: groundDef.blocksVision || false
+      };
+      groundEffect.data = JSON.stringify(effectData);
+      
+      console.log(`Applied ground effect ${groundDef.effectId} at (${cell.x}, ${cell.y}) for ${groundEffect.duration} turns`);
+    });
+  }
+
+  /**
+   * Apply terrain modification
+   * @param {number} x - X coordinate
+   * @param {number} y - Y coordinate
+   * @param {Object} terrainChangeDef - Terrain change definition
+   * @param {string} sourceSpellId - Spell that created this
+   * @param {string} sourceUserId - User who cast the spell
+   */
+  applyTerrainModification(x, y, terrainChangeDef, sourceSpellId, sourceUserId) {
+    if (!this.terrain) {
+      console.warn('Cannot apply terrain modification: terrain not loaded');
+      return;
+    }
+    
+    const radius = terrainChangeDef.radius || 1;
+    const cells = getCellsInRadius(x, y, radius);
+    
+    cells.forEach(cell => {
+      if (cell.y < 0 || cell.y >= this.terrain.length || 
+          cell.x < 0 || cell.x >= this.terrain[0].length) {
+        return; // Skip out of bounds
+      }
+      
+      const originalType = this.terrain[cell.y][cell.x];
+      
+      // Check if this cell matches the fromType
+      if (originalType !== terrainChangeDef.fromType) {
+        return; // Can only change from the specified type
+      }
+      
+      const cellKey = `${cell.x}_${cell.y}`;
+      
+      // Create or update terrain modification
+      let terrainMod = this.state.terrainModifications.get(cellKey);
+      
+      if (!terrainMod) {
+        terrainMod = new TerrainModState();
+        terrainMod.x = cell.x;
+        terrainMod.y = cell.y;
+        terrainMod.originalType = originalType;
+        this.state.terrainModifications.set(cellKey, terrainMod);
+      }
+      
+      terrainMod.newType = terrainChangeDef.toType;
+      terrainMod.duration = terrainChangeDef.duration || 0;
+      terrainMod.sourceSpellId = sourceSpellId;
+      terrainMod.sourceUserId = sourceUserId;
+      
+      console.log(`Modified terrain at (${cell.x}, ${cell.y}) from ${originalType} to ${terrainChangeDef.toType} for ${terrainMod.duration} turns`);
+    });
+  }
+
+  /**
+   * Process ground effects for a player at their position
+   * @param {PlayerState} player - Player to check
+   */
+  processGroundEffectsForPlayer(player) {
+    if (!player.position) return;
+    
+    const posKey = `${player.position.x}_${player.position.y}`;
+    const groundEffect = this.state.groundEffects.get(posKey);
+    
+    if (groundEffect) {
+      try {
+        const effectData = JSON.parse(groundEffect.data || '{}');
+        
+        // Apply onTurnStart effects
+        if (effectData.onTurnStart) {
+          if (effectData.onTurnStart.damage) {
+            player.health -= effectData.onTurnStart.damage;
+            if (player.health < 0) player.health = 0;
+            console.log(`Ground effect ${groundEffect.effectId} dealt ${effectData.onTurnStart.damage} damage to ${player.username}, health now: ${player.health}`);
+          }
+          if (effectData.onTurnStart.heal) {
+            player.health += effectData.onTurnStart.heal;
+            if (player.health > player.maxHealth) player.health = player.maxHealth;
+            console.log(`Ground effect ${groundEffect.effectId} healed ${effectData.onTurnStart.heal} to ${player.username}, health now: ${player.health}`);
+          }
+        }
+      } catch (error) {
+        console.error(`Error processing ground effect for ${player.username}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Process all ground effects and terrain modifications at end of turn
+   */
+  processGroundEffectsAndTerrain() {
+    // Process ground effects - decrement duration
+    const groundEffectsToRemove = [];
+    this.state.groundEffects.forEach((effect, key) => {
+      if (effect.duration > 0) {
+        effect.duration--;
+        if (effect.duration <= 0) {
+          groundEffectsToRemove.push(key);
+        }
+      }
+    });
+    
+    groundEffectsToRemove.forEach(key => {
+      this.state.groundEffects.delete(key);
+      console.log(`Ground effect at ${key} expired`);
+    });
+    
+    // Process terrain modifications - decrement duration
+    const terrainModsToRemove = [];
+    this.state.terrainModifications.forEach((mod, key) => {
+      if (mod.duration > 0) {
+        mod.duration--;
+        if (mod.duration <= 0) {
+          terrainModsToRemove.push(key);
+        }
+      }
+    });
+    
+    terrainModsToRemove.forEach(key => {
+      const mod = this.state.terrainModifications.get(key);
+      if (mod && this.terrain) {
+        // Revert terrain to original type
+        if (mod.y >= 0 && mod.y < this.terrain.length && 
+            mod.x >= 0 && mod.x < this.terrain[0].length) {
+          // Note: We store originalType but don't actually modify the terrain array
+          // The terrainModifications map is the source of truth
+          console.log(`Terrain modification at (${mod.x}, ${mod.y}) expired, reverting to original type ${mod.originalType}`);
+        }
+      }
+      this.state.terrainModifications.delete(key);
+    });
+  }
+
+  /**
+   * Apply invisibility to a player
+   * @param {PlayerState} player - Player to make invisible
+   * @param {number} duration - Turns invisibility lasts
+   * @param {string} sourceSpellId - Spell that granted invisibility
+   */
+  applyInvisibility(player, duration, sourceSpellId) {
+    player.isInvisible = true;
+    player.invisibilitySource = sourceSpellId;
+    player.invisibilityDuration = duration;
+    console.log(`Applied invisibility to ${player.username} for ${duration} turns`);
+  }
+
+  /**
+   * Remove invisibility from a player
+   * @param {PlayerState} player - Player to make visible
+   */
+  removeInvisibility(player) {
+    if (player.isInvisible) {
+      player.isInvisible = false;
+      player.invisibilitySource = '';
+      player.invisibilityDuration = 0;
+      console.log(`Removed invisibility from ${player.username}`);
+    }
+  }
+
+  /**
+   * Check if a viewer can see a target player
+   * @param {PlayerState} viewer - Player trying to see
+   * @param {PlayerState} target - Player being viewed
+   * @returns {boolean} True if viewer can see target
+   */
+  canSeePlayer(viewer, target) {
+    // Same team can always see each other
+    if (viewer.team === target.team) {
+      return true;
+    }
+    
+    // Enemy is invisible - check if any status effects reveal them
+    if (target.isInvisible) {
+      // Check if target has any status effects that block invisibility
+      if (target.statusEffects) {
+        let isRevealed = false;
+        target.statusEffects.forEach((effect, effectId) => {
+          try {
+            const effectData = JSON.parse(effect.data || '{}');
+            if (effectData.blocksInvisibility) {
+              isRevealed = true;
+            }
+          } catch (error) {
+            // Ignore parse errors
+          }
+        });
+        return isRevealed;
+      }
+      return false; // Invisible and not revealed
+    }
+    
+    return true; // Not invisible
+  }
+
+  /**
+   * Spawn an entity at a location
+   * @param {number} x - X coordinate
+   * @param {number} y - Y coordinate
+   * @param {Object} spawnDef - Spawn entity definition
+   * @param {string} sourceSpellId - Spell that created this
+   * @param {string} sourceUserId - User who cast the spell
+   * @param {string} team - Team that owns the entity ('A' or 'B')
+   */
+  spawnEntity(x, y, spawnDef, sourceSpellId, sourceUserId, team) {
+    // Check if terrain is valid
+    if (this.terrain) {
+      if (y < 0 || y >= this.terrain.length || 
+          x < 0 || x >= this.terrain[0].length) {
+        console.warn(`Cannot spawn entity: position (${x}, ${y}) out of bounds`);
+        return;
+      }
+      
+      // Only spawn on walkable tiles
+      const terrainType = getTerrainType(this, x, y);
+      if (terrainType !== TILE_TYPES.TILE) {
+        console.warn(`Cannot spawn entity: position (${x}, ${y}) is not walkable`);
+        return;
+      }
+    }
+    
+    // Check if position is occupied by a player
+    let isOccupied = false;
+    this.state.teamA.players.forEach((p, id) => {
+      if (p.position && p.position.x === x && p.position.y === y) {
+        isOccupied = true;
+      }
+    });
+    if (!isOccupied) {
+      this.state.teamB.players.forEach((p, id) => {
+        if (p.position && p.position.x === x && p.position.y === y) {
+          isOccupied = true;
+        }
+      });
+    }
+    
+    // Check if position is occupied by another entity
+    if (!isOccupied) {
+      this.state.spawnedEntities.forEach((entity, entityId) => {
+        if (entity.position && entity.position.x === x && entity.position.y === y) {
+          isOccupied = true;
+        }
+      });
+    }
+    
+    if (isOccupied) {
+      console.warn(`Cannot spawn entity: position (${x}, ${y}) is occupied`);
+      return;
+    }
+    
+    // For earth_block entities, enforce limit of 2 per user
+    // When spawning a third, remove the oldest one
+    if (spawnDef.entityType === 'earth_block') {
+      const userEarthBlocks = [];
+      
+      // Collect all earth_blocks for this user
+      this.state.spawnedEntities.forEach((entity, entityId) => {
+        if (entity.entityType === 'earth_block' && entity.sourceUserId === sourceUserId) {
+          // Extract timestamp from entityId (format: entity_timestamp_random)
+          const match = entityId.match(/entity_(\d+)_/);
+          const timestamp = match ? parseInt(match[1], 10) : 0;
+          userEarthBlocks.push({ entityId, timestamp, entity });
+        }
+      });
+      
+      // If user already has 2 blocks, remove the oldest one
+      if (userEarthBlocks.length >= 2) {
+        // Sort by timestamp (oldest first)
+        userEarthBlocks.sort((a, b) => a.timestamp - b.timestamp);
+        const oldestBlock = userEarthBlocks[0];
+        
+        console.log(`User ${sourceUserId} has ${userEarthBlocks.length} earth blocks, removing oldest: ${oldestBlock.entityId}`);
+        this.state.spawnedEntities.delete(oldestBlock.entityId);
+      }
+    }
+    
+    // Generate unique entity ID
+    const entityId = `entity_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Create entity
+    const entity = new SpawnedEntityState();
+    entity.entityId = entityId;
+    entity.entityType = spawnDef.entityType;
+    entity.sourceSpellId = sourceSpellId;
+    entity.sourceUserId = sourceUserId;
+    entity.team = team;
+    entity.position.x = x;
+    entity.position.y = y;
+    entity.health = spawnDef.health || 0;
+    entity.maxHealth = spawnDef.health || 0;
+    entity.duration = spawnDef.duration || 0;
+    
+    // Store entity data as JSON
+    // If spawnDef.data is already a JSON string, parse it and merge with defaults
+    // Otherwise, build from individual properties
+    let entityData = {};
+    if (spawnDef.data) {
+      try {
+        entityData = JSON.parse(spawnDef.data);
+        console.log(`Parsed entity data from spawnDef:`, entityData);
+      } catch (error) {
+        console.warn(`Failed to parse spawnDef.data:`, error, spawnDef.data);
+        // If parsing fails, treat as empty object
+        entityData = {};
+      }
+    }
+    
+    // Merge with default properties (don't overwrite existing ones from parsed data)
+    // Use === undefined to preserve false values
+    if (entityData.trigger === undefined) entityData.trigger = spawnDef.trigger || null;
+    if (entityData.onTrigger === undefined) entityData.onTrigger = spawnDef.onTrigger || {};
+    if (entityData.onDeath === undefined) entityData.onDeath = spawnDef.onDeath || {};
+    if (entityData.onTurnStart === undefined) entityData.onTurnStart = spawnDef.onTurnStart || {};
+    
+    // Preserve blocking flags - check both parsed data and spawnDef properties
+    // The flags should already be in entityData if they were in spawnDef.data
+    if (entityData.blocksMovement === undefined && spawnDef.blocksMovement !== undefined) {
+      entityData.blocksMovement = spawnDef.blocksMovement;
+    }
+    if (entityData.blocksVision === undefined && spawnDef.blocksVision !== undefined) {
+      entityData.blocksVision = spawnDef.blocksVision;
+    }
+    
+    entity.data = JSON.stringify(entityData);
+    
+    // Debug log to verify blocking flags are set
+    console.log(`Spawned entity ${entityId} (${spawnDef.entityType}) at (${x}, ${y}) with data:`, JSON.stringify(entityData, null, 2));
+    console.log(`Entity blocksMovement: ${entityData.blocksMovement}, blocksVision: ${entityData.blocksVision}`);
+    
+    this.state.spawnedEntities.set(entityId, entity);
+    console.log(`Spawned entity ${spawnDef.entityType} (${entityId}) at (${x}, ${y}) for team ${team} for ${entity.duration} turns`);
+  }
+
+  /**
+   * Process spawned entities (check triggers, decrement duration)
+   */
+  processSpawnedEntities() {
+    const entitiesToRemove = [];
+    
+    this.state.spawnedEntities.forEach((entity, entityId) => {
+      // Check for triggers
+      try {
+        const entityData = JSON.parse(entity.data || '{}');
+        
+        if (entityData.trigger) {
+          const trigger = entityData.trigger;
+          
+          if (trigger.type === 'MOVEMENT') {
+            // Check if any enemy player moved onto this entity's position
+            const enemyTeam = entity.team === 'A' ? 'B' : 'A';
+            const enemyTeamState = enemyTeam === 'A' ? this.state.teamA : this.state.teamB;
+            
+            enemyTeamState.players.forEach((player, userId) => {
+              if (player.position && 
+                  player.position.x === entity.position.x && 
+                  player.position.y === entity.position.y) {
+                // Trigger activated!
+                this.triggerEntity(entity, entityData, player);
+                entitiesToRemove.push(entityId);
+              }
+            });
+          } else if (trigger.type === 'PROXIMITY') {
+            // Check if any enemy player is within radius
+            const radius = trigger.radius || 1;
+            const enemyTeam = entity.team === 'A' ? 'B' : 'A';
+            const enemyTeamState = enemyTeam === 'A' ? this.state.teamA : this.state.teamB;
+            
+            enemyTeamState.players.forEach((player, userId) => {
+              if (player.position) {
+                const distance = Math.abs(player.position.x - entity.position.x) + 
+                               Math.abs(player.position.y - entity.position.y);
+                if (distance <= radius) {
+                  // Trigger activated!
+                  this.triggerEntity(entity, entityData, player);
+                  entitiesToRemove.push(entityId);
+                }
+              }
+            });
+          }
+        }
+      } catch (error) {
+        console.error(`Error processing entity ${entityId}:`, error);
+      }
+      
+      // Decrement duration
+      if (entity.duration > 0) {
+        entity.duration--;
+        if (entity.duration <= 0) {
+          entitiesToRemove.push(entityId);
+        }
+      }
+    });
+    
+    // Remove expired/triggered entities
+    entitiesToRemove.forEach(entityId => {
+      const entity = this.state.spawnedEntities.get(entityId);
+      if (entity) {
+        try {
+          const entityData = JSON.parse(entity.data || '{}');
+          // Check for onDeath effects
+          if (entityData.onDeath) {
+            // Apply onDeath effects (e.g., explosion damage)
+            if (entityData.onDeath.damage && entityData.onDeath.radius) {
+              const cells = getCellsInRadius(entity.position.x, entity.position.y, entityData.onDeath.radius);
+              cells.forEach(cell => {
+                // Find players in radius
+                const affectedPlayers = getUnitsInPattern(
+                  this,
+                  cell.x,
+                  cell.y,
+                  'SINGLE',
+                  'ANY',
+                  entity.team,
+                  entity.position.x,
+                  entity.position.y
+                );
+                affectedPlayers.forEach(player => {
+                  // Only damage enemies
+                  if (player.team !== entity.team) {
+                    player.health -= entityData.onDeath.damage;
+                    if (player.health < 0) player.health = 0;
+                    console.log(`Entity ${entityId} death dealt ${entityData.onDeath.damage} damage to ${player.username}`);
+                  }
+                });
+              });
+            }
+          }
+        } catch (error) {
+          console.error(`Error processing entity death ${entityId}:`, error);
+        }
+        console.log(`Entity ${entityId} expired/triggered, removing`);
+      }
+      this.state.spawnedEntities.delete(entityId);
+    });
+  }
+
+  /**
+   * Trigger an entity (trap activated, etc.)
+   * @param {SpawnedEntityState} entity - Entity being triggered
+   * @param {Object} entityData - Parsed entity data
+   * @param {PlayerState} triggerPlayer - Player that triggered the entity
+   */
+  triggerEntity(entity, entityData, triggerPlayer) {
+    if (entityData.onTrigger) {
+      if (entityData.onTrigger.damage) {
+        triggerPlayer.health -= entityData.onTrigger.damage;
+        if (triggerPlayer.health < 0) triggerPlayer.health = 0;
+        console.log(`Entity ${entity.entityId} triggered, dealt ${entityData.onTrigger.damage} damage to ${triggerPlayer.username}`);
+      }
+      if (entityData.onTrigger.heal) {
+        triggerPlayer.health += entityData.onTrigger.heal;
+        if (triggerPlayer.health > triggerPlayer.maxHealth) triggerPlayer.health = triggerPlayer.maxHealth;
+        console.log(`Entity ${entity.entityId} triggered, healed ${entityData.onTrigger.heal} to ${triggerPlayer.username}`);
+      }
+      if (entityData.onTrigger.statusEffect) {
+        this.applyStatusEffect(triggerPlayer, entityData.onTrigger.statusEffect, entity.sourceSpellId, entity.sourceUserId);
+      }
+    }
+  }
+
+  /**
+   * Apply a status effect to a player
+   * @param {PlayerState} targetPlayer - Player to apply effect to
+   * @param {Object} statusDef - Status effect definition
+   * @param {string} sourceSpellId - Spell that applied this effect
+   * @param {string} sourceUserId - User who cast the spell
+   */
+  applyStatusEffect(targetPlayer, statusDef, sourceSpellId, sourceUserId) {
+    if (!targetPlayer.statusEffects) {
+      targetPlayer.statusEffects = new MapSchema();
+    }
+    
+    const effectId = statusDef.effectId;
+    const existingEffect = targetPlayer.statusEffects.get(effectId);
+    
+    // Check if effect is stackable
+    if (existingEffect && statusDef.stackable) {
+      // Stack the effect
+      const maxStacks = statusDef.maxStacks || 999;
+      if (existingEffect.stacks < maxStacks) {
+        existingEffect.stacks++;
+        // Refresh duration when stacking
+        existingEffect.duration = Math.max(existingEffect.duration, statusDef.duration);
+        console.log(`Stacked ${effectId} on ${targetPlayer.username} (stacks: ${existingEffect.stacks})`);
+      } else {
+        console.log(`Cannot stack ${effectId} on ${targetPlayer.username} - max stacks reached (${maxStacks})`);
+      }
+    } else if (!existingEffect) {
+      // Create new status effect
+      const statusEffect = new StatusEffectState();
+      statusEffect.effectId = effectId;
+      statusEffect.sourceSpellId = sourceSpellId;
+      statusEffect.sourceUserId = sourceUserId;
+      statusEffect.duration = statusDef.duration;
+      statusEffect.stacks = 1;
+      
+      // Store effect data as JSON
+      const effectData = {
+        onApply: statusDef.onApply || {},
+        onTurnStart: statusDef.onTurnStart || {},
+        onTurnEnd: statusDef.onTurnEnd || {},
+        onRemove: statusDef.onRemove || {},
+        type: statusDef.type || 'NEUTRAL',
+        grantsInvisibility: statusDef.grantsInvisibility || false
+      };
+      statusEffect.data = JSON.stringify(effectData);
+      
+      targetPlayer.statusEffects.set(effectId, statusEffect);
+      
+      // Apply onApply effects
+      if (effectData.onApply) {
+        if (effectData.onApply.damage) {
+          targetPlayer.health -= effectData.onApply.damage;
+          if (targetPlayer.health < 0) targetPlayer.health = 0;
+        }
+        if (effectData.onApply.heal) {
+          targetPlayer.health += effectData.onApply.heal;
+          if (targetPlayer.health > targetPlayer.maxHealth) targetPlayer.health = targetPlayer.maxHealth;
+        }
+      }
+      
+      // Apply invisibility if status effect grants it
+      if (effectData.grantsInvisibility) {
+        this.applyInvisibility(targetPlayer, statusDef.duration, sourceSpellId);
+      }
+      
+      console.log(`Applied status effect ${effectId} to ${targetPlayer.username} for ${statusDef.duration} turns`);
+    } else {
+      // Effect already exists and is not stackable - refresh duration
+      existingEffect.duration = Math.max(existingEffect.duration, statusDef.duration);
+      console.log(`Refreshed ${effectId} duration on ${targetPlayer.username} to ${existingEffect.duration} turns`);
+    }
+  }
+
+  /**
+   * Process status effects for a player at the start of their turn
+   * @param {PlayerState} player - Player whose turn is starting
+   */
+  processTurnStartStatusEffects(player) {
+    if (!player.statusEffects || player.statusEffects.size === 0) {
+      return;
+    }
+    
+    const effectsToRemove = [];
+    
+    player.statusEffects.forEach((effect, effectId) => {
+      try {
+        const effectData = JSON.parse(effect.data || '{}');
+        
+        // Apply onTurnStart effects
+        if (effectData.onTurnStart) {
+          if (effectData.onTurnStart.damage) {
+            const damage = effectData.onTurnStart.damage * effect.stacks; // Scale by stacks
+            player.health -= damage;
+            if (player.health < 0) player.health = 0;
+            console.log(`Status effect ${effectId} dealt ${damage} damage to ${player.username} (${effect.stacks} stacks), health now: ${player.health}`);
+          }
+          if (effectData.onTurnStart.heal) {
+            const heal = effectData.onTurnStart.heal * effect.stacks; // Scale by stacks
+            player.health += heal;
+            if (player.health > player.maxHealth) player.health = player.maxHealth;
+            console.log(`Status effect ${effectId} healed ${heal} to ${player.username} (${effect.stacks} stacks), health now: ${player.health}`);
+          }
+        }
+        
+        // Decrement duration
+        effect.duration--;
+        
+        // Check if effect should be removed
+        if (effect.duration <= 0) {
+          // Apply onRemove effects
+          if (effectData.onRemove) {
+            if (effectData.onRemove.damage) {
+              player.health -= effectData.onRemove.damage;
+              if (player.health < 0) player.health = 0;
+            }
+            if (effectData.onRemove.heal) {
+              player.health += effectData.onRemove.heal;
+              if (player.health > player.maxHealth) player.health = player.maxHealth;
+            }
+          }
+          
+          // Remove invisibility if this effect granted it
+          if (effectData.grantsInvisibility && player.invisibilitySource === effect.sourceSpellId) {
+            this.removeInvisibility(player);
+          }
+          
+          effectsToRemove.push(effectId);
+          console.log(`Status effect ${effectId} expired on ${player.username}`);
+        }
+      } catch (error) {
+        console.error(`Error processing status effect ${effectId} for ${player.username}:`, error);
+        effectsToRemove.push(effectId); // Remove corrupted effects
+      }
+    });
+    
+    // Remove expired effects
+    effectsToRemove.forEach(effectId => {
+      player.statusEffects.delete(effectId);
+    });
+  }
+
+  /**
    * Handle end turn
    */
   handleEndTurn(client, message) {
@@ -1802,7 +2902,27 @@ export class GameRoom extends Room {
       if (nextPlayer.movementPoints < nextPlayer.maxMovementPoints) {
         nextPlayer.movementPoints = nextPlayer.maxMovementPoints;
       }
+      
+      // Process status effects at the start of the turn
+      this.processTurnStartStatusEffects(nextPlayer);
+      
+      // Process ground effects at player's position
+      this.processGroundEffectsForPlayer(nextPlayer);
+      
+      // Process invisibility duration
+      if (nextPlayer.isInvisible && nextPlayer.invisibilityDuration > 0) {
+        nextPlayer.invisibilityDuration--;
+        if (nextPlayer.invisibilityDuration <= 0) {
+          this.removeInvisibility(nextPlayer);
+        }
+      }
     }
+    
+    // Process ground effects and terrain modifications (decrement durations)
+    this.processGroundEffectsAndTerrain();
+    
+    // Process spawned entities (check triggers, decrement duration)
+    this.processSpawnedEntities();
     
     console.log(`Turn ${this.state.turn}: Now ${nextPlayerId}'s turn`);
     

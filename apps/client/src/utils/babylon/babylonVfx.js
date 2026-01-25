@@ -4,6 +4,7 @@
  */
 
 import { MeshBuilder, StandardMaterial, Color3, Color4, Vector3, Animation, AnimationGroup, ParticleSystem, Texture, DynamicTexture, Material } from '@babylonjs/core';
+import { ArcaneMissileRender } from './ArcaneMissileRender';
 
 /**
  * Create a VFX mesh based on VFX definition
@@ -800,12 +801,84 @@ export function playHealVfx(scene, spellDef, startPos, endPos, castStartTime) {
  * @param {Vector3} endPos - End position
  * @param {number} castStartTime - Timestamp when cast started
  */
+/**
+ * Play Arcane Missile VFX using the new ArcaneMissileRender class
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Object} spellDef - Spell definition
+ * @param {Vector3} startPos - Start position
+ * @param {Vector3} endPos - End position
+ * @param {number} castStartTime - Timestamp when cast started
+ */
+function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStartTime) {
+  // Calculate delay from cast start time
+  const baseDelay = 600; // Match character animation impact delay
+  const now = Date.now();
+  const delay = Math.max(0, castStartTime + baseDelay - now);
+  
+  setTimeout(() => {
+    // Create renderer
+    const renderer = new ArcaneMissileRender(scene, {
+      trailPoints: 28,
+      headWidth: 0.12,
+      coreSize: 0.2,
+      color1: new Color3(0.6, 0.4, 1.0), // Purple
+      color2: new Color3(0.4, 0.6, 1.0), // Blue
+      enableParticles: true,
+      ringBillboard: true,
+      autoDisposeAfterImpact: true,
+      onDone: () => {
+        // Cleanup after impact
+        renderer.dispose();
+      }
+    });
+    
+    // Calculate movement parameters
+    const distance = Vector3.Distance(startPos, endPos);
+    const speed = 8.0; // units per second
+    const duration = distance / speed; // seconds
+    const startTime = Date.now();
+    
+    // Calculate forward direction
+    const forward = endPos.clone().subtractInPlace(startPos);
+    const forwardLen = forward.length();
+    if (forwardLen < 0.001) {
+      // Degenerate case: start and end are the same
+      forward.set(0, 0, 1);
+    } else {
+      forward.scaleInPlace(1.0 / forwardLen); // Normalize
+    }
+    
+    // Animation loop
+    const observer = scene.onBeforeRenderObservable.add(() => {
+      const elapsed = (Date.now() - startTime) / 1000.0; // seconds
+      const progress = Math.min(elapsed / duration, 1.0);
+      
+      // Interpolate position
+      const currentPos = Vector3.Lerp(startPos, endPos, progress);
+      
+      // Update renderer position
+      renderer.setPosition(currentPos, forward);
+      
+      // Check if reached target
+      if (progress >= 1.0) {
+        // Impact!
+        renderer.impact(endPos);
+        
+        // Remove observer
+        scene.onBeforeRenderObservable.remove(observer);
+      }
+    });
+  }, delay);
+}
+
 export function playSpellVfx(scene, spellDef, startPos, endPos, castStartTime) {
   // Route to specific spell VFX handler
   if (spellDef.spellId === 'fireball') {
     playFireballVfx(scene, spellDef, startPos, endPos, castStartTime);
   } else if (spellDef.spellId === 'heal') {
     playHealVfx(scene, spellDef, startPos, endPos, castStartTime);
+  } else if (spellDef.spellId === 'arcane_missile' || spellDef.spellId === 'arcane_missiles') {
+    playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStartTime);
   } else {
     console.warn(`VFX not implemented for spell: ${spellDef.spellId}`);
   }

@@ -13,10 +13,63 @@
  */
 
 /**
+ * @typedef {Object} StatusEffectDef
+ * @property {string} effectId - Unique identifier (e.g., 'bleed', 'burn', 'shield')
+ * @property {string} name - Display name
+ * @property {number} duration - Turns the effect lasts
+ * @property {boolean} [stackable] - Can stack multiple times (default: false)
+ * @property {number} [maxStacks] - Maximum stacks (if stackable)
+ * @property {"BUFF" | "DEBUFF" | "NEUTRAL"} type
+ * @property {Object} [onApply] - Effects when applied { damage?: number, heal?: number, statModifiers?: {...} }
+ * @property {Object} [onTurnStart] - Effects at start of each turn { damage?: number, heal?: number, damageType?: string }
+ * @property {Object} [onTurnEnd] - Effects at end of each turn
+ * @property {Object} [onRemove] - Effects when removed
+ * @property {boolean} [blocksInvisibility] - If true, effect is visible even if unit is invisible
+ * @property {boolean} [grantsInvisibility] - If true, this status effect grants invisibility
+ */
+
+/**
+ * @typedef {Object} GroundEffectDef
+ * @property {string} effectId - Unique identifier
+ * @property {string} name - Display name
+ * @property {number} duration - Turns the effect lasts (0 = permanent)
+ * @property {number} radius - Radius in cells (default: 1)
+ * @property {Object} [onEnter] - Effects when unit enters { damage?: number, heal?: number, statusEffect?: StatusEffectDef }
+ * @property {Object} [onTurnStart] - Effects at start of turn for units on this cell
+ * @property {Object} [onTurnEnd] - Effects at end of turn
+ * @property {boolean} [blocksMovement] - If true, units cannot move through
+ * @property {boolean} [blocksVision] - If true, blocks line of sight
+ */
+
+/**
+ * @typedef {Object} TerrainChangeDef
+ * @property {number} fromType - Terrain type to change from (TILE_TYPES value)
+ * @property {number} toType - Terrain type to change to
+ * @property {number} [duration] - Turns until terrain reverts (0 = permanent)
+ * @property {number} [radius] - Radius of change (default: 1)
+ */
+
+/**
+ * @typedef {Object} SpawnEntityDef
+ * @property {string} entityType - Type identifier (e.g., 'trap', 'totem')
+ * @property {string} name - Display name
+ * @property {number} health - Starting health (0 = invulnerable)
+ * @property {number} duration - Turns entity lasts (0 = permanent)
+ * @property {Object} [trigger] - For traps: { type: 'MOVEMENT' | 'PROXIMITY', radius?: number }
+ * @property {Object} [onTrigger] - Effects when triggered { damage?: number, heal?: number, statusEffect?: StatusEffectDef }
+ * @property {Object} [onDeath] - Effects when entity dies { damage?: number, radius?: number }
+ * @property {Object} [onTurnStart] - Effects at start of entity's turn
+ */
+
+/**
  * @typedef {Object} EffectDef
- * @property {"DAMAGE" | "HEAL" | "MOVEMENT"} kind
+ * @property {"DAMAGE" | "HEAL" | "MOVEMENT" | "STATUS_EFFECT" | "GROUND_EFFECT" | "TERRAIN_CHANGE" | "SPAWN_ENTITY"} kind
  * @property {number} amount
  * @property {"physical" | "magic"} [damageType] - Only for DAMAGE
+ * @property {StatusEffectDef} [statusEffect] - Only for STATUS_EFFECT
+ * @property {GroundEffectDef} [groundEffect] - Only for GROUND_EFFECT
+ * @property {TerrainChangeDef} [terrainChange] - Only for TERRAIN_CHANGE
+ * @property {SpawnEntityDef} [spawnEntity] - Only for SPAWN_ENTITY
  */
 
 /**
@@ -95,6 +148,7 @@
  * @property {{ energy: number }} cost
  * @property {number} [cooldown] - Turns
  * @property {number} [castPerTurnLimit]
+ * @property {boolean} [ignoresInvisibility] - If true, can target invisible units
  * @property {EffectDef[]} effects
  * @property {Object} presentation
  * @property {string} presentation.castAnim
@@ -392,10 +446,10 @@ export const SpellDefs = {
       }
     },
   
-    smoke_trap: {
-      spellId: 'smoke_trap',
-      name: 'Smoke Trap',
-      description: 'Place a smoke trap on a target cell',
+    trap: {
+      spellId: 'trap',
+      name: 'Trap',
+      description: 'Place a trap on a target cell',
       targeting: {
         targetType: 'CELL',
         range: { min: 1, max: 3 },
@@ -1346,10 +1400,10 @@ export const SpellDefs = {
     },
   
     // Mage spells
-    earth_wall: {
-      spellId: 'earth_wall',
-      name: 'Earth Wall',
-      description: 'Summon a wall of earth to block movement',
+    earth_block: {
+      spellId: 'earth_block',
+      name: 'Earth Block',
+      description: 'Summon a block of earth that blocks movement and line of sight',
       targeting: {
         targetType: 'CELL',
         range: { min: 1, max: 3 },
@@ -1361,12 +1415,22 @@ export const SpellDefs = {
       cost: { energy: 3 },
       effects: [
         {
-          kind: 'DAMAGE',
-          amount: 0 // Utility spell
+          kind: 'SPAWN_ENTITY',
+          amount: 0,
+          spawnEntity: {
+            entityType: 'earth_block',
+            name: 'Earth Block',
+            health: 0, // Invulnerable
+            duration: 0, // Permanent
+            data: JSON.stringify({
+              blocksMovement: true,
+              blocksVision: true
+            })
+          }
         }
       ],
       presentation: {
-        castAnim: 'cast',
+        castAnim: 'cast3',
         impactVfx: 'earth_rise',
         sound: 'earth_cast'
       },
@@ -1379,7 +1443,7 @@ export const SpellDefs = {
           canMoveWhilePreparing: false
         },
         cast: {
-          name: 'cast',
+          name: 'cast3',
           blendInMs: 100,
           blendOutMs: 200,
           lockMs: 1000,
@@ -1388,29 +1452,86 @@ export const SpellDefs = {
       }
     },
   
-    arcane_explosion: {
-      spellId: 'arcane_explosion',
-      name: 'Arcane Explosion',
-      description: 'Explosive arcane energy in an area',
+    arcane_missile: {
+      spellId: 'arcane_missile',
+      name: 'Arcane Missile',
+      description: 'Hurl a bolt of arcane energy at a target',
       targeting: {
         targetType: 'CELL',
-        range: { min: 2, max: 5 },
-        requiresLoS: false,
+        range: { min: 2, max: 6 },
+        requiresLoS: true,
         allowBlockedCellTarget: false,
-        allowOccupiedCellTarget: false,
-        pattern: 'CIRCLE1'
+        allowOccupiedCellTarget: true,
+        pattern: 'SINGLE',
+        multiTarget: true, // Allow multiple target selections
+        maxTargets: 3 // Maximum number of targets
       },
-      cost: { energy: 4 },
+      cost: { energy: 3 },
       effects: [
         {
           kind: 'DAMAGE',
-          amount: 6,
+          amount: 5,
           damageType: 'magic'
         }
       ],
       presentation: {
         castAnim: 'cast',
+        // Legacy projectile (kept for backward compatibility)
+        projectile: { type: 'BOLT', speedCellsPerSec: 5 },
+        // New detailed VFX system
+        projectileVfx: {
+          vfx: {
+            type: 'SPHERE',
+            size: 0.3, // Diameter of missile
+            color: { r: 0.6, g: 0.4, b: 1.0 }, // Purple arcane color
+            emissiveIntensity: 1.0, // Full glow
+            opacity: 0.9,
+            animated: true,
+            animation: {
+              rotationSpeed: 3.0, // Rotations per second
+              scalePulse: true, // Pulsing effect
+              pulseSpeed: 4.0 // Pulse cycles per second
+            },
+            duration: 0 // Lasts until impact
+          },
+          speedCellsPerSec: 5, // Speed in cells per second
+          startDelayMs: 200, // Spawn 200ms after cast animation starts
+          heightOffset: 0.6, // Float 0.6 units above ground
+          trail: true, // Leave a trail
+          trailVfx: {
+            type: 'SPHERE',
+            size: 0.12, // Smaller trail particles
+            color: { r: 0.7, g: 0.5, b: 1.0 }, // Lighter purple
+            emissiveIntensity: 0.8,
+            opacity: 0.6,
+            animated: false,
+            duration: 300 // Trail particles fade after 300ms
+          },
+          trailLength: 0.8 // Trail extends 0.8 cells behind projectile
+        },
+        // Legacy impact VFX (kept for backward compatibility)
         impactVfx: 'arcane_explosion',
+        // New detailed impact VFX
+        impactVfxDef: {
+          vfx: {
+            type: 'SPHERE',
+            size: 0.2, // Starting size
+            color: { r: 0.8, g: 0.6, b: 1.0 }, // Bright purple
+            emissiveIntensity: 1.0,
+            opacity: 1.0,
+            animated: true,
+            animation: {
+              scalePulse: false // No pulse, just expand
+            },
+            duration: 400 // Impact effect lasts 400ms
+          },
+          delayMs: 0, // Instant on impact
+          duration: 400,
+          size: 1.0, // Final explosion size (overrides vfx.size)
+          explosive: true, // Expands outward
+          explosionRadius: 1.2, // Explosion reaches 1.2 cells radius
+          explosionDuration: 300 // Expansion takes 300ms
+        },
         sound: 'arcane_cast'
       },
       animations: {
