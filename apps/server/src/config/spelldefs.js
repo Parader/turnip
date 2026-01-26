@@ -1547,7 +1547,7 @@ export const SpellDefs = {
           blendInMs: 100,
           blendOutMs: 200,
           lockMs: 1000,
-          impactDelayMs: 600
+          impactDelayMs: 1600
         }
       }
     },

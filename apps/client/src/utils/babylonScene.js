@@ -276,7 +276,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   // Multi-target spell system state
   let selectedTargets = []; // Array of {x, y} for multi-target spells
   let multiTargetSpell = null; // Reference to spell definition for multi-target spells
-  let targetMarkers = new Map(); // Map of tileKey -> Array of marker meshes
+  let targetMarkers = new Map(); // Map of tileKey -> Array of {marker: Mesh, observer: Observer} objects
   
   // Initialize scene metadata for pending movement paths
   if (!scene.metadata) {
@@ -346,13 +346,17 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     spellTargetTiles = [];
   };
   
-  // Function to update target markers (white circles) for multi-target spells
+  // Function to update target markers (3D arcane torus rings) for multi-target spells
   const updateTargetMarkers = () => {
-    // Clear existing markers
+    // Clear existing markers and their animations
     targetMarkers.forEach((markers, tileKey) => {
-      markers.forEach(marker => {
-        if (marker && !marker.isDisposed()) {
-          marker.dispose();
+      markers.forEach(markerData => {
+        if (markerData && markerData.marker && !markerData.marker.isDisposed()) {
+          // Remove animation observer if it exists
+          if (markerData.observer) {
+            scene.onBeforeRenderObservable.remove(markerData.observer);
+          }
+          markerData.marker.dispose();
         }
       });
     });
@@ -370,61 +374,68 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       const [x, y] = tileKey.split('_').map(Number);
       const markers = [];
       
-      // Create multiple circles that stack (smaller for each additional selection)
-      const baseSize = 0.6; // Base circle size
-      const sizeDecrement = 0.15; // How much smaller each additional circle is
-      const heightOffset = 0.02; // Height above ground
+      // Torus parameters
+      const baseDiameter = 0.7; // Base torus diameter
+      const thickness = 0.02; // Thin, elegant torus
+      const baseHeight = 0.15; // Hover above ground
+      const verticalSpacing = 0.12; // Clean spacing between stacked rings
+      const rotationSpeed = 0.5; // Slow, deliberate rotation (radians per second)
+      const bobAmplitude = 0.02; // Minimal bobbing
+      const bobSpeed = 2.0; // Bobbing frequency
       
       for (let i = 0; i < count; i++) {
-        const size = baseSize - (i * sizeDecrement);
-        const height = heightOffset + (i * 0.01); // Stack slightly higher
-        
-        // Create white circle marker (using plane for flat circle)
-        const marker = MeshBuilder.CreatePlane(`targetMarker_${tileKey}_${i}`, {
-          size: size,
-          sideOrientation: 2 // Double-sided
+        // Create 3D torus ring
+        const torus = MeshBuilder.CreateTorus(`targetMarker_${tileKey}_${i}`, {
+          diameter: baseDiameter,
+          thickness: thickness,
+          tessellation: 32
         }, scene);
         
-        // Position marker above the tile
-        marker.position.x = x;
-        marker.position.y = height;
-        marker.position.z = y; // game y maps to Babylon z
+        // Position torus above the tile, stacked vertically
+        // Torus is already horizontal (parallel to XZ plane) by default in Babylon.js
+        const height = baseHeight + (i * verticalSpacing);
+        torus.position.x = x;
+        torus.position.y = height;
+        torus.position.z = y; // game y maps to Babylon z
         
-        // Rotate plane to be flat on the ground (rotate 90 degrees around X axis)
-        marker.rotation.x = Math.PI / 2;
+        // No X rotation needed - torus is already horizontal/parallel to ground
+        // This creates a magical seal/binding placed on the ground
         
-        // Create white material with circle texture
+        // Create arcane purple/violet material
         const markerMaterial = new StandardMaterial(`targetMarkerMaterial_${tileKey}_${i}`, scene);
-        markerMaterial.diffuseColor = new Color3(1, 1, 1); // White
-        markerMaterial.emissiveColor = new Color3(0.8, 0.8, 0.8); // Slight glow
-        markerMaterial.alpha = 0.9;
-        markerMaterial.backFaceCulling = false; // Show from both sides
+        markerMaterial.emissiveColor = new Color3(0.7, 0.4, 1.0); // Rich arcane purple
+        markerMaterial.diffuseColor = new Color3(0.5, 0.2, 0.8); // Deep violet
+        markerMaterial.alpha = 0.85;
+        markerMaterial.specularColor = new Color3(0.8, 0.6, 1.0); // Soft purple specular
+        markerMaterial.transparencyMode = 2; // MATERIAL_ALPHABLEND
+        markerMaterial.backFaceCulling = false;
+        markerMaterial.disableDepthWrite = true;
         
-        // Create a simple circle texture using DynamicTexture
-        const textureSize = 64;
-        const texture = new DynamicTexture(`targetMarkerTexture_${tileKey}_${i}`, textureSize, scene, false);
-        const context = texture.getContext();
+        torus.material = markerMaterial;
+        torus.isPickable = false;
         
-        // Draw white circle with transparent background
-        const center = textureSize / 2;
-        const radius = (textureSize / 2) - 2;
+        // Add slow rotation and minimal bobbing animation
+        const startTime = Date.now();
+        const rotationPhase = (i * Math.PI * 0.3); // Phase difference for stacked rings
+        const bobPhase = (i * Math.PI * 0.4); // Different bob phase for each ring
         
-        // Clear with transparent
-        context.clearRect(0, 0, textureSize, textureSize);
+        const observer = scene.onBeforeRenderObservable.add(() => {
+          if (!torus || torus.isDisposed()) {
+            scene.onBeforeRenderObservable.remove(observer);
+            return;
+          }
+          
+          const elapsed = (Date.now() - startTime) / 1000; // seconds
+          
+          // Slow, deliberate rotation around Y axis
+          torus.rotation.y = (elapsed * rotationSpeed) + rotationPhase;
+          
+          // Minimal bobbing - subtle vertical movement
+          const bobOffset = Math.sin(elapsed * bobSpeed + bobPhase) * bobAmplitude;
+          torus.position.y = height + bobOffset;
+        });
         
-        // Draw white circle outline (ring)
-        context.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-        context.lineWidth = 3;
-        context.beginPath();
-        context.arc(center, center, radius, 0, Math.PI * 2);
-        context.stroke();
-        
-        texture.update();
-        markerMaterial.diffuseTexture = texture;
-        markerMaterial.emissiveTexture = texture;
-        
-        marker.material = markerMaterial;
-        markers.push(marker);
+        markers.push({ marker: torus, observer: observer });
       }
       
       targetMarkers.set(tileKey, markers);
@@ -1305,11 +1316,15 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       selectedTargets = [];
       multiTargetSpell = null;
       
-      // Clear target markers
+      // Clear target markers and their animations
       targetMarkers.forEach((markers, tileKey) => {
-        markers.forEach(marker => {
-          if (marker && !marker.isDisposed()) {
-            marker.dispose();
+        markers.forEach(markerData => {
+          if (markerData && markerData.marker && !markerData.marker.isDisposed()) {
+            // Remove animation observer if it exists
+            if (markerData.observer) {
+              scene.onBeforeRenderObservable.remove(markerData.observer);
+            }
+            markerData.marker.dispose();
           }
         });
       });
@@ -1705,12 +1720,14 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
               const delay = index * 150; // 150ms delay between each projectile
               setTimeout(() => {
                 console.log(`Playing VFX for spell ${spellId} target ${index + 1}/${targetsToProcess.length}: spawn at (${spawnPos.x.toFixed(2)}, ${spawnPos.y.toFixed(2)}, ${spawnPos.z.toFixed(2)}), target at (${targetPos.x.toFixed(2)}, ${targetPos.z.toFixed(2)}), orientation: ${casterOrientation.toFixed(2)}`);
-                // Use appropriate VFX based on spell
+                // Use actual spell definition for VFX
                 const vfxSpellDef = {
-                  spellId: spellId, // Use actual spell ID so it routes correctly
+                  spellId: spellId,
                   presentation: spellDef.presentation || {}
                 };
-                playSpellVfx(scene, vfxSpellDef, spawnPos, targetPos, castStartTime);
+                // Pass missile index and total count for arcane_missile multi-target pattern
+                const totalMissiles = targetsToProcess.length;
+                playSpellVfx(scene, vfxSpellDef, spawnPos, targetPos, castStartTime, index, totalMissiles);
               }, delay);
             });
           } else {
