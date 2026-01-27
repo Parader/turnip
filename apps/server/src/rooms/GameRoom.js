@@ -252,8 +252,58 @@ defineTypes(GameState, {
 const TILE_TYPES = {
   NONE: 0,
   TILE: 1,
-  WALL: 2
+  WALL: 2,
+  WATER: 3
 };
+
+// Tile type definitions with properties (matching client)
+const TILE_DEFINITIONS = {
+  [TILE_TYPES.NONE]: {
+    walkable: false,
+    blocksLOS: false
+  },
+  [TILE_TYPES.TILE]: {
+    walkable: true,
+    blocksLOS: false
+  },
+  [TILE_TYPES.WALL]: {
+    walkable: false,
+    blocksLOS: true
+  },
+  [TILE_TYPES.WATER]: {
+    walkable: false,
+    blocksLOS: false
+  }
+};
+
+/**
+ * Get tile definition for a tile type
+ * @param {number} tileType - Tile type value
+ * @returns {Object} Tile definition with walkable and blocksLOS properties
+ */
+function getTileDefinition(tileType) {
+  return TILE_DEFINITIONS[tileType] || TILE_DEFINITIONS[TILE_TYPES.NONE];
+}
+
+/**
+ * Check if a tile type is walkable
+ * @param {number} tileType - Tile type value
+ * @returns {boolean} True if walkable
+ */
+function isTileWalkable(tileType) {
+  const def = getTileDefinition(tileType);
+  return def.walkable;
+}
+
+/**
+ * Check if a tile type blocks line of sight
+ * @param {number} tileType - Tile type value
+ * @returns {boolean} True if blocks LOS
+ */
+function doesTileBlockLOS(tileType) {
+  const def = getTileDefinition(tileType);
+  return def.blocksLOS;
+}
 
 /**
  * A* pathfinding algorithm for grid movement (server-side)
@@ -282,10 +332,10 @@ function findPath(terrain, startX, startY, endX, endY, occupiedTiles = new Set()
   const startTerrain = gameRoom ? getTerrainType(gameRoom, startX, startY) : terrain[startY][startX];
   const endTerrain = gameRoom ? getTerrainType(gameRoom, endX, endY) : terrain[endY][endX];
   
-  if (startTerrain !== TILE_TYPES.TILE) {
+  if (!isTileWalkable(startTerrain)) {
     return [];
   }
-  if (endTerrain !== TILE_TYPES.TILE) {
+  if (!isTileWalkable(endTerrain)) {
     return [];
   }
   
@@ -362,7 +412,7 @@ function findPath(terrain, startX, startY, endX, endY, occupiedTiles = new Set()
       
       // Skip if not walkable (accounting for terrain modifications)
       const neighborTerrain = gameRoom ? getTerrainType(gameRoom, neighbor.x, neighbor.y) : terrain[neighbor.y][neighbor.x];
-      if (neighborTerrain !== TILE_TYPES.TILE) {
+      if (!isTileWalkable(neighborTerrain)) {
         continue;
       }
       
@@ -1575,7 +1625,7 @@ export class GameRoom extends Room {
         if (step.x < 0 || step.y < 0 || 
             step.y >= this.terrain.length || 
             step.x >= this.terrain[0].length ||
-            this.terrain[step.y][step.x] !== TILE_TYPES.TILE) {
+            !isTileWalkable(this.terrain[step.y][step.x])) {
           console.log(`Movement denied: path contains unwalkable tile at (${step.x}, ${step.y})`);
           return;
         }
@@ -1779,7 +1829,7 @@ export class GameRoom extends Room {
         return;
       }
       
-      // Validate target tile is walkable (if targeting CELL)
+      // Validate target tile is valid (if targeting CELL)
       if (targeting.targetType === 'CELL' && this.terrain) {
         if (target.y < 0 || target.y >= this.terrain.length || 
             target.x < 0 || target.x >= this.terrain[0].length) {
@@ -1787,8 +1837,17 @@ export class GameRoom extends Room {
           return;
         }
         
-        if (this.terrain[target.y][target.x] !== TILE_TYPES.TILE) {
-          console.log(`Spell cast denied: target tile (${target.x}, ${target.y}) is not walkable`);
+        const targetTileType = this.terrain[target.y][target.x];
+        
+        // Water tiles cannot be targeted
+        if (targetTileType === TILE_TYPES.WATER) {
+          console.log(`Spell cast denied: cannot target water tile at (${target.x}, ${target.y})`);
+          return;
+        }
+        
+        // Only walkable tiles (TILE) can be targeted
+        if (targetTileType !== TILE_TYPES.TILE) {
+          console.log(`Spell cast denied: target tile (${target.x}, ${target.y}) is not targetable`);
           return;
         }
       }
@@ -1824,7 +1883,7 @@ export class GameRoom extends Room {
         });
         
         // Create blocks function (exclude caster's position so they don't block their own LOS)
-        const blocks = createTerrainBlocksFunction(this.terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+        const blocks = createTerrainBlocksFunction(this.terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY }, doesTileBlockLOS);
         const hasLineOfSight = hasLOS(
           { x: playerX, y: playerY },
           { x: target.x, y: target.y },

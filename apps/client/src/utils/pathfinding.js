@@ -1,4 +1,4 @@
-import { TILE_TYPES } from './mapRenderer';
+import { TILE_TYPES, isTileWalkable } from './mapRenderer';
 
 /**
  * A* pathfinding algorithm for Dofus-style grid movement
@@ -24,10 +24,10 @@ export function findPath(terrain, startX, startY, endX, endY, occupiedTiles = ne
   }
   
   // Check if start and end are walkable
-  if (terrain[startY][startX] !== TILE_TYPES.TILE) {
+  if (!isTileWalkable(terrain[startY][startX])) {
     return [];
   }
-  if (terrain[endY][endX] !== TILE_TYPES.TILE) {
+  if (!isTileWalkable(terrain[endY][endX])) {
     return [];
   }
   
@@ -136,7 +136,7 @@ export function findPath(terrain, startX, startY, endX, endY, occupiedTiles = ne
       }
       
       // Skip if not walkable
-      if (terrain[neighbor.y][neighbor.x] !== TILE_TYPES.TILE) {
+      if (!isTileWalkable(terrain[neighbor.y][neighbor.x])) {
         continue;
       }
       
@@ -267,7 +267,7 @@ export function getMovementRange(terrain, startX, startY, maxDistance, occupiedT
       }
       
       // Skip if not walkable
-      if (terrain[neighbor.y][neighbor.x] !== TILE_TYPES.TILE) {
+      if (!isTileWalkable(terrain[neighbor.y][neighbor.x])) {
         continue;
       }
       

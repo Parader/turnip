@@ -1,6 +1,6 @@
 import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput, Animation, DynamicTexture } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
-import { TILE_TYPES } from './mapRenderer';
+import { TILE_TYPES, doesTileBlockLOS } from './mapRenderer';
 import { findPath, getMovementRange } from './pathfinding';
 import { build3DMap } from './babylon/babylonMap';
 import { buildPlayerCharacters, updatePlayerCharacters } from './babylon/babylonPlayers';
@@ -541,7 +541,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     
     // Create blocks function for LOS checking ONCE (exclude caster's position)
     // This blocks function is used for ALL LOS checks: spell range visualization AND individual tile checks
-    const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+    const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY }, doesTileBlockLOS);
     
     // Always show spell range when in cast mode
     if (isHover || isLeftClick) {
@@ -564,8 +564,21 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
           // Check if this tile is a valid target
           let isValidTarget = true;
           
+          // For CELL targeting, check if tile is valid (not water, not wall, etc.)
+          if (targeting.targetType === 'CELL') {
+            const tileType = terrain[y][x];
+            // Water tiles cannot be targeted
+            if (tileType === TILE_TYPES.WATER) {
+              isValidTarget = false;
+            }
+            // Only walkable tiles (TILE) can be targeted
+            else if (tileType !== TILE_TYPES.TILE) {
+              isValidTarget = false;
+            }
+          }
+          
           // Check line of sight if required
-          if (targeting.requiresLoS) {
+          if (targeting.requiresLoS && isValidTarget) {
             const hasLineOfSight = hasLOS(
               { x: playerX, y: playerY },
               { x, y },
@@ -1158,7 +1171,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             }
             
             // Create blocks function for LOS checking
-            const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+            const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY }, doesTileBlockLOS);
             
             // Clear and recalculate spell range
             clearSpellTargeting();
@@ -1178,8 +1191,21 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                 // Check if this tile is a valid target
                 let isValidTarget = true;
                 
+                // For CELL targeting, check if tile is valid (not water, not wall, etc.)
+                if (targeting.targetType === 'CELL') {
+                  const tileType = terrain[y][x];
+                  // Water tiles cannot be targeted
+                  if (tileType === TILE_TYPES.WATER) {
+                    isValidTarget = false;
+                  }
+                  // Only walkable tiles (TILE) can be targeted
+                  else if (tileType !== TILE_TYPES.TILE) {
+                    isValidTarget = false;
+                  }
+                }
+                
                 // Check line of sight if required
-                if (targeting.requiresLoS) {
+                if (targeting.requiresLoS && isValidTarget) {
                   const hasLineOfSight = hasLOS(
                     { x: playerX, y: playerY },
                     { x, y },
@@ -1397,7 +1423,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             }
             
             // Create blocks function for LOS checking (exclude caster's position)
-            const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY });
+            const blocks = createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles, { x: playerX, y: playerY }, doesTileBlockLOS);
             
             const rangeTiles = getSpellRangeTiles(playerX, playerY, range.min, range.max, terrain);
             rangeTiles.forEach(({ x, y }) => {
@@ -1414,8 +1440,21 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                 // Check if this tile is a valid target
                 let isValidTarget = true;
                 
+                // For CELL targeting, check if tile is valid (not water, not wall, etc.)
+                if (targeting.targetType === 'CELL') {
+                  const tileType = terrain[y][x];
+                  // Water tiles cannot be targeted
+                  if (tileType === TILE_TYPES.WATER) {
+                    isValidTarget = false;
+                  }
+                  // Only walkable tiles (TILE) can be targeted
+                  else if (tileType !== TILE_TYPES.TILE) {
+                    isValidTarget = false;
+                  }
+                }
+                
                 // Check line of sight if required
-                if (targeting.requiresLoS) {
+                if (targeting.requiresLoS && isValidTarget) {
                   const hasLineOfSight = hasLOS(
                     { x: playerX, y: playerY },
                     { x, y },

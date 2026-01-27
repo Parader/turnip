@@ -1470,7 +1470,7 @@ export const SpellDefs = {
       effects: [
         {
           kind: 'DAMAGE',
-          amount: 5,
+          amount: 1,
           damageType: 'magic'
         }
       ],

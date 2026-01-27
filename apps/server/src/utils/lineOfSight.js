@@ -76,21 +76,30 @@ export function hasLOS(from, to, blocks) {
 /**
  * Create a blocks function for terrain-based LOS checking
  * @param {Array<Array<number>>} terrain - 2D array of tile types
- * @param {Object} TILE_TYPES - Object with tile type constants (NONE, TILE, WALL)
+ * @param {Object} TILE_TYPES - Object with tile type constants (NONE, TILE, WALL, WATER)
  * @param {Set<string>} [occupiedTiles] - Optional set of occupied tile keys "x_y" (players block LOS)
  * @param {Object} [excludePosition] - Optional position {x, y} to exclude from blocking (e.g., caster's position)
+ * @param {Function} [doesTileBlockLOS] - Optional function to check if a tile type blocks LOS
  * @returns {Function} - Blocks function (x, y) => boolean
  */
-export function createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles = null, excludePosition = null) {
+export function createTerrainBlocksFunction(terrain, TILE_TYPES, occupiedTiles = null, excludePosition = null, doesTileBlockLOS = null) {
   return (x, y) => {
     // Check bounds
     if (y < 0 || y >= terrain.length || x < 0 || x >= terrain[0].length) {
       return true; // Out of bounds blocks LOS
     }
     
-    // Walls block LOS
-    if (terrain[y][x] === TILE_TYPES.WALL) {
-      return true;
+    // Check if tile type blocks LOS (using definition system if available)
+    const tileType = terrain[y][x];
+    if (doesTileBlockLOS) {
+      if (doesTileBlockLOS(tileType)) {
+        return true;
+      }
+    } else {
+      // Fallback: only walls block LOS (for backward compatibility)
+      if (tileType === TILE_TYPES.WALL) {
+        return true;
+      }
     }
     
     // Occupied tiles (players) block LOS
