@@ -6,7 +6,7 @@ import '../styles/friends.scss';
 
 function FriendsList() {
   const { user } = useAuth();
-  const { onlineStatus, friendListUpdates, clearFriendListUpdate } = useColyseus();
+  const { onlineStatus, lobbyStatus, gameStatus, friendListUpdates, clearFriendListUpdate, room } = useColyseus();
   const [friends, setFriends] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -15,6 +15,19 @@ function FriendsList() {
     if (!user) return;
     loadFriends();
   }, [user]);
+
+  // Request friend statuses when component mounts and room is connected
+  useEffect(() => {
+    if (room && room.sessionId && user) {
+      // Request fresh friend statuses to ensure accuracy
+      try {
+        room.send('requestFriendStatuses', {});
+      } catch (error) {
+        console.error('Error requesting friend statuses in FriendsList:', error);
+      }
+    }
+  }, [room, user]);
+
 
   // Listen for real-time friend list updates
   useEffect(() => {
@@ -40,6 +53,18 @@ function FriendsList() {
       setLoading(false);
     }
   };
+
+  // Request friend statuses after friends are loaded
+  useEffect(() => {
+    if (friends.length > 0 && room && room.sessionId) {
+      // Request fresh friend statuses after loading friends to ensure accuracy
+      try {
+        room.send('requestFriendStatuses', {});
+      } catch (error) {
+        console.error('Error requesting friend statuses after loading friends:', error);
+      }
+    }
+  }, [friends.length, room]);
 
   const handleRemoveFriend = async (friendUsername) => {
     if (!window.confirm('Are you sure you want to remove this friend?')) {
@@ -79,9 +104,31 @@ function FriendsList() {
                 </div>
               </div>
               <div className="friend-actions">
-                <div className={`status-indicator ${onlineStatus[friend.id] ? 'online' : 'offline'}`}>
-                  {onlineStatus[friend.id] ? 'Online' : 'Offline'}
-                </div>
+                {(() => {
+                  const isOnline = onlineStatus[friend.id] === true;
+                  const isInLobby = lobbyStatus[friend.id] === true;
+                  const isInGame = gameStatus[friend.id] === true;
+                  
+                  let statusText = 'Offline';
+                  let statusClass = 'offline';
+                  
+                  if (isInGame) {
+                    statusText = 'In Game';
+                    statusClass = 'in-game';
+                  } else if (isInLobby) {
+                    statusText = 'In Lobby';
+                    statusClass = 'in-lobby';
+                  } else if (isOnline) {
+                    statusText = 'Online';
+                    statusClass = 'online';
+                  }
+                  
+                  return (
+                    <div className={`status-indicator ${statusClass}`}>
+                      {statusText}
+                    </div>
+                  );
+                })()}
                 <button
                   onClick={() => handleRemoveFriend(friend.username)}
                   className="remove-friend-btn"

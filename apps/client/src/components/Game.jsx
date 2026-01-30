@@ -3,6 +3,9 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useColyseus } from '../context/ColyseusContext';
 import { createBabylonScene, disposeBabylonScene } from '../utils/babylonScene';
+import { onServerTeleportConfirmed } from '../utils/babylon/babylonTeleport';
+import { babylonToServerOrientation } from '../utils/babylon/babylonPlayers';
+import { Vector3 } from '@babylonjs/core';
 import { getMap, getClassSpells } from '../utils/api';
 import { connectToGameRoom } from '../utils/colyseus';
 import GameDataPanel from './GameDataPanel';
@@ -14,7 +17,7 @@ const MATCH_INFO_KEY = 'currentMatchInfo';
 
 const Game = () => {
   const { user } = useAuth();
-  const { matchFound, clearMatchFound } = useColyseus();
+  const { matchFound, clearMatchFound, room: friendRoom } = useColyseus();
   const navigate = useNavigate();
   const location = useLocation();
   
@@ -31,6 +34,9 @@ const Game = () => {
   const canvasRef = useRef(null);
   const babylonResourcesRef = useRef(null);
   const gameRoomRef = useRef(null);
+  const spellMessageListenersRegisteredRef = useRef(false);
+  const latestGameStateRef = useRef(null);
+  const pendingHitCountsRef = useRef(new Map());
 
   // Check if user should be in game - redirect if not
   useEffect(() => {
@@ -39,6 +45,10 @@ const Game = () => {
       return;
     }
   }, [user, navigate]);
+
+  useEffect(() => {
+    latestGameStateRef.current = gameState;
+  }, [gameState]);
 
   // Load match info from location state, localStorage, or context
   useEffect(() => {
@@ -154,6 +164,8 @@ const Game = () => {
         room.onLeave(() => {
           gameRoomRef.current = null;
           setGameRoom(null);
+          // Reset listener registration flag when room leaves
+          spellMessageListenersRegisteredRef.current = false;
         });
       } catch (err) {
         console.error('Failed to connect to game room:', err);
@@ -171,6 +183,29 @@ const Game = () => {
       }
     };
   }, [matchInfo, user]);
+
+  // Notify server when entering/leaving game
+  useEffect(() => {
+    if (friendRoom && friendRoom.sessionId && user && matchInfo) {
+      // Notify server that we're in game
+      try {
+        friendRoom.send('updateGameStatus', { inGame: true });
+      } catch (error) {
+        console.error('Error notifying game status:', error);
+      }
+
+      // Cleanup: notify server when leaving game
+      return () => {
+        if (friendRoom && friendRoom.sessionId) {
+          try {
+            friendRoom.send('updateGameStatus', { inGame: false });
+          } catch (error) {
+            console.error('Error notifying game status on leave:', error);
+          }
+        }
+      };
+    }
+  }, [friendRoom, user, matchInfo]);
 
   // Initialize Babylon.js 3D scene when canvas and map data are ready
   useEffect(() => {
@@ -219,6 +254,20 @@ const Game = () => {
       });
     }
   }, [babylonResourcesRef.current, gameRoomRef.current, gameState, user]);
+  
+  // Set up orientation change handler (syncs facing direction after movement animation)
+  useEffect(() => {
+    if (babylonResourcesRef.current && babylonResourcesRef.current.setOnOrientationChange && gameRoomRef.current) {
+      babylonResourcesRef.current.setOnOrientationChange((userId, babylonRotation) => {
+        // Only send orientation updates for the current user
+        if (gameRoomRef.current && userId === user?.id) {
+          // Convert Babylon rotation to server orientation format
+          const serverOrientation = babylonToServerOrientation(babylonRotation);
+          gameRoomRef.current.send('updateOrientation', { orientation: serverOrientation });
+        }
+      });
+    }
+  }, [babylonResourcesRef.current, gameRoomRef.current, user]);
   
   // Load spell definitions when game state is available
   useEffect(() => {
@@ -311,16 +360,12 @@ const Game = () => {
     const room = gameRoomRef.current;
     if (!room || !babylonResourcesRef.current || Object.keys(spellDefs).length === 0) return;
     
+    // Prevent duplicate listener registration
+    if (spellMessageListenersRegisteredRef.current) {
+      return;
+    }
+    
     const handleSpellCast = (message) => {
-      console.log('handleSpellCast: Received spellCast message:', {
-        userId: message.userId,
-        spellId: message.spellId,
-        targetX: message.targetX,
-        targetY: message.targetY,
-        hasCastAnimDef: !!message.castAnimDef,
-        hasPresentation: !!message.presentation,
-        presentation: message.presentation
-      });
       // Use cast animation definition from server message (preferred)
       // Fallback to local spellDefs if not provided
       let castAnimDef = message.castAnimDef;
@@ -342,19 +387,29 @@ const Game = () => {
             ...message.presentation
           }
         };
-        console.log('Merged spell definition with server VFX data:', spellDef.spellId, spellDef.presentation);
       } else if (!spellDef) {
         // If no local spellDef, create one from server data
         spellDef = {
           spellId: message.spellId,
           presentation: message.presentation || {}
         };
-        console.log('Created spell definition from server data:', spellDef);
       }
       
+      if (message.targets && Array.isArray(message.targets) && message.targets.length > 1) {
+        const positionCounts = new Map();
+        message.targets.forEach(target => {
+          const posKey = `${target.x}_${target.y}`;
+          positionCounts.set(posKey, (positionCounts.get(posKey) || 0) + 1);
+        });
+        const castKey = `${message.userId}:${message.spellId}`;
+        pendingHitCountsRef.current.set(castKey, {
+          positionCounts,
+          expiresAt: Date.now() + 5000
+        });
+      }
+
       if (babylonResourcesRef.current && babylonResourcesRef.current.playSpellCastAnimation) {
         if (castAnimDef) {
-          console.log('handleSpellCast: Calling playSpellCastAnimation with:', message.userId, message.spellId, castAnimDef);
           
           // Check if this is a multi-target spell
           if (message.targets && Array.isArray(message.targets)) {
@@ -388,7 +443,6 @@ const Game = () => {
     };
     
     const handleSpellPrep = (message) => {
-      console.log('handleSpellPrep: Received spellPrep message:', message);
       // Only play stance animation for other players (not yourself)
       if (message.userId !== user?.id && babylonResourcesRef.current && babylonResourcesRef.current.playSpellPrepAnimation) {
         // Use prep animation definition from server message (preferred)
@@ -400,7 +454,6 @@ const Game = () => {
         }
         
         if (prepAnimDef) {
-          console.log('handleSpellPrep: Calling playSpellPrepAnimation with:', message.userId, message.spellId, prepAnimDef);
           babylonResourcesRef.current.playSpellPrepAnimation(message.userId, message.spellId, prepAnimDef);
         } else {
           console.warn(`Prep animation not found for spell "${message.spellId}". prepAnimDef from server:`, message.prepAnimDef);
@@ -409,7 +462,6 @@ const Game = () => {
     };
     
     const handleSpellPrepCancel = (message) => {
-      console.log('handleSpellPrepCancel: Received spellPrepCancel message:', message);
       
       // If it's for the current user, also clear spell selection state
       if (message.userId === user?.id) {
@@ -422,38 +474,103 @@ const Game = () => {
       
       // Stop stance animation for the player (works for both self and others)
       if (babylonResourcesRef.current && babylonResourcesRef.current.stopSpellPrepAnimation) {
-        console.log('handleSpellPrepCancel: Calling stopSpellPrepAnimation with:', message.userId);
         babylonResourcesRef.current.stopSpellPrepAnimation(message.userId);
       }
     };
     
     const handleSpellHit = (message) => {
       // Play hit animation for the target player (can be yourself or others)
-      // Get hit delay from spell definition if available
-      const spellDef = spellDefs[message.spellId];
-      const hitDelay = spellDef?.presentation?.hitDelayMs || 0;
-      
-      if (babylonResourcesRef.current && babylonResourcesRef.current.playHitAnimation) {
-        if (hitDelay > 0) {
-          setTimeout(() => {
-            babylonResourcesRef.current.playHitAnimation(message.targetUserId);
-          }, hitDelay);
-        } else {
-          babylonResourcesRef.current.playHitAnimation(message.targetUserId);
+      // Note: Server already delays spellHit broadcast by impactDelayMs, so we don't add that delay here
+      const pendingKey = `${message.casterUserId}:${message.spellId}`;
+      const pendingEntry = pendingHitCountsRef.current.get(pendingKey);
+      let multiHitCount = 1;
+      if (pendingEntry && pendingEntry.expiresAt > Date.now() && pendingEntry.positionCounts) {
+        const latestState = latestGameStateRef.current;
+        if (latestState) {
+          const findPlayerPosition = (state, targetUserId) => {
+            const findInTeam = (team) => {
+              if (!team?.players) return null;
+              const player = Object.values(team.players).find(p => p.userId === targetUserId);
+              return player?.position || null;
+            };
+            return findInTeam(state.myTeam) || findInTeam(state.enemyTeam);
+          };
+          const targetPos = findPlayerPosition(latestState, message.targetUserId);
+          if (targetPos) {
+            const posKey = `${targetPos.x}_${targetPos.y}`;
+            const count = pendingEntry.positionCounts.get(posKey);
+            if (count) {
+              multiHitCount = count;
+              pendingEntry.positionCounts.delete(posKey);
+              if (pendingEntry.positionCounts.size === 0) {
+                pendingHitCountsRef.current.delete(pendingKey);
+              }
+            }
+          }
         }
+      } else if (pendingEntry) {
+        pendingHitCountsRef.current.delete(pendingKey);
+      }
+      
+      // Record hit for combat text - no additional delay since server already timed it
+      if (babylonResourcesRef.current?.recordSpellHit) {
+        babylonResourcesRef.current.recordSpellHit(message.targetUserId, 0, multiHitCount);
+      }
+
+      // Play hit animation immediately - server already delayed the spellHit message
+      if (babylonResourcesRef.current && babylonResourcesRef.current.playHitAnimation) {
+        babylonResourcesRef.current.playHitAnimation(message.targetUserId);
       }
     };
     
-    room.onMessage('spellCast', handleSpellCast);
-    room.onMessage('spellPrep', handleSpellPrep);
-    room.onMessage('spellPrepCancel', handleSpellPrepCancel);
-    room.onMessage('spellHit', handleSpellHit);
-    console.log('handleSpellCast: Registered spellCast, spellPrep, and spellPrepCancel message listeners');
+    const handleTeleportConfirm = (message) => {
+      // Server confirms teleport destination
+      // Convert grid coordinates to world coordinates
+      if (message.userId && message.destinationX !== undefined && message.destinationY !== undefined) {
+        const tileSize = 1;
+        
+        // Get character's current Y position from their mesh (for proper ground level)
+        let characterY = 0.5; // Default fallback
+        if (babylonResourcesRef.current && babylonResourcesRef.current.scene) {
+          const scene = babylonResourcesRef.current.scene;
+          if (scene.metadata && scene.metadata.playerMeshes) {
+            const characterMesh = scene.metadata.playerMeshes.get(message.userId);
+            if (characterMesh && characterMesh.position) {
+              characterY = characterMesh.position.y;
+            }
+          }
+        }
+        
+        const destination = new Vector3(
+          message.destinationX * tileSize,
+          characterY, // Use character's actual Y position (ground level)
+          message.destinationY * tileSize
+        );
+        onServerTeleportConfirmed(message.userId, destination);
+      }
+    };
     
-    // Cleanup: remove listener when dependencies change
+    // Store removal functions to properly clean up listeners
+    const removeSpellCast = room.onMessage('spellCast', handleSpellCast);
+    const removeSpellPrep = room.onMessage('spellPrep', handleSpellPrep);
+    const removeSpellPrepCancel = room.onMessage('spellPrepCancel', handleSpellPrepCancel);
+    const removeSpellHit = room.onMessage('spellHit', handleSpellHit);
+    const removeTeleportConfirm = room.onMessage('teleportConfirm', handleTeleportConfirm);
+    
+    // Mark listeners as registered
+    spellMessageListenersRegisteredRef.current = true;
+    
+    // Cleanup: remove listeners when dependencies change to prevent duplicates
     return () => {
-      // Note: Colyseus automatically removes listeners when room is left, but we can't manually remove them
-      // The listener will be cleaned up when the room is disposed
+      // Remove all listeners to prevent duplicate message handling
+      if (typeof removeSpellCast === 'function') removeSpellCast();
+      if (typeof removeSpellPrep === 'function') removeSpellPrep();
+      if (typeof removeSpellPrepCancel === 'function') removeSpellPrepCancel();
+      if (typeof removeSpellHit === 'function') removeSpellHit();
+      if (typeof removeTeleportConfirm === 'function') removeTeleportConfirm();
+      
+      // Reset registration flag
+      spellMessageListenersRegisteredRef.current = false;
     };
   }, [gameRoom, spellDefs, user]);
 

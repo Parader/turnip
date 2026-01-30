@@ -11,6 +11,7 @@ export function ColyseusProvider({ children }) {
   const { user, isAuthenticated } = useAuth();
   const [onlineStatus, setOnlineStatus] = useState({});
   const [lobbyStatus, setLobbyStatus] = useState({}); // friendId -> inLobby boolean
+  const [gameStatus, setGameStatus] = useState({}); // friendId -> inGame boolean
   const [partyUpdate, setPartyUpdate] = useState(null); // Party update from server
   const [friendRequestUpdates, setFriendRequestUpdates] = useState(null);
   const [friendListUpdates, setFriendListUpdates] = useState(null);
@@ -19,6 +20,8 @@ export function ColyseusProvider({ children }) {
   const [matchmakingStatus, setMatchmakingStatus] = useState(null); // { queues: [], message: '' }
   const [matchFound, setMatchFound] = useState(null); // Match info when found
   const [room, setRoom] = useState(null); // Track room in state so React re-renders when it changes
+  const [isConnecting, setIsConnecting] = useState(false); // Track connection status
+  const [connectionError, setConnectionError] = useState(null); // Track connection errors
   const roomRef = useRef(null);
   const connectingRef = useRef(false);
 
@@ -27,6 +30,11 @@ export function ColyseusProvider({ children }) {
       // Clean up if user logs out
       if (roomRef.current) {
         const currentRoom = roomRef.current;
+        // Clear status refresh interval
+        if (currentRoom._statusRefreshInterval) {
+          clearInterval(currentRoom._statusRefreshInterval);
+          delete currentRoom._statusRefreshInterval;
+        }
         roomRef.current.leave();
         roomRef.current = null;
         setRoom(null); // Update state to trigger re-render
@@ -40,6 +48,9 @@ export function ColyseusProvider({ children }) {
       }
       setOnlineStatus({});
       setLobbyStatus({});
+      setGameStatus({});
+      setIsConnecting(false);
+      setConnectionError(null);
       return;
     }
 
@@ -79,6 +90,34 @@ export function ColyseusProvider({ children }) {
       if (existingRoom && existingRoom.sessionId) {
         roomRef.current = existingRoom;
         setRoom(existingRoom);
+        setIsConnecting(false);
+        setConnectionError(null);
+        // Request fresh friend statuses to ensure they're up to date
+        Promise.resolve().then(() => {
+          if (existingRoom && existingRoom.sessionId) {
+            try {
+              existingRoom.send('requestFriendStatuses', {});
+              
+              // Set up periodic status refresh if not already set up
+              if (!existingRoom._statusRefreshInterval) {
+                const statusRefreshInterval = setInterval(() => {
+                  if (existingRoom && existingRoom.sessionId) {
+                    try {
+                      existingRoom.send('requestFriendStatuses', {});
+                    } catch (error) {
+                      console.error('Error in periodic friend status refresh:', error);
+                    }
+                  } else {
+                      clearInterval(statusRefreshInterval);
+                  }
+                }, 30000);
+                existingRoom._statusRefreshInterval = statusRefreshInterval;
+              }
+            } catch (error) {
+              console.error('Error requesting friend statuses on existing connection:', error);
+            }
+          }
+        });
         return;
       } else {
         // Room exists but is disconnected, remove it
@@ -93,11 +132,15 @@ export function ColyseusProvider({ children }) {
 
     const connectToRoom = async () => {
       connectingRef.current = true;
+      setIsConnecting(true);
+      setConnectionError(null);
       try {
         const friendRoom = await connectToFriendRoom(userId);
         roomRef.current = friendRoom;
         setRoom(friendRoom); // Update state to trigger re-render
         globalConnections.set(userId, friendRoom);
+        setIsConnecting(false);
+        setConnectionError(null);
 
         // Listen for friend status updates
         friendRoom.onMessage('friendStatusUpdate', (message) => {
@@ -173,6 +216,31 @@ export function ColyseusProvider({ children }) {
             updated[message.friendId] = message.inLobby;
             return updated;
           });
+          // If entering lobby, clear game status
+          if (message.inLobby) {
+            setGameStatus(prev => {
+              const updated = { ...prev };
+              updated[message.friendId] = false;
+              return updated;
+            });
+          }
+        });
+
+        // Listen for game status updates
+        friendRoom.onMessage('gameStatusUpdate', (message) => {
+          setGameStatus(prev => {
+            const updated = { ...prev };
+            updated[message.friendId] = message.inGame;
+            return updated;
+          });
+          // If entering game, clear lobby status
+          if (message.inGame) {
+            setLobbyStatus(prev => {
+              const updated = { ...prev };
+              updated[message.friendId] = false;
+              return updated;
+            });
+          }
         });
 
         // Listen for invitation errors
@@ -209,8 +277,45 @@ export function ColyseusProvider({ children }) {
           setMatchmakingStatus(null); // Clear matchmaking status
         });
 
+        // Request friend statuses after listeners are set up
+        // This ensures we get the latest statuses even if initial messages were missed
+        // Use Promise.resolve().then() to ensure this runs after current synchronous code
+        // but before any potential missed messages
+        Promise.resolve().then(() => {
+          if (friendRoom && friendRoom.sessionId) {
+            try {
+              friendRoom.send('requestFriendStatuses', {});
+            } catch (error) {
+              console.error('Error requesting friend statuses:', error);
+            }
+          }
+        });
+
+        // Set up periodic status refresh (every 30 seconds) to ensure accuracy
+        // This works in conjunction with server-side ping/pong status sync
+        const statusRefreshInterval = setInterval(() => {
+          if (friendRoom && friendRoom.sessionId) {
+            try {
+              friendRoom.send('requestFriendStatuses', {});
+            } catch (error) {
+              console.error('Error in periodic friend status refresh:', error);
+            }
+          } else {
+            // Room disconnected, clear interval
+            clearInterval(statusRefreshInterval);
+          }
+        }, 30000);
+
+        // Store interval ID for cleanup
+        friendRoom._statusRefreshInterval = statusRefreshInterval;
+
         // Handle room leave/disconnect
         friendRoom.onLeave(() => {
+          // Clear status refresh interval
+          if (friendRoom._statusRefreshInterval) {
+            clearInterval(friendRoom._statusRefreshInterval);
+            delete friendRoom._statusRefreshInterval;
+          }
           globalConnections.delete(userId);
           if (roomRef.current === friendRoom) {
             roomRef.current = null;
@@ -222,6 +327,8 @@ export function ColyseusProvider({ children }) {
         globalConnections.delete(userId);
         roomRef.current = null;
         setRoom(null); // Update state to trigger re-render
+        setIsConnecting(false);
+        setConnectionError(error.message || 'Failed to connect to server');
       } finally {
         connectingRef.current = false;
       }
@@ -244,6 +351,7 @@ export function ColyseusProvider({ children }) {
     room, // Use state instead of ref so React re-renders when it changes
     onlineStatus,
     lobbyStatus,
+    gameStatus,
     partyUpdate,
     friendRequestUpdates,
     friendListUpdates,
@@ -251,6 +359,8 @@ export function ColyseusProvider({ children }) {
     invitationResponse,
     matchmakingStatus,
     matchFound,
+    isConnecting,
+    connectionError,
     clearFriendRequestUpdate: () => setFriendRequestUpdates(null),
     clearFriendListUpdate: () => setFriendListUpdates(null),
     clearLobbyInvitation: () => setLobbyInvitation(null),
@@ -258,6 +368,7 @@ export function ColyseusProvider({ children }) {
     clearPartyUpdate: () => setPartyUpdate(null),
     clearMatchmakingStatus: () => setMatchmakingStatus(null),
     clearMatchFound: () => setMatchFound(null),
+    clearConnectionError: () => setConnectionError(null),
     isConnected: !!room,
   };
 

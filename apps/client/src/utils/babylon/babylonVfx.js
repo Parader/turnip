@@ -3,7 +3,8 @@
  * Handles rendering of spell projectiles, impacts, and ground effects
  */
 
-import { MeshBuilder, StandardMaterial, Color3, Color4, Vector3, Animation, AnimationGroup, ParticleSystem, Texture, DynamicTexture, Material } from '@babylonjs/core';
+import { MeshBuilder, StandardMaterial, Color3, Color4, Vector3, Animation, AnimationGroup, ParticleSystem, Texture, DynamicTexture, Material, SceneLoader } from '@babylonjs/core';
+import '@babylonjs/loaders/glTF';
 
 /**
  * Create a VFX mesh based on VFX definition
@@ -216,7 +217,7 @@ function createStarTexture(scene) {
 /**
  * Create a diamond texture for geometric particles
  */
-function createDiamondTexture(scene) {
+export function createDiamondTexture(scene) {
   const size = 64;
   const texture = new DynamicTexture('diamondTexture', size, scene, false);
   const context = texture.getContext();
@@ -255,7 +256,7 @@ function createDiamondTexture(scene) {
 /**
  * Create a line-streak texture for linear particles
  */
-function createLineStreakTexture(scene) {
+export function createLineStreakTexture(scene) {
   const size = 64;
   const texture = new DynamicTexture('lineStreakTexture', size, scene, false);
   const context = texture.getContext();
@@ -294,35 +295,45 @@ function createProjectileParticles(projectileMesh, scene, particleConfig = {}) {
   
   // Emit from the projectile mesh
   particleSystem.emitter = projectileMesh;
-  // Larger emit box to ensure particles are visible
-  particleSystem.minEmitBox = new Vector3(-0.2, -0.2, -0.2);
-  particleSystem.maxEmitBox = new Vector3(0.2, 0.2, 0.2);
+  
+  const trailing = particleConfig.trailing === true;
+  if (trailing) {
+    // Tighter emit box – less disperse, trail stays close to projectile
+    particleSystem.minEmitBox = new Vector3(-0.06, -0.06, -0.06);
+    particleSystem.maxEmitBox = new Vector3(0.06, 0.06, 0.06);
+    // Direction mostly backward (opposite movement) – trail behind projectile; small lateral spread
+    particleSystem.direction1 = new Vector3(-0.15, -0.15, 1);
+    particleSystem.direction2 = new Vector3(0.15, 0.15, 0.7);
+    particleSystem.minEmitPower = particleConfig.minEmitPower ?? 0.08;
+    particleSystem.maxEmitPower = particleConfig.maxEmitPower ?? 0.2;
+    particleSystem.gravity = new Vector3(0, 0.02, 0);
+    particleSystem.minLifeTime = particleConfig.minLifeTime ?? 0.35;
+    particleSystem.maxLifeTime = particleConfig.maxLifeTime ?? 0.7;
+  } else {
+    particleSystem.minEmitBox = new Vector3(-0.2, -0.2, -0.2);
+    particleSystem.maxEmitBox = new Vector3(0.2, 0.2, 0.2);
+    particleSystem.direction1 = new Vector3(-1, -1, -1);
+    particleSystem.direction2 = new Vector3(1, 1, 1);
+    particleSystem.minEmitPower = particleConfig.minEmitPower || 0.3;
+    particleSystem.maxEmitPower = particleConfig.maxEmitPower || 1.0;
+    particleSystem.gravity = new Vector3(0, 0.1, 0);
+  }
   
   // Particle colors (fire colors: orange to yellow to red)
   particleSystem.color1 = new Color4(1.0, 0.5, 0.0, 1.0); // Orange
   particleSystem.color2 = new Color4(1.0, 0.8, 0.0, 1.0); // Yellow
   particleSystem.colorDead = new Color4(0.8, 0.2, 0.0, 0.0); // Fade to dark red
   
-  // Particle size - make them larger and more visible
   particleSystem.minSize = particleConfig.minSize || 0.15;
   particleSystem.maxSize = particleConfig.maxSize || 0.3;
   
-  // Particle lifetime
-  particleSystem.minLifeTime = particleConfig.minLifeTime || 0.2;
-  particleSystem.maxLifeTime = particleConfig.maxLifeTime || 0.5;
+  if (!trailing) {
+    particleSystem.minLifeTime = particleConfig.minLifeTime || 0.2;
+    particleSystem.maxLifeTime = particleConfig.maxLifeTime || 0.5;
+  }
   
-  // Emission rate - higher for more visible effect
   particleSystem.emitRate = particleConfig.emitRate || 150;
-  
-  // Direction and speed - particles spread outward from center
-  particleSystem.direction1 = new Vector3(-1, -1, -1);
-  particleSystem.direction2 = new Vector3(1, 1, 1);
-  particleSystem.minEmitPower = particleConfig.minEmitPower || 0.3;
-  particleSystem.maxEmitPower = particleConfig.maxEmitPower || 1.0;
   particleSystem.updateSpeed = 0.02;
-  
-  // Gravity (slight upward drift)
-  particleSystem.gravity = new Vector3(0, 0.1, 0);
   
   // Blend mode for fire effect (additive blending)
   particleSystem.blendMode = ParticleSystem.BLENDMODE_ONEONE;
@@ -447,7 +458,6 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
   const arcLength = bezierArcLength(startPos, controlPoint, endPos);
   const duration = arcLength / adjustedSpeed;
   
-  console.log(`Starting curved projectile animation: arcLength=${arcLength.toFixed(2)}, speed=${adjustedSpeed.toFixed(2)}, pattern=${curvePattern}, duration=${duration.toFixed(2)}s`);
   
   const startTime = Date.now();
   const speed = adjustedSpeed;
@@ -492,12 +502,14 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
       t
     );
     
-    // Calculate direction for orientation (optional - can orient missile along path)
+    // Calculate direction for orientation and orient shard along path
     const direction = newPos.subtract(projectileMesh.metadata.lastPosition);
     if (direction.length() > 0.001) {
-      direction.normalize();
-      // Optional: Orient missile along path
-      // projectileMesh.lookAt(newPos.add(direction));
+      const normalizedDir = direction.clone().normalize();
+      // Orient shard to face direction of travel
+      // Calculate target point ahead in the direction of travel
+      const targetPoint = newPos.clone().add(normalizedDir.scale(1.0));
+      projectileMesh.lookAt(targetPoint);
     }
     projectileMesh.metadata.lastPosition = newPos.clone();
     
@@ -539,7 +551,6 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
       if (!wasTriggered && onCompleteCallback) {
         onCompleteCallback();
       }
-      console.log('Curved projectile reached destination');
     } else {
       // Update position along curve
       projectileMesh.position = newPos;
@@ -553,7 +564,6 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
   projectileMesh.isVisible = true;
   projectileMesh.setEnabled(true);
   
-  console.log('Curved projectile animation observer added');
 }
 
 /**
@@ -565,34 +575,28 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
  * @param {Scene} scene - Babylon.js scene
  * @param {Function} onComplete - Callback when projectile reaches destination
  * @param {ParticleSystem} particleSystem - Optional particle system to dispose
+ * @param {{ orientToDestination?: boolean }} options - If true, mesh faces endPos each frame (like magic missile)
  */
-function animateProjectile(projectileMesh, startPos, endPos, speedCellsPerSec, scene, onComplete, particleSystem = null) {
+function animateProjectile(projectileMesh, startPos, endPos, speedCellsPerSec, scene, onComplete, particleSystem = null, options = {}) {
   const distance = Vector3.Distance(startPos, endPos);
-  const duration = distance / speedCellsPerSec; // Duration in seconds
+  const { orientToDestination = false } = options;
   
-  console.log(`Starting projectile animation: distance=${distance.toFixed(2)}, speed=${speedCellsPerSec}, duration=${duration.toFixed(2)}s`);
-  console.log(`Start: (${startPos.x.toFixed(2)}, ${startPos.y.toFixed(2)}, ${startPos.z.toFixed(2)}), End: (${endPos.x.toFixed(2)}, ${endPos.y.toFixed(2)}, ${endPos.z.toFixed(2)})`);
-  
-  // Use render loop for smooth animation instead of Animation.CreateAndStartAnimation
   const startTime = Date.now();
-  const speed = speedCellsPerSec; // units per second
+  const speed = speedCellsPerSec;
   
-  // Store animation state in mesh metadata
   projectileMesh.metadata = {
     startPos: startPos.clone(),
     endPos: endPos.clone(),
     speed: speed,
     startTime: startTime,
     onComplete: onComplete,
-    observer: null, // Will store observer reference
-    particleSystem: particleSystem // Store particle system for cleanup
+    observer: null,
+    particleSystem: particleSystem
   };
   
-  // Store positions locally to avoid null reference issues
   const startPosLocal = startPos.clone();
   const endPosLocal = endPos.clone();
   
-  // Use scene's render loop to update position
   const observer = scene.onBeforeRenderObservable.add(() => {
     if (!projectileMesh || !projectileMesh.metadata) {
       if (observer) {
@@ -609,29 +613,33 @@ function animateProjectile(projectileMesh, startPos, endPos, speedCellsPerSec, s
     // Trigger explosion slightly before arrival (at 95% of journey) for better sync
     if (!projectileMesh.metadata.explosionTriggered && progress >= 0.95) {
       projectileMesh.metadata.explosionTriggered = true;
+      scene.onBeforeRenderObservable.remove(observer);
+      projectileMesh.isVisible = false;
+      projectileMesh.setEnabled(false);
       if (projectileMesh.metadata.onComplete) {
         projectileMesh.metadata.onComplete();
       }
+      projectileMesh.metadata = null;
+      return;
     }
     
     if (distanceTraveled >= totalDistance) {
-      // Reached destination
+      // Reached destination - hide mesh before impact, then complete
       projectileMesh.position = endPosLocal.clone();
       scene.onBeforeRenderObservable.remove(observer);
+      projectileMesh.isVisible = false;
+      projectileMesh.setEnabled(false);
       
-      // Dispose particle system if it exists (stored in metadata)
       if (projectileMesh.metadata.particleSystem) {
         projectileMesh.metadata.particleSystem.dispose();
       }
       
-      // Only call onComplete if explosion wasn't already triggered
       if (!projectileMesh.metadata.explosionTriggered && projectileMesh.metadata.onComplete) {
         projectileMesh.metadata.onComplete();
       }
       projectileMesh.metadata = null;
-      console.log('Projectile reached destination');
+      return;
     } else {
-      // Interpolate position using local copies
       const t = distanceTraveled / totalDistance;
       const newPos = new Vector3(
         startPosLocal.x + (endPosLocal.x - startPosLocal.x) * t,
@@ -639,17 +647,15 @@ function animateProjectile(projectileMesh, startPos, endPos, speedCellsPerSec, s
         startPosLocal.z + (endPosLocal.z - startPosLocal.z) * t
       );
       projectileMesh.position = newPos;
+      if (orientToDestination) {
+        projectileMesh.lookAt(endPosLocal);
+      }
     }
   });
   
-  // Store observer reference
   projectileMesh.metadata.observer = observer;
-  
-  // Ensure mesh is visible
   projectileMesh.isVisible = true;
   projectileMesh.setEnabled(true);
-  
-  console.log('Projectile animation observer added, mesh visible:', projectileMesh.isVisible);
 }
 
 /**
@@ -730,10 +736,19 @@ function createExplosionParticles(position, scene, config = {}) {
  */
 function createExplosion(impactVfxDef, position, scene, name) {
   // Use particle system for explosion instead of mesh
-  // Raise explosion position slightly higher
   const explosionPos = position.clone();
-  explosionPos.y += 0.3; // Raise explosion by 0.3 units
-  createExplosionParticles(explosionPos, scene, {
+  explosionPos.y += 0.3;
+  const isFireball = name === 'fireball_impact';
+  createExplosionParticles(explosionPos, scene, isFireball ? {
+    minSize: 0.11,
+    maxSize: 0.19,
+    minLifeTime: 0.28,
+    maxLifeTime: 0.7,
+    emitRate: 230,
+    minEmitPower: 0.75,
+    maxEmitPower: 1.5,
+    burstDuration: 0.18
+  } : {
     minSize: 0.15,
     maxSize: 0.25,
     minLifeTime: 0.3,
@@ -741,7 +756,7 @@ function createExplosion(impactVfxDef, position, scene, name) {
     emitRate: 300,
     minEmitPower: 1.0,
     maxEmitPower: 2.0,
-    burstDuration: 0.2 // 200ms burst
+    burstDuration: 0.2
   });
 }
 
@@ -803,6 +818,59 @@ function createGroundEffect(groundEffectVfxDef, position, scene, name) {
 }
 
 /**
+ * Load fireball.glb once and cache in scene.metadata (fireballModel, fireballAnimationGroups).
+ * Returns { template, animationGroups } for cloning projectiles.
+ * @param {Scene} scene - Babylon.js scene
+ * @returns {Promise<{ template: AbstractMesh, animationGroups: AnimationGroup[] }>}
+ */
+function getOrLoadFireballModel(scene) {
+  if (scene.metadata && scene.metadata.fireballModel) {
+    return Promise.resolve({
+      template: scene.metadata.fireballModel,
+      animationGroups: scene.metadata.fireballAnimationGroups || []
+    });
+  }
+  const rootUrl = '/assets/';
+  const filename = 'fireball.glb';
+  return SceneLoader.ImportMeshAsync('', rootUrl, filename, scene).then((result) => {
+    if (!result.meshes || result.meshes.length === 0) {
+      throw new Error('Fireball GLB: no meshes in model');
+    }
+    let rootMesh = result.meshes[0];
+    for (const mesh of result.meshes) {
+      if (!mesh.parent) {
+        rootMesh = mesh;
+        break;
+      }
+    }
+    rootMesh.name = 'fireball_model_template';
+    rootMesh.setEnabled(false);
+    rootMesh.isVisible = false;
+    const animationGroups = result.animationGroups || [];
+    if (!scene.metadata) {
+      scene.metadata = {};
+    }
+    scene.metadata.fireballModel = rootMesh;
+    scene.metadata.fireballAnimationGroups = animationGroups;
+    return { template: rootMesh, animationGroups };
+  });
+}
+
+/**
+ * Dispose a mesh and all its descendants (for GLB clone cleanup).
+ * Does not dispose materials so template model can be cloned again.
+ * @param {AbstractMesh} mesh - Root mesh to dispose
+ */
+function disposeMeshAndChildren(mesh) {
+  if (!mesh) return;
+  const children = mesh.getChildMeshes ? mesh.getChildMeshes(false) : [];
+  children.forEach((child) => disposeMeshAndChildren(child));
+  if (!mesh.isDisposed) {
+    mesh.dispose();
+  }
+}
+
+/**
  * Play fireball VFX
  * @param {Scene} scene - Babylon.js scene
  * @param {Object} spellDef - Spell definition with VFX
@@ -826,12 +894,7 @@ export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime
     return;
   }
   
-  console.log('Playing fireball VFX:', {
-    hasProjectile: !!projectileVfx,
-    hasImpact: !!impactVfx,
-    startPos: { x: startPos.x, y: startPos.y, z: startPos.z },
-    endPos: { x: endPos.x, y: endPos.y, z: endPos.z }
-  });
+  // Playing fireball VFX
   
   // Calculate start delay: add 150ms to match character animation + any projectileVfx delay
   const baseDelay = 600; // 150ms delay to match character animation
@@ -850,88 +913,151 @@ export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime
         return;
       }
       
-      // Create projectile with modified opacity (10% transparent)
-      // Clone the vfx definition to avoid modifying the original
-      const modifiedVfx = { ...projectileVfx.vfx, opacity: 0.05 };
-      const projectileMesh = createVfxMesh(modifiedVfx, scene, 'fireball_projectile');
-      
-      // Ensure transparency settings are correct
-      if (projectileMesh.material) {
-        projectileMesh.material.alpha = 0.05;
-        // Set transparency mode for proper alpha blending
-        projectileMesh.material.transparencyMode = Material.MATERIAL_ALPHABLEND;
-        // Ensure back face culling is disabled for transparency to work properly
-        projectileMesh.material.backFaceCulling = false;
-        // Disable depth write for proper transparency blending
-        projectileMesh.material.disableDepthWrite = true;
-      }
-      
-      // Position projectile at start with height offset
-      const projectileStart = startPos.clone();
       const heightOffset = projectileVfx.heightOffset || 0.5;
-      projectileStart.y = startPos.y + heightOffset;
-      
-      // Calculate end position with height offset
+      const projectileStart = startPos.clone();
+      projectileStart.y = startPos.y + heightOffset + 0.1; // Slightly higher (hand height), a bit lower
       const projectileEnd = endPos.clone();
       projectileEnd.y = endPos.y + heightOffset;
+      // Offset start to character's right and a bit forward (simulating from hand, further from body)
+      const dir = endPos.subtract(startPos);
+      if (dir.length() > 0.001) {
+        const right = Vector3.Cross(dir, new Vector3(0, 1, 0)).normalize();
+        projectileStart.addInPlace(right.scale(0.35));
+        const forward = dir.clone().normalize();
+        projectileStart.addInPlace(forward.scale(0.6)); // Start further from character
+      }
       
-      // Set initial position
-      projectileMesh.position = projectileStart.clone();
-      
-      // Ensure mesh is visible and enabled, and parented to scene
-      projectileMesh.isVisible = true;
-      projectileMesh.setEnabled(true);
-      projectileMesh.parent = null; // Ensure it's directly in the scene
-      
-      // Force update
-      projectileMesh.computeWorldMatrix(true);
-      
-      console.log('Created fireball projectile:', {
-        start: `(${projectileStart.x.toFixed(2)}, ${projectileStart.y.toFixed(2)}, ${projectileStart.z.toFixed(2)})`,
-        end: `(${projectileEnd.x.toFixed(2)}, ${projectileEnd.y.toFixed(2)}, ${projectileEnd.z.toFixed(2)})`,
-        meshPosition: `(${projectileMesh.position.x.toFixed(2)}, ${projectileMesh.position.y.toFixed(2)}, ${projectileMesh.position.z.toFixed(2)})`,
-        meshWorldPos: projectileMesh.getAbsolutePosition() ? `(${projectileMesh.getAbsolutePosition().x.toFixed(2)}, ${projectileMesh.getAbsolutePosition().y.toFixed(2)}, ${projectileMesh.getAbsolutePosition().z.toFixed(2)})` : 'N/A',
-        visible: projectileMesh.isVisible,
-        enabled: projectileMesh.isEnabled(),
-        inScene: scene.meshes.includes(projectileMesh)
+      // Use fireball.glb model; fallback to sphere if load fails
+      getOrLoadFireballModel(scene).then(({ template, animationGroups }) => {
+        const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+        const uniqueName = `fireball_projectile_${uniqueId}`;
+        const projectileMesh = template.clone(uniqueName, null, false);
+        if (!projectileMesh) {
+          runFireballFallback();
+          return;
+        }
+        projectileMesh.setEnabled(true);
+        projectileMesh.isVisible = true;
+        projectileMesh.parent = null;
+        projectileMesh.position = projectileStart.clone();
+        projectileMesh.computeWorldMatrix(true);
+        
+        // Clone and play fireball.glb animations, retargeted to this projectile clone
+        const clonedAnimGroups = [];
+        if (animationGroups && animationGroups.length > 0) {
+          const templateDescendants = template.getDescendants ? template.getDescendants() : [template, ...(template.getChildMeshes ? template.getChildMeshes(true) : [])];
+          const cloneDescendants = projectileMesh.getDescendants ? projectileMesh.getDescendants() : [projectileMesh, ...(projectileMesh.getChildMeshes ? projectileMesh.getChildMeshes(true) : [])];
+          const targetMap = new Map();
+          targetMap.set(template, projectileMesh);
+          templateDescendants.forEach((tNode, i) => {
+            if (cloneDescendants[i]) targetMap.set(tNode, cloneDescendants[i]);
+          });
+          animationGroups.forEach((ag, idx) => {
+            if (!ag || ag.isDisposed) return;
+            const cloneName = `fireball_anim_${uniqueId}_${idx}`;
+            try {
+              const cloned = ag.clone(cloneName, (oldTarget) => {
+                const newTarget = targetMap.get(oldTarget);
+                if (newTarget) return newTarget;
+                if (oldTarget === template) return projectileMesh;
+                const found = cloneDescendants.find(d => d.name === oldTarget.name);
+                return found || projectileMesh;
+              }, true);
+              if (cloned) {
+                cloned.play(true);
+                clonedAnimGroups.push(cloned);
+              }
+            } catch (e) {
+              console.warn('[Fireball] Animation group clone/play failed:', e);
+            }
+          });
+        }
+        projectileMesh.metadata = projectileMesh.metadata || {};
+        projectileMesh.metadata.fireballAnimationGroups = clonedAnimGroups;
+        
+        const particleSystem = createProjectileParticles(projectileMesh, scene, {
+          trailing: true,
+          minSize: 0.075,
+          maxSize: 0.15,
+          emitRate: 150
+        });
+        
+        animateProjectile(
+          projectileMesh,
+          projectileStart,
+          projectileEnd,
+          projectileVfx.speedCellsPerSec * 1.5,
+          scene,
+          () => {
+            if (particleSystem) {
+              particleSystem.dispose();
+            }
+            if (projectileMesh.metadata && projectileMesh.metadata.fireballAnimationGroups) {
+              projectileMesh.metadata.fireballAnimationGroups.forEach(ag => {
+                if (ag && !ag.isDisposed) {
+                  ag.stop();
+                  ag.dispose();
+                }
+              });
+            }
+            disposeMeshAndChildren(projectileMesh);
+            if (impactVfx) {
+              const impactDelay = impactVfx.delayMs || 0;
+              setTimeout(() => {
+                createExplosion(impactVfx, endPos, scene, 'fireball_impact');
+              }, impactDelay);
+            }
+          },
+          particleSystem,
+          { orientToDestination: true }
+        );
+      }).catch(() => {
+        runFireballFallback();
       });
       
-      // Create particle system around projectile
-      const particleSystem = createProjectileParticles(projectileMesh, scene, {
-        minSize: 0.15,
-        maxSize: 0.3,
-        minLifeTime: 0.2,
-        maxLifeTime: 0.5,
-        emitRate: 150,
-        minEmitPower: 0.3,
-        maxEmitPower: 1.0
-      });
-      
-      // Animate projectile (1.5x faster)
-      animateProjectile(
-        projectileMesh,
-        projectileStart,
-        projectileEnd,
-        projectileVfx.speedCellsPerSec * 1.5,
-        scene,
-        () => {
-          // Projectile reached destination - create impact
-          // Dispose particle system first
-          if (particleSystem) {
-            particleSystem.dispose();
-          }
-          projectileMesh.dispose();
-          
-          // Create impact explosion (reduced delay for better sync with projectile)
-          if (impactVfx) {
-            const impactDelay = impactVfx.delayMs || 0; // Removed the 200ms delay for better sync
-            setTimeout(() => {
-              createExplosion(impactVfx, endPos, scene, 'fireball_impact');
-            }, impactDelay);
-          }
-        },
-        particleSystem // Pass particle system for cleanup
-      );
+      function runFireballFallback() {
+        const modifiedVfx = { ...projectileVfx.vfx, opacity: 0.05 };
+        const projectileMesh = createVfxMesh(modifiedVfx, scene, 'fireball_projectile');
+        if (projectileMesh.material) {
+          projectileMesh.material.alpha = 0.05;
+          projectileMesh.material.transparencyMode = Material.MATERIAL_ALPHABLEND;
+          projectileMesh.material.backFaceCulling = false;
+          projectileMesh.material.disableDepthWrite = true;
+        }
+        projectileMesh.position = projectileStart.clone();
+        projectileMesh.isVisible = true;
+        projectileMesh.setEnabled(true);
+        projectileMesh.parent = null;
+        projectileMesh.computeWorldMatrix(true);
+        
+        const particleSystem = createProjectileParticles(projectileMesh, scene, {
+          trailing: true,
+          minSize: 0.075,
+          maxSize: 0.15,
+          emitRate: 150
+        });
+        
+        animateProjectile(
+          projectileMesh,
+          projectileStart,
+          projectileEnd,
+          projectileVfx.speedCellsPerSec * 1.5,
+          scene,
+          () => {
+            if (particleSystem) {
+              particleSystem.dispose();
+            }
+            projectileMesh.dispose();
+            if (impactVfx) {
+              const impactDelay = impactVfx.delayMs || 0;
+              setTimeout(() => {
+                createExplosion(impactVfx, endPos, scene, 'fireball_impact');
+              }, impactDelay);
+            }
+          },
+          particleSystem
+        );
+      }
     } else {
       // No projectile, but we might have impact
       // Create impact (add 200ms delay for this spell)
@@ -1096,11 +1222,7 @@ export function playHealVfx(scene, spellDef, startPos, endPos, castStartTime) {
   
   const impactVfx = presentation.impactVfxDef;
   
-  console.log('Playing heal VFX:', {
-    hasImpact: !!impactVfx,
-    startPos: { x: startPos.x, y: startPos.y, z: startPos.z },
-    endPos: { x: endPos.x, y: endPos.y, z: endPos.z }
-  });
+  // Playing heal VFX
   
   // Calculate delay based on cast animation timing
   const baseDelay = 600; // Match character animation
@@ -1139,45 +1261,273 @@ export function playHealVfx(scene, spellDef, startPos, endPos, castStartTime) {
 }
 
 /**
- * Create arcane missile core (Layer 1): Diamond/crystal construct with glow wrapping around geometry
+ * Minimal pre-warming for arcane missile VFX shaders
+ * Creates offscreen instances to compile shaders at initialization, not at cast time
+ * This is a minimal, safe optimization that doesn't change VFX behavior
+ */
+export function preWarmArcaneMissileShaders(scene) {
+  const offscreenPos = new Vector3(-1000, -1000, -1000);
+  
+  // Pre-warm textures by creating them once
+  const warmLineStreak = createLineStreakTexture(scene);
+  const warmDiamond = createDiamondTexture(scene);
+  
+  // Pre-load magic shard GLB model and cache it
+  const shardModelPath = '/assets/magicshard.glb';
+  SceneLoader.ImportMeshAsync('', shardModelPath, '', scene).then((result) => {
+    if (result.meshes && result.meshes.length > 0) {
+      const shardRoot = result.meshes[0];
+      // Find root mesh (one without parent, or use first)
+      let rootMesh = shardRoot;
+      for (const mesh of result.meshes) {
+        if (!mesh.parent) {
+          rootMesh = mesh;
+          break;
+        }
+      }
+      
+      // Position offscreen and make invisible
+      rootMesh.position = offscreenPos;
+      rootMesh.isVisible = false;
+      rootMesh.name = 'arcane_warm_shard_model';
+      
+      // Store in scene metadata for cloning later
+      if (!scene.metadata) {
+        scene.metadata = {};
+      }
+      scene.metadata.arcaneShardModel = rootMesh;
+      
+      // Magic shard GLB model pre-loaded successfully
+    } else {
+      console.warn('[ArcaneMissile] Failed to load magic shard GLB model, will use fallback box');
+    }
+  }).catch((error) => {
+    console.warn('[ArcaneMissile] Error loading magic shard GLB model:', error);
+  });
+  
+  // Pre-warm fallback core mesh (in case GLB fails to load)
+  const warmCore = MeshBuilder.CreateBox('arcane_warm_core', {
+    width: 0.04,
+    height: 0.15,
+    depth: 0.04
+  }, scene);
+  warmCore.position = offscreenPos;
+  warmCore.rotation.z = Math.PI / 4;
+  warmCore.rotation.x = -Math.PI / 12;
+  const warmCoreMaterial = new StandardMaterial('arcane_warm_core_material', scene);
+  warmCoreMaterial.diffuseColor = new Color3(0.38, 0.18, 0.92);
+  warmCoreMaterial.emissiveColor = new Color3(0.75, 0.85, 1.0);
+  warmCoreMaterial.alpha = 0.95;
+  warmCoreMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
+  warmCoreMaterial.backFaceCulling = false;
+  warmCoreMaterial.disableDepthWrite = true;
+  warmCore.material = warmCoreMaterial;
+  warmCore.isVisible = false;
+  
+  // Pre-warm particle systems (create but don't start)
+  const warmEmitter = MeshBuilder.CreateSphere('arcane_warm_emitter', { diameter: 0.1 }, scene);
+  warmEmitter.position = offscreenPos;
+  warmEmitter.isVisible = false;
+  
+  // Pre-warm ribbon particle system - fully configure it
+  const warmRibbon = new ParticleSystem('arcane_warm_ribbon', 10, scene);
+  warmRibbon.particleTexture = warmLineStreak;
+  warmRibbon.emitter = warmEmitter;
+  warmRibbon.color1 = new Color4(0.45, 0.25, 1.0, 1.0);
+  warmRibbon.color2 = new Color4(0.30, 0.15, 0.85, 1.0);
+  warmRibbon.blendMode = ParticleSystem.BLENDMODE_ONEONE;
+  warmRibbon.minSize = 0.08;
+  warmRibbon.maxSize = 0.15;
+  warmRibbon.minLifeTime = 0.12;
+  warmRibbon.maxLifeTime = 0.25;
+  warmRibbon.emitRate = 250;
+  warmRibbon.direction1 = new Vector3(-0.1, -0.05, -0.6);
+  warmRibbon.direction2 = new Vector3(0.1, 0.05, -0.4);
+  warmRibbon.gravity = new Vector3(0, 0, 0);
+  warmRibbon.updateSpeed = 0.02;
+  
+  // Pre-warm facet particle system - fully configure it
+  const warmFacet = new ParticleSystem('arcane_warm_facet', 10, scene);
+  warmFacet.particleTexture = warmDiamond;
+  warmFacet.emitter = warmEmitter;
+  warmFacet.color1 = new Color4(0.35, 0.18, 0.85, 1.0);
+  warmFacet.color2 = new Color4(0.25, 0.12, 0.65, 1.0);
+  warmFacet.blendMode = ParticleSystem.BLENDMODE_ONEONE;
+  warmFacet.minSize = 0.03;
+  warmFacet.maxSize = 0.06;
+  warmFacet.minLifeTime = 0.1;
+  warmFacet.maxLifeTime = 0.2;
+  warmFacet.emitRate = 80;
+  warmFacet.direction1 = new Vector3(-0.2, -0.1, -0.5);
+  warmFacet.direction2 = new Vector3(0.2, 0.1, -0.3);
+  warmFacet.gravity = new Vector3(0, 0, 0);
+  warmFacet.updateSpeed = 0.02;
+  
+  // Pre-warm impact flare particle system - fully configure it
+  const warmFlare = new ParticleSystem('arcane_warm_flare', 10, scene);
+  warmFlare.particleTexture = warmDiamond;
+  warmFlare.emitter = warmEmitter;
+  warmFlare.color1 = new Color4(1.0, 1.0, 1.0, 1.0);
+  warmFlare.color2 = new Color4(0.45, 0.55, 1.0, 1.0);
+  warmFlare.blendMode = ParticleSystem.BLENDMODE_ONEONE;
+  warmFlare.minSize = 0.04;
+  warmFlare.maxSize = 0.08;
+  warmFlare.minLifeTime = 0.08;
+  warmFlare.maxLifeTime = 0.15;
+  warmFlare.emitRate = 300;
+  
+  // Pre-warm impact ring mesh
+  const warmRing = MeshBuilder.CreateBox('arcane_warm_ring', {
+    size: 0.12,
+    height: 0.005
+  }, scene);
+  warmRing.position = offscreenPos;
+  warmRing.rotation.x = Math.PI / 2;
+  warmRing.rotation.z = Math.PI / 4;
+  const warmRingMaterial = new StandardMaterial('arcane_warm_ring_material', scene);
+  warmRingMaterial.emissiveColor = new Color3(0.35, 0.45, 0.85);
+  warmRingMaterial.alpha = 0.8;
+  warmRingMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
+  warmRingMaterial.backFaceCulling = false;
+  warmRingMaterial.disableDepthWrite = true;
+  warmRing.material = warmRingMaterial;
+  warmRing.isVisible = false;
+  
+  // Start particle systems briefly to ensure shaders are fully compiled
+  // This ensures first cast looks identical to subsequent casts
+  warmRibbon.start();
+  warmFacet.start();
+  warmFlare.start();
+  
+  // Force multiple render passes to ensure everything is compiled and uploaded
+  // This ensures first cast looks identical to subsequent casts
+  const renderPasses = 3;
+  let renderCount = 0;
+  const renderObserver = scene.onBeforeRenderObservable.add(() => {
+    renderCount++;
+    if (renderCount >= renderPasses) {
+      scene.onBeforeRenderObservable.remove(renderObserver);
+      
+      // Stop particle systems
+      warmRibbon.stop();
+      warmFacet.stop();
+      warmFlare.stop();
+      
+      // Clean up pre-warm objects after shaders are fully compiled
+      setTimeout(() => {
+        warmCore.dispose();
+        warmCoreMaterial.dispose();
+        warmRibbon.dispose();
+        warmFacet.dispose();
+        warmFlare.dispose();
+        warmRing.dispose();
+        warmRingMaterial.dispose();
+        warmEmitter.dispose();
+        // Textures are fine to keep - they're small and reusable
+      }, 50);
+    }
+  });
+}
+
+/**
+ * Create arcane missile core (Layer 1): Sharp, elongated arcane shard fragment
+ * Uses magicshard.glb model if available, falls back to box geometry
+ * Thin, pointy, slicing fragment with white-hot center and purple falloff
  */
 function createArcaneMissileCore(scene, name) {
-  // Create an elongated crystal/diamond shape - elongated along forward axis
-  // Create main crystal body (elongated diamond pointing forward)
-  const core = MeshBuilder.CreateBox(`${name}_core`, {
-    width: 0.12,   // Narrow width (X axis)
-    height: 0.2,   // Elongated length (Y axis - forward direction)
-    depth: 0.12    // Narrow depth (Z axis)
-  }, scene);
+  let core;
   
-  // Rotate 45 degrees on Z axis to create diamond cross-section when viewed from above
-  core.rotation.z = Math.PI / 4; // 45 degree rotation for diamond silhouette
+  // Try to use pre-loaded GLB model, fall back to box if not available
+  if (scene.metadata && scene.metadata.arcaneShardModel) {
+    // Clone the pre-loaded shard model
+    const shardModel = scene.metadata.arcaneShardModel;
+    core = shardModel.clone(`${name}_core`);
+    
+    // Reset position and rotation (clone preserves original)
+    core.position = Vector3.Zero();
+    core.rotation = Vector3.Zero();
+    
+    // Scale the model to match the original shard size
+    // Original was 0.04 x 0.15 x 0.04, so we'll scale to match roughly
+    // Adjust scale based on the model's original bounding box
+    const boundingInfo = shardModel.getBoundingInfo();
+    if (boundingInfo) {
+      const size = boundingInfo.boundingBox.maximum.subtract(boundingInfo.boundingBox.minimum);
+      // Scale to make height ~0.15 (forward direction)
+      const targetHeight = 0.15;
+      const scale = targetHeight / Math.max(size.y, 0.001);
+      core.scaling = new Vector3(scale, scale, scale);
+    } else {
+      // Default scale if bounding box not available
+      core.scaling = new Vector3(0.1, 0.1, 0.1);
+    }
+    
+    // Using GLB shard model
+  } else {
+    // Fallback: Create a thin, elongated shard using box geometry
+    // Using fallback box geometry
+    core = MeshBuilder.CreateBox(`${name}_core`, {
+      width: 0.04,   // Very thin width (X axis) - sharp sliver
+      height: 0.15,  // Elongated length (Y axis - forward direction) - smaller overall
+      depth: 0.04   // Very thin depth (Z axis) - sharp edge
+    }, scene);
+    
+    // Rotate 45 degrees on Z axis to create diamond cross-section when viewed from above
+    core.rotation.z = Math.PI / 4; // 45 degree rotation for diamond silhouette
+    
+    // Add forward tilt to align with projectile direction - slicing forward
+    // Tilt forward slightly (around X axis) so shard points in direction of travel
+    core.rotation.x = -Math.PI / 12; // ~15 degrees forward tilt
+  }
   
-  // Create material - glow wraps around geometry, not defining it
+  // Create material with white-hot center and purple/blue falloff
   const material = new StandardMaterial(`${name}_core_material`, scene);
-  material.emissiveColor = new Color3(0.7, 0.4, 1.0); // Rich arcane purple glow
-  material.diffuseColor = new Color3(0.5, 0.2, 0.8); // Deep violet
-  material.alpha = 0.9;
-  material.specularColor = new Color3(0.9, 0.7, 1.0); // Soft purple specular for edges
+  
+  // Cooler, sharper arcane look - blue dominates, red suppressed
+  material.diffuseColor = new Color3(0.38, 0.18, 0.92); // Deep indigo base - blue dominates over red
+  material.emissiveColor = new Color3(0.75, 0.85, 1.0); // Hot edge - near-white blue highlight
+  material.alpha = 0.95; // Slightly more opaque for crisp edges
+  
+  // High specular for crisp edges and highlights
+  material.specularColor = new Color3(1.0, 1.0, 1.0); // Bright white specular for edges
+  material.specularPower = 64; // Sharp, focused highlights
+  
   material.transparencyMode = Material.MATERIAL_ALPHABLEND;
   material.backFaceCulling = false;
   material.disableDepthWrite = true;
   
-  core.material = material;
+  // Apply material to the core mesh
+  // If it's a cloned GLB model, apply to all child meshes as well
+  if (core.getChildMeshes && core.getChildMeshes().length > 0) {
+    // GLB model with children - apply material to root and all children
+    core.material = material;
+    core.getChildMeshes().forEach(child => {
+      child.material = material;
+    });
+  } else {
+    // Simple mesh (fallback box) - just apply to root
+    core.material = material;
+  }
   core.isPickable = false;
   
-  // Add subtle pulsing animation - controlled, geometric
+  // Add subtle pulsing animation - maintains sharp silhouette
   const pulseSpeed = 6.0; // 6 pulses per second
   const startTime = Date.now();
   const observer = scene.onBeforeRenderObservable.add(() => {
     const elapsed = (Date.now() - startTime) / 1000;
-    // Subtle pulse - maintains sharp silhouette
-    const pulse = 0.92 + 0.08 * Math.sin(elapsed * pulseSpeed * Math.PI * 2);
+    // Very subtle pulse - maintains sharp, crisp edges
+    const pulse = 0.95 + 0.05 * Math.sin(elapsed * pulseSpeed * Math.PI * 2);
     core.scaling = new Vector3(pulse, pulse, pulse);
     
-    // Pulse brightness - energy bound to geometry
-    const brightness = 0.85 + 0.15 * Math.sin(elapsed * pulseSpeed * Math.PI * 2);
-    material.emissiveColor = new Color3(0.7 * brightness, 0.4 * brightness, 1.0 * brightness);
+    // Pulse brightness - hot edge highlight pulses, base stays deep indigo
+    // Brightness oscillates between hot and slightly dimmer
+    const brightness = 0.9 + 0.1 * Math.sin(elapsed * pulseSpeed * Math.PI * 2);
+    // Hot edge emissive pulses - near-white blue highlight at edges
+    material.emissiveColor = new Color3(
+      0.75 * brightness,  // Blue-dominated, red suppressed
+      0.85 * brightness,  // Slight green for cool white-blue
+      1.0 * brightness    // Blue dominates
+    );
   });
   
   core.metadata = { observer };
@@ -1189,6 +1539,8 @@ function createArcaneMissileCore(scene, name) {
  * Create arcane missile trail (Layer 2): Structured linear energy ribbon with thin streaks and angular flow
  */
 function createArcaneMissileTrail(projectileMesh, scene, name) {
+  // Create trail particle systems
+  
   // Primary trail: Linear energy ribbon using line-streak particles
   const ribbonParticles = new ParticleSystem(`${name}_trail_ribbon`, 80, scene);
   
@@ -1199,10 +1551,10 @@ function createArcaneMissileTrail(projectileMesh, scene, name) {
   ribbonParticles.minEmitBox = new Vector3(-0.03, -0.03, -0.03);
   ribbonParticles.maxEmitBox = new Vector3(0.03, 0.03, 0.03);
   
-  // Rich arcane purple/violet colors - primary trail identity
-  ribbonParticles.color1 = new Color4(0.7, 0.4, 1.0, 0.9); // Rich arcane purple
-  ribbonParticles.color2 = new Color4(0.6, 0.3, 0.9, 0.7); // Deep violet
-  ribbonParticles.colorDead = new Color4(0.4, 0.2, 0.7, 0.0); // Fade to dark violet
+  // Cooler, sharper arcane trail - blue dominates, pink removed
+  ribbonParticles.color1 = new Color4(0.45, 0.25, 1.0, 1.0); // Hot inner trail - blue dominates
+  ribbonParticles.color2 = new Color4(0.30, 0.15, 0.85, 1.0); // Outer/cooler - deep indigo
+  ribbonParticles.colorDead = new Color4(0.20, 0.10, 0.55, 0.0); // Fade to deep indigo, not lavender
   
   // Thin, elongated streaks for linear ribbon
   ribbonParticles.minSize = 0.08;
@@ -1228,6 +1580,7 @@ function createArcaneMissileTrail(projectileMesh, scene, name) {
   // Additive blending for energy glow
   ribbonParticles.blendMode = ParticleSystem.BLENDMODE_ONEONE;
   
+  // Start ribbon particles
   ribbonParticles.start();
   
   // Secondary trail: Segmented facets using diamond particles for angular flow lines
@@ -1240,10 +1593,10 @@ function createArcaneMissileTrail(projectileMesh, scene, name) {
   facetParticles.minEmitBox = new Vector3(-0.02, -0.02, -0.02);
   facetParticles.maxEmitBox = new Vector3(0.02, 0.02, 0.02);
   
-  // Purple/violet for layered effect with subtle cyan edge highlight
-  facetParticles.color1 = new Color4(0.6, 0.3, 0.9, 0.6); // Deep violet
-  facetParticles.color2 = new Color4(0.5, 0.2, 0.8, 0.4); // Darker violet
-  facetParticles.colorDead = new Color4(0.3, 0.15, 0.6, 0.0); // Fade to dark purple
+  // Darker, sharper arcane fragments - not bright candy
+  facetParticles.color1 = new Color4(0.35, 0.18, 0.85, 1.0); // Arcane fragments - blue dominates
+  facetParticles.color2 = new Color4(0.25, 0.12, 0.65, 1.0); // Darker fragments
+  facetParticles.colorDead = new Color4(0.15, 0.08, 0.40, 0.0); // Fade to deep indigo
   
   // Small angular facets
   facetParticles.minSize = 0.03;
@@ -1265,7 +1618,15 @@ function createArcaneMissileTrail(projectileMesh, scene, name) {
   facetParticles.gravity = new Vector3(0, 0, 0);
   facetParticles.blendMode = ParticleSystem.BLENDMODE_ONEONE;
   
+  // Start facet particles
   facetParticles.start();
+  
+  // Store particle system references for proper cleanup
+  // Ensure they're properly tracked to prevent stacking
+  ribbonParticles.name = `${name}_trail_ribbon`;
+  facetParticles.name = `${name}_trail_facets`;
+  
+  // Trail particle systems created
   
   // Return both systems for cleanup
   return { ribbon: ribbonParticles, facets: facetParticles };
@@ -1284,10 +1645,10 @@ function createArcaneSparkles(projectileMesh, scene, name) {
   particleSystem.minEmitBox = new Vector3(-0.08, -0.08, -0.08);
   particleSystem.maxEmitBox = new Vector3(0.08, 0.08, 0.08);
   
-  // Arcane colors: rich purple/violet with soft magenta undertones
-  particleSystem.color1 = new Color4(0.8, 0.5, 1.0, 1.0); // Rich purple with magenta
-  particleSystem.color2 = new Color4(0.6, 0.3, 0.9, 1.0); // Deep violet
-  particleSystem.colorDead = new Color4(0.4, 0.2, 0.7, 0.0); // Fade to dark violet
+  // Cool arcane glints - almost white-blue, not fairy glitter
+  particleSystem.color1 = new Color4(0.80, 0.90, 1.0, 1.0); // Almost white-blue (G > R avoids magenta)
+  particleSystem.color2 = new Color4(0.45, 0.60, 1.0, 1.0); // Cool blue glint
+  particleSystem.colorDead = new Color4(0.25, 0.35, 0.70, 0.0); // Fade to cool blue
   
   // Small geometric shards
   particleSystem.minSize = 0.02;
@@ -1338,7 +1699,8 @@ function createRunicMotes(projectileMesh, scene, name) {
     );
     
     const material = new StandardMaterial(`${name}_mote_material_${i}`, scene);
-    material.emissiveColor = new Color3(0.6, 0.4, 0.9); // Rich violet with magenta undertones
+    // Calm, deep, authoritative runes - blue dominates
+    material.emissiveColor = new Color3(0.30, 0.20, 0.65); // Deep indigo runes
     material.alpha = 0.4;
     material.transparencyMode = Material.MATERIAL_ALPHABLEND;
     material.backFaceCulling = false;
@@ -1347,9 +1709,10 @@ function createRunicMotes(projectileMesh, scene, name) {
     mote.material = material;
     mote.isPickable = false;
     
-    // Rotate slowly
+    // Rotate slowly with optional highlight pulse
     const startTime = Date.now();
     const rotationSpeed = 2.0; // Rotations per second
+    const pulseSpeed = 3.0; // Pulse speed for highlight
     const observer = scene.onBeforeRenderObservable.add(() => {
       if (!projectileMesh || !projectileMesh.metadata) {
         scene.onBeforeRenderObservable.remove(observer);
@@ -1358,6 +1721,12 @@ function createRunicMotes(projectileMesh, scene, name) {
       const elapsed = (Date.now() - startTime) / 1000;
       mote.rotation.y = elapsed * rotationSpeed * Math.PI * 2;
       mote.rotation.x = elapsed * rotationSpeed * 0.5 * Math.PI * 2;
+      
+      // Optional highlight pulse - pulse between deep indigo and bright blue
+      const pulse = 0.5 + 0.5 * Math.sin(elapsed * pulseSpeed * Math.PI * 2);
+      const baseColor = new Color3(0.30, 0.20, 0.65); // Deep indigo
+      const highlightColor = new Color3(0.55, 0.65, 1.0); // Pulse peak - bright blue
+      material.emissiveColor = Color3.Lerp(baseColor, highlightColor, pulse);
       
       // Fade out over time
       const fadeTime = 0.3; // Fade in 300ms
@@ -1383,18 +1752,18 @@ function createRunicMotes(projectileMesh, scene, name) {
  */
 function createArcaneImpact(position, scene, name) {
   const impactPos = position.clone();
-  impactPos.y += 0.3;
+  impactPos.y += 0.5; // Higher impact position
   
   // 1. Bright central hit point - Small white/cyan core (compact, focused)
   const coreGlow = MeshBuilder.CreateSphere(`${name}_core_glow`, {
-    diameter: 0.08, // Much smaller - focused point
+    diameter: 0.16, // 2x larger - focused point
     segments: 12
   }, scene);
   coreGlow.position = impactPos.clone();
   
   const coreMaterial = new StandardMaterial(`${name}_core_material`, scene);
-  coreMaterial.emissiveColor = new Color3(0.95, 0.95, 1.0); // Restrained white-hot center with slight purple tint
-  coreMaterial.diffuseColor = new Color3(0.6, 0.3, 0.9); // Deep violet glow
+  coreMaterial.emissiveColor = new Color3(0.85, 0.95, 1.0); // Core flash - near-white blue highlight
+  coreMaterial.diffuseColor = new Color3(0.38, 0.18, 0.92); // Deep indigo base - blue dominates
   coreMaterial.alpha = 1.0;
   coreMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
   coreMaterial.backFaceCulling = false;
@@ -1413,7 +1782,7 @@ function createArcaneImpact(position, scene, name) {
     if (progress < 1.0) {
       const fade = 1.0 - progress;
       coreMaterial.alpha = fade;
-      // Minimal expansion - stays focused
+      // Minimal expansion - stays focused (2x larger overall)
       coreGlow.scaling = new Vector3(1.0 + progress * 0.15, 1.0 + progress * 0.15, 1.0 + progress * 0.15);
     } else {
       scene.onBeforeRenderObservable.remove(coreObserver);
@@ -1421,33 +1790,33 @@ function createArcaneImpact(position, scene, name) {
     }
   });
   
-  // 2. Minimal geometric burst - Small diamond or star-shaped flare (very compact)
-  const flareEmitter = MeshBuilder.CreateSphere(`${name}_flare_emitter`, { diameter: 0.02 }, scene);
+  // 2. Minimal geometric burst - Small diamond or star-shaped flare (very compact, 2x larger)
+  const flareEmitter = MeshBuilder.CreateSphere(`${name}_flare_emitter`, { diameter: 0.04 }, scene);
   flareEmitter.position = impactPos.clone();
   flareEmitter.isVisible = false;
   
-  const flareParticles = new ParticleSystem(`${name}_flare`, 25, scene); // Much fewer particles
+  const flareParticles = new ParticleSystem(`${name}_flare`, 50, scene); // 2x more particles
   flareParticles.particleTexture = createDiamondTexture(scene);
   flareParticles.emitter = flareEmitter;
-  flareParticles.minEmitBox = new Vector3(-0.01, -0.01, -0.01);
-  flareParticles.maxEmitBox = new Vector3(0.01, 0.01, 0.01);
+  flareParticles.minEmitBox = new Vector3(-0.02, -0.02, -0.02);
+  flareParticles.maxEmitBox = new Vector3(0.02, 0.02, 0.02);
   
-  // White → rich purple/violet
-  flareParticles.color1 = new Color4(1.0, 1.0, 1.0, 1.0); // White
-  flareParticles.color2 = new Color4(0.7, 0.4, 1.0, 1.0); // Rich arcane purple
-  flareParticles.colorDead = new Color4(0.5, 0.2, 0.8, 0.0); // Fade to deep violet
+  // Precise arcane discharge - not confetti
+  flareParticles.color1 = new Color4(1.0, 1.0, 1.0, 1.0); // White flash
+  flareParticles.color2 = new Color4(0.45, 0.55, 1.0, 1.0); // Cool blue flare - blue dominates
+  flareParticles.colorDead = new Color4(0.25, 0.30, 0.70, 0.0); // Fade to deep indigo
   
-  // Small, compact particles
-  flareParticles.minSize = 0.04;
-  flareParticles.maxSize = 0.08;
+  // Small, compact particles (2x larger)
+  flareParticles.minSize = 0.08;
+  flareParticles.maxSize = 0.16;
   flareParticles.minLifeTime = 0.08;
   flareParticles.maxLifeTime = 0.15;
-  flareParticles.emitRate = 300; // Lower rate
-  // Very tight, controlled burst - minimal spread
-  flareParticles.direction1 = new Vector3(-0.4, -0.2, -0.4);
-  flareParticles.direction2 = new Vector3(0.4, 0.2, 0.4);
-  flareParticles.minEmitPower = 1.0;
-  flareParticles.maxEmitPower = 2.0;
+  flareParticles.emitRate = 600; // 2x rate
+  // Very tight, controlled burst - minimal spread (2x larger spread)
+  flareParticles.direction1 = new Vector3(-0.8, -0.4, -0.8);
+  flareParticles.direction2 = new Vector3(0.8, 0.4, 0.8);
+  flareParticles.minEmitPower = 2.0;
+  flareParticles.maxEmitPower = 4.0;
   flareParticles.updateSpeed = 0.02;
   flareParticles.gravity = new Vector3(0, 0, 0); // No gravity
   flareParticles.blendMode = ParticleSystem.BLENDMODE_ONEONE;
@@ -1455,8 +1824,8 @@ function createArcaneImpact(position, scene, name) {
   
   flareParticles.start();
   
-  // 3. Subtle arcane ring or glyph - Small, brief appearance
-  const ringSize = 0.12; // Much smaller starting size
+  // 3. Subtle arcane ring or glyph - Small, brief appearance (2x larger)
+  const ringSize = 0.24; // 2x larger starting size
   const ring = MeshBuilder.CreateBox(`${name}_ring`, {
     size: ringSize,
     height: 0.005 // Very thin
@@ -1466,7 +1835,7 @@ function createArcaneImpact(position, scene, name) {
   ring.rotation.z = Math.PI / 4; // Diamond orientation
   
   const ringMaterial = new StandardMaterial(`${name}_ring_material`, scene);
-  ringMaterial.emissiveColor = new Color3(0.7, 0.4, 1.0); // Rich arcane purple
+  ringMaterial.emissiveColor = new Color3(0.35, 0.45, 0.85); // Arcane discharge ring - blue dominates
   ringMaterial.alpha = 0.8;
   ringMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
   ringMaterial.backFaceCulling = false;
@@ -1475,10 +1844,10 @@ function createArcaneImpact(position, scene, name) {
   ring.material = ringMaterial;
   ring.isPickable = false;
   
-  // Ring expansion - small, brief (120ms)
+  // Ring expansion - small, brief (120ms, 2x larger)
   const ringStartTime = Date.now();
   const ringDuration = 120; // 120ms
-  const maxSize = 0.35; // Much smaller max size - compact
+  const maxSize = 0.70; // 2x larger max size
   const ringObserver = scene.onBeforeRenderObservable.add(() => {
     const elapsed = Date.now() - ringStartTime;
     const progress = Math.min(elapsed / ringDuration, 1.0);
@@ -1493,10 +1862,47 @@ function createArcaneImpact(position, scene, name) {
     }
   });
   
-  // Cleanup
+  // Cleanup - ensure particle system is removed from scene
   setTimeout(() => {
-    flareParticles.dispose();
-    flareEmitter.dispose();
+    // Stop and dispose flare particles
+    try {
+      if (flareParticles && typeof flareParticles.isDisposed === 'function' && !flareParticles.isDisposed()) {
+        flareParticles.stop();
+        flareParticles.emitter = null;
+        flareParticles.dispose();
+        // Explicitly remove from scene's particleSystems array
+        const index = scene.particleSystems.indexOf(flareParticles);
+        if (index !== -1) {
+          scene.particleSystems.splice(index, 1);
+        }
+      } else if (flareParticles) {
+        // Fallback: if isDisposed doesn't exist, just try to dispose
+        try {
+          flareParticles.stop();
+          flareParticles.emitter = null;
+          flareParticles.dispose();
+        } catch (e) {
+          console.warn(`[ArcaneMissile] Error disposing flare particles:`, e);
+        }
+        // Explicitly remove from scene's particleSystems array
+        const index = scene.particleSystems.indexOf(flareParticles);
+        if (index !== -1) {
+          scene.particleSystems.splice(index, 1);
+        }
+      }
+    } catch (e) {
+      console.error(`[ArcaneMissile] Error in impact cleanup:`, e);
+    }
+    
+    if (flareEmitter && typeof flareEmitter.isDisposed === 'function' && !flareEmitter.isDisposed()) {
+      flareEmitter.dispose();
+    } else if (flareEmitter) {
+      try {
+        flareEmitter.dispose();
+      } catch (e) {
+        console.warn(`[ArcaneMissile] Error disposing flare emitter:`, e);
+      }
+    }
   }, 500); // Shorter cleanup time
 }
 
@@ -1541,7 +1947,7 @@ export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStar
     projectileStart.y = startPos.y + heightOffset;
     
     const projectileEnd = endPos.clone();
-    projectileEnd.y = endPos.y + heightOffset;
+    projectileEnd.y = endPos.y + heightOffset + 0.3; // Add extra height for target destination
     
     const baseSpeed = projectileVfx ? (projectileVfx.speedCellsPerSec || 5) : 5;
     
@@ -1585,18 +1991,31 @@ export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStar
     
     const speed = baseSpeed * speedMultiplier;
     
+    // Generate unique name for this missile instance to prevent stacking
+    const uniqueId = `${missileIndex}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const uniqueName = `arcane_missile_${uniqueId}`;
+    
     // Layer 1: Core
-    const core = createArcaneMissileCore(scene, 'arcane_missile');
+    const core = createArcaneMissileCore(scene, uniqueName);
     core.position = projectileStart.clone();
     
-    // Layer 2: Trail
-    const trail = createArcaneMissileTrail(core, scene, 'arcane_missile');
+    // Set initial orientation toward target
+    const initialDirection = projectileEnd.subtract(projectileStart);
+    if (initialDirection.length() > 0.001) {
+      const normalizedDir = initialDirection.clone().normalize();
+      const initialTarget = projectileStart.clone().add(normalizedDir.scale(1.0));
+      core.lookAt(initialTarget);
+    }
     
-    // Layer 3: Sparkles
-    const sparkles = createArcaneSparkles(core, scene, 'arcane_missile');
+    // Layer 2: Trail
+    const trail = createArcaneMissileTrail(core, scene, uniqueName);
+    
+    // Layer 3: Sparkles - DISABLED (removed circle particles)
+    // const sparkles = createArcaneSparkles(core, scene, uniqueName);
+    const sparkles = null;
     
     // Layer 4: Runic motes
-    const motes = createRunicMotes(core, scene, 'arcane_missile');
+    const motes = createRunicMotes(core, scene, uniqueName);
     
     // Store all particle systems for cleanup
     core.metadata = core.metadata || {};
@@ -1612,31 +2031,115 @@ export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStar
       baseSpeed, // Base speed, multiplier applied inside function
       scene,
       () => {
-        // Cleanup on impact
-        if (core.metadata) {
-          if (core.metadata.sparkles) core.metadata.sparkles.dispose();
+        // Cleanup on impact - ensure proper order to prevent stacking
+        
+        if (core && core.metadata) {
+          // First: Stop and dispose particle systems (trail) - CRITICAL to prevent stacking
           if (core.metadata.trail) {
-            // Trail is now an object with ribbon and facets
-            if (core.metadata.trail.ribbon) core.metadata.trail.ribbon.dispose();
-            if (core.metadata.trail.facets) core.metadata.trail.facets.dispose();
+            const trail = core.metadata.trail;
+            
+                // Stop and dispose ribbon particles - CRITICAL: Remove from scene to prevent stacking
+                if (trail.ribbon && !trail.ribbon.isDisposed()) {
+                  const ribbon = trail.ribbon;
+                  
+                  // Stop emission immediately
+                  ribbon.stop();
+                  // Verify it's stopped
+                  if (ribbon.isStarted()) {
+                    ribbon.reset(); // Force reset if stop didn't work
+                  }
+                  // Clear emitter to prevent any further updates
+                  ribbon.emitter = null;
+                  // Dispose the particle system first (should remove from scene automatically)
+                  ribbon.dispose();
+                  // Explicitly remove from scene's particleSystems array as backup
+                  const index = scene.particleSystems.indexOf(ribbon);
+                  if (index !== -1) {
+                    scene.particleSystems.splice(index, 1);
+                  }
+                }
+            
+                // Stop and dispose facet particles - CRITICAL: Remove from scene to prevent stacking
+                if (trail.facets && !trail.facets.isDisposed()) {
+                  const facets = trail.facets;
+                  
+                  // Stop emission immediately
+                  facets.stop();
+                  // Verify it's stopped
+                  if (facets.isStarted()) {
+                    facets.reset(); // Force reset if stop didn't work
+                  }
+                  // Clear emitter to prevent any further updates
+                  facets.emitter = null;
+                  // Dispose the particle system first (should remove from scene automatically)
+                  facets.dispose();
+                  // Explicitly remove from scene's particleSystems array as backup
+                  const index = scene.particleSystems.indexOf(facets);
+                  if (index !== -1) {
+                    scene.particleSystems.splice(index, 1);
+                  }
+                }
+            
+            // Clear trail reference
+            core.metadata.trail = null;
           }
+          
+          // Second: Clean up sparkles (disabled but handle if exists)
+          if (core.metadata.sparkles && !core.metadata.sparkles.isDisposed()) {
+            core.metadata.sparkles.stop();
+            core.metadata.sparkles.emitter = null;
+            core.metadata.sparkles.dispose();
+            core.metadata.sparkles = null;
+          }
+          
+          // Third: Clean up motes
           if (core.metadata.motes) {
             core.metadata.motes.forEach(({ observer, mote }) => {
-              scene.onBeforeRenderObservable.remove(observer);
+              if (observer) scene.onBeforeRenderObservable.remove(observer);
               if (mote && !mote.isDisposed()) mote.dispose();
             });
+            core.metadata.motes = null;
           }
+          
+          // Fourth: Clean up core observer
           if (core.metadata.observer) {
             scene.onBeforeRenderObservable.remove(core.metadata.observer);
+            core.metadata.observer = null;
+          }
+          
+          // Clear all metadata
+          core.metadata = null;
+        }
+        
+        // Finally: Dispose core mesh
+        if (core && !core.isDisposed()) {
+          core.dispose();
+        }
+        
+        // Safety check: If there are too many particle systems, try to clean up disposed ones
+        // Note: With 3 missiles per cast (2 particle systems each = 6), plus impact effects, 15+ is normal during active casting
+        const afterCleanupCount = scene.particleSystems.length;
+        if (afterCleanupCount > 20) {
+          // Try to clean up any disposed particle systems that are still in the array
+          for (let i = scene.particleSystems.length - 1; i >= 0; i--) {
+            const ps = scene.particleSystems[i];
+            try {
+              if (ps && typeof ps.isDisposed === 'function' && ps.isDisposed()) {
+                scene.particleSystems.splice(i, 1);
+              }
+            } catch (e) {
+              // If we can't check, remove it anyway (might be corrupted)
+              scene.particleSystems.splice(i, 1);
+            }
           }
         }
-        core.dispose();
         
-        // Layer 5: Impact
+        // Layer 5: Impact - use unique name to prevent conflicts
         if (impactVfx) {
           const impactDelay = impactVfx.delayMs || 0;
           setTimeout(() => {
-            createArcaneImpact(endPos, scene, 'arcane_missile');
+            const impactName = `${core?.name || 'arcane_missile'}_impact`;
+            createArcaneImpact(endPos, scene, impactName);
           }, impactDelay);
         }
       },
@@ -1665,6 +2168,10 @@ export function playSpellVfx(scene, spellDef, startPos, endPos, castStartTime, m
     playHealVfx(scene, spellDef, startPos, endPos, castStartTime);
   } else if (spellDef.spellId === 'arcane_missile') {
     playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStartTime, missileIndex, totalMissiles);
+  } else if (spellDef.spellId === 'teleport') {
+    // Teleport VFX is handled separately via TeleportVFXController
+    // This is just a placeholder - actual teleport is triggered via startTeleportVFX
+    console.warn(`Teleport VFX should be handled via TeleportVFXController, not playSpellVfx`);
   } else {
     console.warn(`VFX not implemented for spell: ${spellDef.spellId}`);
   }

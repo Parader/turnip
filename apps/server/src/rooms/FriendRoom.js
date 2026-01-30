@@ -10,15 +10,20 @@ export class FriendRoom extends Room {
   lastPingTime = new Map();
   // Map to track users in lobby: userId -> boolean
   usersInLobby = new Map();
+  // Map to track users in game: userId -> boolean
+  usersInGame = new Map();
   // Matchmaking queues: queueType -> Set of { userId, partyMembers, characterId, characterName, client }
   matchmakingQueues = new Map();
   // Map to track which queues a user is in: userId -> Set of queueTypes
   userMatchmakingQueues = new Map();
-  // Ping interval in milliseconds (30 seconds)
-  pingInterval = 30000;
-  // Timeout before marking as offline (60 seconds)
-  pingTimeout = 60000;
+  // Ping interval in milliseconds (15 seconds - more frequent for better accuracy)
+  pingInterval = 15000;
+  // Timeout before marking as offline (45 seconds)
+  pingTimeout = 45000;
   pingTimer = null;
+  // Status sync interval - periodically sync all friend statuses (every 30 seconds)
+  statusSyncInterval = 30000;
+  statusSyncTimer = null;
   // Matchmaking check interval (every 2 seconds)
   matchmakingCheckInterval = 2000;
   matchmakingTimer = null;
@@ -29,7 +34,16 @@ export class FriendRoom extends Room {
     
     // Listen for pong responses from clients
     this.onMessage('pong', (client, message) => {
+      const userId = client.userId;
       this.lastPingTime.set(client.sessionId, Date.now());
+      
+      // Verify and sync friend statuses when pong is received
+      // This ensures statuses stay accurate based on active connections
+      if (userId) {
+        this.syncFriendStatusesForUser(userId, client).catch(error => {
+          console.error('Error syncing friend statuses on pong:', error);
+        });
+      }
     });
 
     // Listen for lobby invitation requests
@@ -80,8 +94,28 @@ export class FriendRoom extends Room {
       
       if (userId) {
         this.usersInLobby.set(userId, inLobby);
+        // If entering lobby, make sure they're not marked as in game
+        if (inLobby) {
+          this.usersInGame.set(userId, false);
+        }
         // Broadcast lobby status to friends
         this.broadcastLobbyStatus(userId, inLobby);
+      }
+    });
+
+    // Listen for game status updates (entering/leaving game)
+    this.onMessage('updateGameStatus', (client, message) => {
+      const userId = client.userId;
+      const { inGame } = message;
+      
+      if (userId) {
+        this.usersInGame.set(userId, inGame);
+        // If entering game, make sure they're not marked as in lobby
+        if (inGame) {
+          this.usersInLobby.set(userId, false);
+        }
+        // Broadcast game status to friends
+        this.broadcastGameStatus(userId, inGame);
       }
     });
 
@@ -113,6 +147,16 @@ export class FriendRoom extends Room {
         this.handleMatchmakingCancel(userId);
       }
     });
+
+    // Listen for friend status refresh requests
+    this.onMessage('requestFriendStatuses', (client, message) => {
+      const userId = client.userId;
+      if (userId) {
+        this.sendInitialFriendStatuses(userId, client).catch(error => {
+          console.error('Error sending friend statuses on request:', error);
+        });
+      }
+    });
     
     // Start ping interval
     this.pingTimer = setInterval(() => {
@@ -128,6 +172,13 @@ export class FriendRoom extends Room {
     this.matchmakingTimer = setInterval(() => {
       this.checkMatchmaking();
     }, this.matchmakingCheckInterval);
+
+    // Start periodic status sync to ensure all clients have accurate friend statuses
+    this.statusSyncTimer = setInterval(() => {
+      this.syncAllFriendStatuses().catch(error => {
+        console.error('Error in periodic friend status sync:', error);
+      });
+    }, this.statusSyncInterval);
   }
 
   async getUserInfo(userId) {
@@ -187,7 +238,7 @@ export class FriendRoom extends Room {
         f.userId.toString() === userId ? f.friendId.toString() : f.userId.toString()
       );
 
-      // Send status of all online friends and their lobby status
+      // Send status of all online friends and their lobby/game status
       for (const friendId of friendIds) {
         const isOnline = this.userSessions.has(friendId);
         client.send('friendStatusUpdate', {
@@ -195,10 +246,17 @@ export class FriendRoom extends Room {
           isOnline: isOnline,
         });
         
-        // Also send lobby status if friend is online and in lobby
+        // Also send lobby/game status if friend is online
         if (isOnline) {
           const isInLobby = this.usersInLobby.get(friendId) === true;
-          if (isInLobby) {
+          const isInGame = this.usersInGame.get(friendId) === true;
+          
+          if (isInGame) {
+            client.send('gameStatusUpdate', {
+              friendId: friendId,
+              inGame: true
+            });
+          } else if (isInLobby) {
             client.send('lobbyStatusUpdate', {
               friendId: friendId,
               inLobby: true
@@ -311,6 +369,78 @@ export class FriendRoom extends Room {
       }
     } catch (error) {
       console.error('Error broadcasting friend status:', error);
+    }
+  }
+
+  // Sync friend statuses for a specific user (used when pong is received)
+  async syncFriendStatusesForUser(userId, client) {
+    try {
+      const db = getDatabase();
+      const friendships = await db.collection('friendships').find({
+        $or: [
+          { userId: new ObjectId(userId), status: 'accepted' },
+          { friendId: new ObjectId(userId), status: 'accepted' }
+        ]
+      }).toArray();
+
+      const friendIds = friendships.map(f => 
+        f.userId.toString() === userId ? f.friendId.toString() : f.userId.toString()
+      );
+
+      // Send current status of all friends to this client
+      for (const friendId of friendIds) {
+        const isOnline = this.userSessions.has(friendId);
+        client.send('friendStatusUpdate', {
+          friendId: friendId,
+          isOnline: isOnline,
+        });
+
+        // Also send lobby/game status if friend is online
+        if (isOnline) {
+          const isInLobby = this.usersInLobby.get(friendId) === true;
+          const isInGame = this.usersInGame.get(friendId) === true;
+          
+          if (isInGame) {
+            client.send('gameStatusUpdate', {
+              friendId: friendId,
+              inGame: true
+            });
+          } else if (isInLobby) {
+            client.send('lobbyStatusUpdate', {
+              friendId: friendId,
+              inLobby: true
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error syncing friend statuses for user:', error);
+    }
+  }
+
+  // Periodically sync all friend statuses to all connected clients
+  async syncAllFriendStatuses() {
+    try {
+      const db = getDatabase();
+      
+      // Get all unique user IDs that are currently connected
+      const connectedUserIds = Array.from(this.userSessions.keys());
+      
+      // For each connected user, sync their friend statuses
+      for (const userId of connectedUserIds) {
+        const sessions = this.userSessions.get(userId);
+        if (sessions && sessions.size > 0) {
+          // Get one client for this user to send statuses to
+          const sessionId = Array.from(sessions)[0];
+          const client = this.clients.find(c => c.sessionId === sessionId);
+          
+          if (client) {
+            await this.syncFriendStatusesForUser(userId, client);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error in syncAllFriendStatuses:', error);
     }
   }
 
@@ -446,6 +576,40 @@ export class FriendRoom extends Room {
   }
 
   // Broadcast lobby status to friends
+  async broadcastGameStatus(userId, inGame) {
+    try {
+      const db = getDatabase();
+      const friendships = await db.collection('friendships').find({
+        $or: [
+          { userId: new ObjectId(userId), status: 'accepted' },
+          { friendId: new ObjectId(userId), status: 'accepted' }
+        ]
+      }).toArray();
+
+      const friendIds = friendships.map(f => 
+        f.userId.toString() === userId ? f.friendId.toString() : f.userId.toString()
+      );
+
+      // Send game status update to all online friends
+      for (const friendId of friendIds) {
+        if (this.userSessions.has(friendId)) {
+          const friendSessions = this.userSessions.get(friendId);
+          for (const sessionId of friendSessions) {
+            const client = this.clients.find(c => c.sessionId === sessionId);
+            if (client) {
+              client.send('gameStatusUpdate', {
+                friendId: userId,
+                inGame: inGame,
+              });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error broadcasting game status:', error);
+    }
+  }
+
   async broadcastLobbyStatus(userId, inLobby) {
     try {
       const db = getDatabase();
@@ -714,6 +878,11 @@ export class FriendRoom extends Room {
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
+    }
+    // Clear status sync timer
+    if (this.statusSyncTimer) {
+      clearInterval(this.statusSyncTimer);
+      this.statusSyncTimer = null;
     }
     // Clear matchmaking timer
     if (this.matchmakingTimer) {

@@ -1,12 +1,14 @@
-import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput, Animation, DynamicTexture } from '@babylonjs/core';
+import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput, Animation } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
 import { TILE_TYPES, doesTileBlockLOS } from './mapRenderer';
 import { findPath, getMovementRange } from './pathfinding';
 import { build3DMap } from './babylon/babylonMap';
 import { buildPlayerCharacters, updatePlayerCharacters } from './babylon/babylonPlayers';
 import { startMovementAnimation, startStanceAnimation, stopStanceAnimation, playCastAnimation, playHitAnimation, updateMovementAnimations, blendAnimations } from './babylon/babylonAnimations';
-import { playSpellVfx } from './babylon/babylonVfx';
+import { playSpellVfx, preWarmArcaneMissileShaders } from './babylon/babylonVfx';
+import { startTeleportVFX, onServerTeleportConfirmed } from './babylon/babylonTeleport';
 import { hasLOS, createTerrainBlocksFunction } from './lineOfSight';
+import { initCombatTextSystem, updateCombatTextFromState, recordCombatTextHit } from './babylon/babylonCombatText';
 
 // Helper to convert angle in radians to Babylon.js rotation (Y axis)
 // In Babylon.js, rotation around Y axis: 
@@ -29,7 +31,7 @@ const angleToRotation = (angle) => {
  * @param {Object} gameState - Current game state with player positions
  * @returns {Object} - Object containing engine, scene, camera, and cleanup function
  */
-export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState = null) {
+export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState = null, onOrientationChange = null) {
   // Validate canvas
   if (!canvas || !(canvas instanceof HTMLCanvasElement)) {
     throw new Error('createBabylonScene: canvas element required');
@@ -44,6 +46,9 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   // Create scene
   const scene = new Scene(engine);
   scene.clearColor = new Color3(0.1, 0.1, 0.15); // Dark blue-gray background
+  
+  // Minimal pre-warming: compile shaders for arcane missile VFX at initialization
+  preWarmArcaneMissileShaders(scene);
 
   // Create camera - positioned to look down at the map at an angle
   const terrain = mapData?.terrain || [];
@@ -88,6 +93,8 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   // Make sure the scene can be picked
   scene.constantlyUpdateMeshUnderPointer = true;
 
+  initCombatTextSystem(scene, camera);
+
   // Create ambient light
   const ambientLight = new HemisphericLight('ambientLight', new Vector3(0, 1, 0), scene);
   ambientLight.intensity = 0.6;
@@ -128,6 +135,10 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   // Store callback for position change requests
   let onPositionChangeRequest = null;
   
+  // Store callback for orientation changes (sent to server after movement animation)
+  // This callback receives (userId, babylonRotation) and should send it to the server
+  const onOrientationChangeCallback = onOrientationChange;
+  
   // Spell casting state
   let selectedSpell = null; // Currently selected spell for casting
   let selectedSpellDef = null; // Spell definition
@@ -156,6 +167,9 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   if (!scene.metadata) {
     scene.metadata = {};
   }
+  
+  // Store orientation change callback in scene metadata so babylonPlayers.js can access it
+  scene.metadata.onOrientationChange = onOrientationChangeCallback;
   
   // Track player positions for movement animation (store in scene metadata for access)
   if (!scene.metadata.playerPreviousPositions) {
@@ -1106,6 +1120,9 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     scene, 
     camera, 
     handleResize, 
+    recordSpellHit: (targetUserId, hitDelayMs, hitCount) => {
+      recordCombatTextHit(scene, targetUserId, hitDelayMs, hitCount);
+    },
     updatePlayers: (newGameState) => {
       // Function to update player positions when game state changes
       if (newGameState) {
@@ -1119,6 +1136,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         
         updatePlayerCharacters(scene, newGameState, userId, mapWidth, mapHeight);
         updateSpawnedEntities(scene, newGameState, mapWidth, mapHeight);
+        updateCombatTextFromState(scene, newGameState);
         
         // If player is in cast mode, recalculate spell range to include newly spawned entities
         if (selectedSpell && selectedSpellDef && newGameState.phase === 'game') {
@@ -1330,6 +1348,12 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     },
     setOnPositionChangeRequest: (callback) => {
       onPositionChangeRequest = callback;
+    },
+    setOnOrientationChange: (callback) => {
+      // Update scene metadata with new callback
+      if (scene.metadata) {
+        scene.metadata.onOrientationChange = callback;
+      }
     },
     setOnSpellCast: (callback) => {
       onSpellCast = callback; // Callback signature: (spellId, targetX, targetY) => void
@@ -1677,65 +1701,100 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         // Play VFX for each target
         const targetsToProcess = isMultiTarget ? targets : (targetX !== null && targetY !== null ? [{ x: targetX, y: targetY }] : []);
         
-        if (spellDef && spellDef.presentation && (spellDef.presentation.projectileVfx || spellDef.presentation.impactVfxDef || spellDef.presentation.groundEffectVfx) && targetsToProcess.length > 0) {
-          // Get caster position - prioritize player mesh (most accurate)
-          let casterPos = null;
-          let casterOrientation = 0;
+        // Special handling for teleportation (doesn't need standard VFX definitions)
+        const isTeleportSpell = spellId === 'teleport' || spellId === 'teleportation';
+        
+        // For teleport spells, always process (they have custom VFX controller)
+        // For other spells, require standard VFX definitions
+        if (targetsToProcess.length === 0) {
+          return; // No targets, nothing to do
+        }
+        
+        if (!isTeleportSpell && (!spellDef || !spellDef.presentation || (!spellDef.presentation.projectileVfx && !spellDef.presentation.impactVfxDef && !spellDef.presentation.groundEffectVfx))) {
+          return; // Not teleport and no VFX definitions, skip
+        }
+        
+        // Continue with VFX processing
+        // Get caster position - prioritize player mesh (most accurate)
+        let casterPos = null;
+        let casterOrientation = 0;
           
-          // First try: get from player meshes in scene (most reliable for 3D position)
-          if (scene.metadata && scene.metadata.playerMeshes) {
-            const playerMesh = scene.metadata.playerMeshes.get(castUserId);
-            if (playerMesh) {
-              // Handle both TransformNode containers and direct meshes
-              if (playerMesh.position) {
-                casterPos = new Vector3(
-                  playerMesh.position.x, 
-                  playerMesh.position.y || 0.5, // Default height if not set
-                  playerMesh.position.z
-                );
-                console.log(`Found caster position from player mesh: (${casterPos.x.toFixed(2)}, ${casterPos.y.toFixed(2)}, ${casterPos.z.toFixed(2)})`);
-              } else if (playerMesh.metadata && playerMesh.metadata.modelMesh && playerMesh.metadata.modelMesh.position) {
-                // Fallback: try to get from modelMesh if it's a container
-                const modelMesh = playerMesh.metadata.modelMesh;
-                casterPos = new Vector3(
-                  playerMesh.position.x || modelMesh.position.x,
-                  playerMesh.position.y || modelMesh.position.y || 0.5,
-                  playerMesh.position.z || modelMesh.position.z
-                );
-                console.log(`Found caster position from modelMesh: (${casterPos.x.toFixed(2)}, ${casterPos.y.toFixed(2)}, ${casterPos.z.toFixed(2)})`);
-              }
+        // First try: get from player meshes in scene (most reliable for 3D position)
+        if (scene.metadata && scene.metadata.playerMeshes) {
+          const playerMesh = scene.metadata.playerMeshes.get(castUserId);
+          if (playerMesh) {
+            // Handle both TransformNode containers and direct meshes
+            if (playerMesh.position) {
+              casterPos = new Vector3(
+                playerMesh.position.x, 
+                playerMesh.position.y || 0.5, // Default height if not set
+                playerMesh.position.z
+              );
+              console.log(`Found caster position from player mesh: (${casterPos.x.toFixed(2)}, ${casterPos.y.toFixed(2)}, ${casterPos.z.toFixed(2)})`);
+            } else if (playerMesh.metadata && playerMesh.metadata.modelMesh && playerMesh.metadata.modelMesh.position) {
+              // Fallback: try to get from modelMesh if it's a container
+              const modelMesh = playerMesh.metadata.modelMesh;
+              casterPos = new Vector3(
+                playerMesh.position.x || modelMesh.position.x,
+                playerMesh.position.y || modelMesh.position.y || 0.5,
+                playerMesh.position.z || modelMesh.position.z
+              );
+              console.log(`Found caster position from modelMesh: (${casterPos.x.toFixed(2)}, ${casterPos.y.toFixed(2)}, ${casterPos.z.toFixed(2)})`);
             }
           }
+        }
+        
+        // Get game state for orientation and fallback position
+        const gameState = currentGameState || scene.metadata?.gameState;
+        let caster = null;
+        if (gameState) {
+          const myTeam = gameState.myTeam?.players;
+          const enemyTeam = gameState.enemyTeam?.players;
           
-          // Get game state for orientation and fallback position
-          const gameState = currentGameState || scene.metadata?.gameState;
-          let caster = null;
-          if (gameState) {
-            const myTeam = gameState.myTeam?.players;
-            const enemyTeam = gameState.enemyTeam?.players;
-            
-            if (myTeam) {
-              caster = Object.values(myTeam).find(p => p.userId === castUserId);
+          if (myTeam) {
+            caster = Object.values(myTeam).find(p => p.userId === castUserId);
+          }
+          if (!caster && enemyTeam) {
+            caster = Object.values(enemyTeam).find(p => p.userId === castUserId);
+          }
+          
+          if (caster) {
+            // Get orientation
+            if (caster.orientation !== undefined) {
+              casterOrientation = caster.orientation;
             }
-            if (!caster && enemyTeam) {
-              caster = Object.values(enemyTeam).find(p => p.userId === castUserId);
-            }
             
-            if (caster) {
-              // Get orientation
-              if (caster.orientation !== undefined) {
-                casterOrientation = caster.orientation;
-              }
+            // Fallback: use game state position if mesh position not found
+            if (!casterPos && caster.position) {
+              casterPos = new Vector3(caster.position.x, 0.5, caster.position.y); // Y=0.5 for character height, map y->z
+              console.log(`Found caster position from gameState: (${caster.position.x}, ${caster.position.y})`);
+            }
+          }
+        }
+        
+        if (casterPos && (Math.abs(casterPos.x) > 0.01 || Math.abs(casterPos.z) > 0.01)) {
+          // Special handling for teleport spell
+          if (isTeleportSpell) {
+            // Teleport is self-cast, destination is the target
+            if (targetsToProcess.length > 0) {
+              const target = targetsToProcess[0];
+              const tileSize = 1;
+              const targetWorldX = target.x * tileSize;
+              const targetWorldZ = target.y * tileSize;
               
-              // Fallback: use game state position if mesh position not found
-              if (!casterPos && caster.position) {
-                casterPos = new Vector3(caster.position.x, 0.5, caster.position.y); // Y=0.5 for character height, map y->z
-                console.log(`Found caster position from gameState: (${caster.position.x}, ${caster.position.y})`);
-              }
+              // Use caster's current Y position (which should be at ground level)
+              // This ensures the character teleports to the same height they're currently at
+              const destination = new Vector3(targetWorldX, casterPos.y, targetWorldZ);
+              
+              console.log(`[Teleport] Starting teleport VFX for ${castUserId} from (${casterPos.x.toFixed(2)}, ${casterPos.y.toFixed(2)}, ${casterPos.z.toFixed(2)}) to (${destination.x.toFixed(2)}, ${destination.y.toFixed(2)}, ${destination.z.toFixed(2)})`);
+              
+              // Start teleport VFX immediately (server will confirm destination)
+              startTeleportVFX(scene, castUserId, casterPos, destination);
+            } else {
+              console.warn(`[Teleport] No target provided for teleport spell`);
             }
-          }
-          
-          if (casterPos && (Math.abs(casterPos.x) > 0.01 || Math.abs(casterPos.z) > 0.01)) {
+            return; // Teleport handled, don't process normal VFX
+          } else {
             // Calculate spawn position in front of caster (0.3 units forward at character height)
             const spawnOffset = 0.3;
             // In Babylon.js: orientation 0 = +Z, PI/2 = +X, PI = -Z, -PI/2 = -X
@@ -1769,19 +1828,11 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                 playSpellVfx(scene, vfxSpellDef, spawnPos, targetPos, castStartTime, index, totalMissiles);
               }, delay);
             });
-          } else {
-            console.error(`Could not find valid caster position for VFX: ${castUserId}. Position: ${casterPos ? `(${casterPos.x}, ${casterPos.y}, ${casterPos.z})` : 'null'}. GameState: ${!!gameState}, Player meshes: ${!!(scene.metadata && scene.metadata.playerMeshes)}`);
-            if (scene.metadata && scene.metadata.playerMeshes) {
-              console.log('Available player meshes:', Array.from(scene.metadata.playerMeshes.keys()));
-            }
           }
         } else {
-          if (!spellDef) {
-            console.warn(`No spell definition provided for VFX: ${spellId}`);
-          } else if (!spellDef.presentation) {
-            console.warn(`No presentation data in spell definition for: ${spellId}`);
-          } else if (targetsToProcess.length === 0) {
-            console.warn(`No targets provided for VFX: targetsToProcess=${targetsToProcess.length}`);
+          console.error(`Could not find valid caster position for VFX: ${castUserId}. Position: ${casterPos ? `(${casterPos.x}, ${casterPos.y}, ${casterPos.z})` : 'null'}. GameState: ${!!gameState}, Player meshes: ${!!(scene.metadata && scene.metadata.playerMeshes)}`);
+          if (scene.metadata && scene.metadata.playerMeshes) {
+            console.log('Available player meshes:', Array.from(scene.metadata.playerMeshes.keys()));
           }
         }
       } else {

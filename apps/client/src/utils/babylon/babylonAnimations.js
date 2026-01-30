@@ -68,7 +68,7 @@ export function blendAnimations(fromAnim, toAnim, durationMs, scene, onComplete)
  * @param {string} animationType - 'walk' or 'run'
  * @param {number} tileSize - Size of each tile
  */
-export function startMovementAnimation(scene, userId, characterMesh, path, animationType, tileSize) {
+export function startMovementAnimation(scene, userId, characterMesh, path, animationType, tileSize, onComplete = null) {
   // Ensure metadata exists
   if (!scene.metadata) {
     scene.metadata = {};
@@ -162,7 +162,8 @@ export function startMovementAnimation(scene, userId, characterMesh, path, anima
     idleAnim: idleAnim,
     timePerTile: timePerTile,
     transitionStartTime: null, // Will be set when starting transition
-    isTransitioning: false
+    isTransitioning: false,
+    onComplete: onComplete // Callback when animation finishes (for orientation sync)
   };
   
   // Start movement animation with full weight
@@ -734,17 +735,19 @@ export function updateMovementAnimations(scene) {
     
     const elapsed = (currentTime - animState.startTime) / 1000; // Convert to seconds
     const totalDuration = animState.path.length * animState.timePerTile;
-    const transitionDuration = animState.animationType === 'walk' ? 0.2 : 0.1; // seconds for transition
+    const baseTransitionDuration = animState.animationType === 'walk' ? 0.2 : 0.1; // seconds for transition
+    const transitionLead = animState.animationType === 'walk' ? 0.18 : 0.12; // start blending earlier
+    const transitionDuration = Math.min(baseTransitionDuration, totalDuration);
     
     // Start transition to idle animation before movement completes
-    if (!animState.isTransitioning && elapsed >= totalDuration - transitionDuration) {
+    const transitionStartAt = Math.max(0, totalDuration - transitionDuration - transitionLead);
+    if (!animState.isTransitioning && elapsed >= transitionStartAt) {
       animState.isTransitioning = true;
       animState.transitionStartTime = currentTime;
       
       // Start blending from movement to idle
       if (animState.movementAnim && animState.idleAnim) {
-        const transitionStartOffset = animState.animationType === 'walk' ? 200 : 100; // ms before end
-        const easeOutDuration = transitionStartOffset / 1000; // Convert to seconds
+        const easeOutDuration = transitionDuration;
         
         // Ease-out function for smooth transition
         const easeOut = (t) => {
@@ -796,6 +799,12 @@ export function updateMovementAnimations(scene) {
           // Animation complete
           animState.isAnimating = false;
           animState.isTransitioning = false;
+          
+          // Call onComplete callback with final rotation for orientation sync
+          if (animState.onComplete && animState.characterMesh) {
+            const finalRotation = animState.characterMesh.rotation?.y ?? 0;
+            animState.onComplete(userId, finalRotation);
+          }
         }
       } else {
         // If transition didn't start (very short movement), stop immediately
@@ -807,6 +816,12 @@ export function updateMovementAnimations(scene) {
           animState.idleAnim.setWeightForAllAnimatables(1.0);
         }
         animState.isAnimating = false;
+        
+        // Call onComplete callback with final rotation for orientation sync
+        if (animState.onComplete && animState.characterMesh) {
+          const finalRotation = animState.characterMesh.rotation?.y ?? 0;
+          animState.onComplete(userId, finalRotation);
+        }
       }
       
       // Keep the final rotation from the last movement step

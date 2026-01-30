@@ -9,6 +9,47 @@ import { findPath } from '../pathfinding';
 import { startMovementAnimation } from './babylonAnimations';
 
 /**
+ * Convert server orientation (atan2-based, 0 = +X in map coords) to Babylon rotation.y
+ * Server: atan2(dy, dx) where 0 = +X, PI/2 = +Y (map coordinates)
+ * Babylon: rotation.y where 0 = +Z, PI/2 = +X
+ * Conversion: babylonRotation = PI/2 - serverOrientation
+ * @param {number} serverOrientation - Orientation in radians from server
+ * @returns {number} Babylon rotation.y value
+ */
+export function serverOrientationToBabylon(serverOrientation) {
+  return Math.PI / 2 - serverOrientation;
+}
+
+/**
+ * Convert Babylon rotation.y to server orientation (for sending updates)
+ * @param {number} babylonRotation - Babylon rotation.y value
+ * @returns {number} Server orientation in radians
+ */
+export function babylonToServerOrientation(babylonRotation) {
+  return Math.PI / 2 - babylonRotation;
+}
+
+/**
+ * Get Babylon rotation for a player based on their orientation or team fallback
+ * @param {Object} player - Player data with optional orientation and team
+ * @returns {number} Babylon rotation.y value
+ */
+function getPlayerRotation(player) {
+  // Use server orientation if available
+  if (player.orientation !== undefined && player.orientation !== null) {
+    return serverOrientationToBabylon(player.orientation);
+  }
+  
+  // Fallback to team-based default
+  if (player.team === 'A') {
+    return Math.PI / 2; // Face right (+X)
+  } else if (player.team === 'B') {
+    return 3 * Math.PI / 2; // Face left (-X)
+  }
+  return 0;
+}
+
+/**
  * Get model path for character class
  * @param {string} characterClass - Character class name
  * @returns {string} Path to model file
@@ -139,15 +180,8 @@ async function createPlayerModel(player, isMyTeam, scene, tileSize) {
       const boundingInfo = modelRoot.getBoundingInfo();
       const size = boundingInfo.boundingBox.extendSize;
       
-      // Calculate rotation based on team
-      let rotationY = 0;
-      if (player.team === 'A') {
-        rotationY = Math.PI / 2; // 90 degrees - face right (+X)
-      } else if (player.team === 'B') {
-        rotationY = 3 * Math.PI / 2; // 270 degrees - face left (-X)
-      }
-      
-      // Apply rotation to container
+      // Apply rotation from server orientation (or team fallback)
+      const rotationY = getPlayerRotation(player);
       characterContainer.rotation.y = rotationY;
       
       // Position container at tile location
@@ -309,6 +343,14 @@ export function buildPlayerCharacters(scene, gameState, userId, mapWidth, mapHei
  * @param {number} mapHeight - Height of the map
  */
 export async function updatePlayerCharacters(scene, gameState, userId, mapWidth, mapHeight) {
+  // Import teleport module to check for active teleports
+  let activeTeleports = null;
+  try {
+    const teleportModule = await import('./babylonTeleport');
+    activeTeleports = teleportModule.activeTeleports;
+  } catch (e) {
+    // Module not available, continue without teleport check
+  }
   if (!scene.metadata) {
     scene.metadata = {};
   }
@@ -370,6 +412,26 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
         const endX = player.position.x;
         const endY = player.position.y;
         const distance = Math.abs(endX - startX) + Math.abs(endY - startY);
+        
+        // Check if this player has an active teleport VFX controller
+        // If so, skip normal movement animation (teleport controller handles position)
+        if (activeTeleports && activeTeleports.has(player.userId)) {
+          // Teleport VFX is handling the position change, skip normal movement
+          console.log(`Skipping normal movement animation for ${player.userId} - teleport VFX active`);
+          // Still update the position silently (teleport controller will handle visual)
+          if (isContainer) {
+            existingMesh.position.x = xPos;
+            existingMesh.position.z = zPos;
+          } else {
+            existingMesh.position.x = xPos;
+            existingMesh.position.z = zPos;
+          }
+          // Update previous position to prevent re-triggering
+          if (scene.metadata.playerPreviousPositions) {
+            scene.metadata.playerPreviousPositions.set(player.userId, { x: endX, y: endY });
+          }
+          return; // Skip normal movement handling
+        }
         
         // During preparation phase, just teleport to destination (no animation)
         if (gameState.phase === 'preparation') {
@@ -491,8 +553,15 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
           // Determine animation type (walk for 2 tiles or less, run for more)
           const animationType = distance <= 2 ? 'walk' : 'run';
           
-          // Start movement animation
-          startMovementAnimation(scene, player.userId, existingMesh, path, animationType, tileSize);
+          // Create onComplete callback to sync orientation with server
+          const onMovementComplete = (completedUserId, finalBabylonRotation) => {
+            if (scene.metadata?.onOrientationChange) {
+              scene.metadata.onOrientationChange(completedUserId, finalBabylonRotation);
+            }
+          };
+          
+          // Start movement animation with orientation sync callback
+          startMovementAnimation(scene, player.userId, existingMesh, path, animationType, tileSize, onMovementComplete);
         }
       }
       
@@ -503,12 +572,7 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
         
         const modelMesh = existingMesh.metadata?.modelMesh || existingMesh;
         
-        let rotationY = 0;
-        if (player.team === 'A') {
-          rotationY = Math.PI / 2;
-        } else if (player.team === 'B') {
-          rotationY = 3 * Math.PI / 2;
-        }
+        const rotationY = getPlayerRotation(player);
         
         characterContainer.position = new Vector3(xPos, existingMesh.position.y, zPos);
         characterContainer.rotation.y = rotationY;
@@ -529,6 +593,11 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
         if (!isAnimating && existingMesh.position) {
           existingMesh.position.x = xPos;
           existingMesh.position.z = zPos;
+          
+          // Apply server orientation when not animating
+          if (player.orientation !== undefined && player.orientation !== null) {
+            existingMesh.rotation.y = getPlayerRotation(player);
+          }
         }
       }
     } else {
@@ -563,13 +632,7 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
             
             const characterContainer = new TransformNode(`characterContainer_${player.userId}`, scene);
             
-            let rotationY = 0;
-            if (player.team === 'A') {
-              rotationY = Math.PI / 2;
-            } else if (player.team === 'B') {
-              rotationY = 3 * Math.PI / 2;
-            }
-            
+            const rotationY = getPlayerRotation(player);
             characterContainer.rotation.y = rotationY;
             characterContainer.position = new Vector3(xPos, size.y, zPos);
             

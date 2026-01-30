@@ -67,8 +67,8 @@ class PlayerState extends Schema {
     this.spellLoadout = ''; // JSON string array of spell IDs
     this.position = new PositionState();
     this.orientation = 0; // Rotation angle in radians (0 = facing positive X, PI/2 = facing positive Z)
-    this.health = 100;
-    this.maxHealth = 100;
+    this.health = 0;
+    this.maxHealth = 0;
     this.ready = false; // For preparation phase
     this.movementPoints = 0; // Total movement points available (can exceed max during turn)
     this.maxMovementPoints = 0; // Maximum movement points (base value from character class)
@@ -737,6 +737,10 @@ export class GameRoom extends Room {
 
     this.onMessage('endTurn', (client, message) => {
       this.handleEndTurn(client, message);
+    });
+
+    this.onMessage('updateOrientation', (client, message) => {
+      this.handleOrientationUpdate(client, message);
     });
   }
 
@@ -1969,8 +1973,50 @@ export class GameRoom extends Room {
         );
       }
       
-      // Apply spell effects to all affected units for this target
-      if (spell.effects && spell.effects.length > 0) {
+      // Special handling for teleportation spell - move caster to target cell
+      if (spellId === 'teleportation' && targeting.targetType === 'CELL') {
+        // Get cast animation definition to determine delay
+        const castAnimDef = spell.animations?.cast || null;
+        const teleportDelayMs = castAnimDef?.impactDelayMs || 1000; // Default 1 second delay
+        
+        // Store teleport destination for delayed execution
+        const oldX = player.position.x;
+        const oldY = player.position.y;
+        const newX = target.x;
+        const newY = target.y;
+        
+        console.log(`Player ${userId} casting teleportation, will move from (${oldX}, ${oldY}) to (${newX}, ${newY}) after ${teleportDelayMs}ms delay`);
+        
+        // Delay the actual position change to allow cast animation to play
+        setTimeout(() => {
+          // Update position
+          player.position.x = newX;
+          player.position.y = newY;
+          
+          // Update orientation to face movement direction
+          if (newX !== oldX || newY !== oldY) {
+            player.orientation = Math.atan2(newY - oldY, newX - oldX);
+          }
+          
+          console.log(`Player ${userId} teleported from (${oldX}, ${oldY}) to (${newX}, ${newY})`);
+          
+          // Broadcast updated state with new position
+          this.broadcastFilteredState();
+          
+          // Send teleport confirmation after position update
+          setTimeout(() => {
+            this.broadcast('teleportConfirm', {
+              userId: userId,
+              destinationX: newX,
+              destinationY: newY
+            });
+          }, 50);
+        }, teleportDelayMs);
+        
+        // Skip normal effect processing for teleportation
+        // (it doesn't have damage/heal effects, just movement)
+      } else if (spell.effects && spell.effects.length > 0) {
+        // Apply spell effects to all affected units for this target
         spell.effects.forEach(effect => {
           if (effect.kind === 'DAMAGE') {
             // Apply damage to all affected units
@@ -2090,6 +2136,9 @@ export class GameRoom extends Room {
     });
     
     this.broadcastFilteredState();
+    
+    // Note: For teleportation spell, position update and teleportConfirm are delayed
+    // (handled in the spell effect processing above with setTimeout)
   }
 
   /**
@@ -2985,6 +3034,39 @@ export class GameRoom extends Room {
     
     console.log(`Turn ${this.state.turn}: Now ${nextPlayerId}'s turn`);
     
+    this.broadcastFilteredState();
+  }
+
+  /**
+   * Handle orientation update from client
+   * Updates the player's facing direction for server-authoritative gameplay
+   * @param {Client} client - The client sending the update
+   * @param {Object} message - The message containing the new orientation
+   */
+  handleOrientationUpdate(client, message) {
+    const userId = client.userId;
+    const { orientation } = message;
+    
+    // Validate orientation is a number
+    if (typeof orientation !== 'number' || isNaN(orientation)) {
+      return;
+    }
+    
+    // Get the player
+    const player = this.getPlayerById(userId);
+    if (!player) {
+      return;
+    }
+    
+    // Normalize orientation to [-PI, PI] range
+    let normalizedOrientation = orientation;
+    while (normalizedOrientation > Math.PI) normalizedOrientation -= 2 * Math.PI;
+    while (normalizedOrientation < -Math.PI) normalizedOrientation += 2 * Math.PI;
+    
+    // Update player orientation
+    player.orientation = normalizedOrientation;
+    
+    // Broadcast state update so other clients see the orientation change
     this.broadcastFilteredState();
   }
 

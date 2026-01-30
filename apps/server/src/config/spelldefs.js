@@ -175,17 +175,17 @@ export const SpellDefs = {
       description: 'Hurl a ball of fire at a target cell',
       targeting: {
         targetType: 'CELL',
-        range: { min: 2, max: 6 },
+        range: { min: 3, max: 8 },
         requiresLoS: true, // MVP: no LoS initially
         allowBlockedCellTarget: false,
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 3 },
+      cost: { energy: 5 },
       effects: [
         {
           kind: 'DAMAGE',
-          amount: 5,
+          amount: 50,
           damageType: 'magic'
         }
       ],
@@ -343,17 +343,17 @@ export const SpellDefs = {
       targeting: {
         targetType: 'UNIT',
         unitFilter: 'ALLY',
-        range: { min: 0, max: 4 },
+        range: { min: 0, max: 5 },
         requiresLoS: true,
         allowBlockedCellTarget: false,
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 3 },
+      cost: { energy: 5 },
       effects: [
         {
           kind: 'HEAL',
-          amount: 6
+          amount: 40
         }
       ],
       presentation: {
@@ -1406,13 +1406,13 @@ export const SpellDefs = {
       description: 'Summon a block of earth that blocks movement and line of sight',
       targeting: {
         targetType: 'CELL',
-        range: { min: 1, max: 3 },
+        range: { min: 1, max: 4 },
         requiresLoS: true,
         allowBlockedCellTarget: true,
         allowOccupiedCellTarget: false,
         pattern: 'SINGLE'
       },
-      cost: { energy: 3 },
+      cost: { energy: 5 },
       effects: [
         {
           kind: 'SPAWN_ENTITY',
@@ -1458,7 +1458,7 @@ export const SpellDefs = {
       description: 'Hurl a bolt of arcane energy at a target',
       targeting: {
         targetType: 'CELL',
-        range: { min: 2, max: 6 },
+        range: { min: 3, max: 9 },
         requiresLoS: true,
         allowBlockedCellTarget: false,
         allowOccupiedCellTarget: true,
@@ -1466,11 +1466,11 @@ export const SpellDefs = {
         multiTarget: true, // Allow multiple target selections
         maxTargets: 3 // Maximum number of targets
       },
-      cost: { energy: 3 },
+      cost: { energy: 4 },
       effects: [
         {
           kind: 'DAMAGE',
-          amount: 1,
+          amount: 10,
           damageType: 'magic'
         }
       ],
@@ -1602,22 +1602,20 @@ export const SpellDefs = {
       description: 'Instantly teleport to a target cell',
       targeting: {
         targetType: 'CELL',
-        range: { min: 2, max: 5 },
+        range: { min: 1, max: 6 },
         requiresLoS: false,
         allowBlockedCellTarget: false,
         allowOccupiedCellTarget: false,
         pattern: 'SINGLE'
       },
-      cost: { energy: 4 },
+      cost: { energy: 8 },
       effects: [
-        {
-          kind: 'DAMAGE',
-          amount: 0
-        }
+        // Teleportation is handled specially in GameRoom.js - no standard effect needed
+        // The server directly moves the player to the target cell
       ],
       presentation: {
         castAnim: 'cast',
-        impactVfx: 'teleport_portal',
+        // Teleport uses custom VFX controller, not standard projectile/impact
         sound: 'teleport_cast'
       },
       animations: {
@@ -1629,11 +1627,11 @@ export const SpellDefs = {
           canMoveWhilePreparing: false
         },
         cast: {
-          name: 'cast',
+          name: 'cast4',
           blendInMs: 100,
           blendOutMs: 200,
-          lockMs: 700,
-          impactDelayMs: 400
+          lockMs: 2500, // Longer lock time to allow VFX to complete
+          impactDelayMs: 2000 // 2 second delay before position change
         }
       }
     },

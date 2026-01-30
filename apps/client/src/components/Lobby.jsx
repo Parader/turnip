@@ -9,7 +9,7 @@ import '../styles/lobby.scss';
 
 function Lobby() {
   const { user } = useAuth();
-  const { onlineStatus, lobbyStatus, room, partyUpdate, lobbyInvitation, invitationResponse, matchmakingStatus, matchFound, clearLobbyInvitation, clearInvitationResponse, clearPartyUpdate, clearMatchmakingStatus, clearMatchFound } = useColyseus();
+  const { onlineStatus, lobbyStatus, room, partyUpdate, lobbyInvitation, invitationResponse, matchmakingStatus, matchFound, isConnecting, connectionError, clearLobbyInvitation, clearInvitationResponse, clearPartyUpdate, clearMatchmakingStatus, clearMatchFound, clearConnectionError } = useColyseus();
   const navigate = useNavigate();
   const [friends, setFriends] = useState([]);
   const [party, setParty] = useState([user]); // Start with current user
@@ -383,7 +383,13 @@ function Lobby() {
 
       setError('');
     } else {
-      setError('Not connected to server. Please refresh the page.');
+      if (isConnecting) {
+        setError('Connecting to server...');
+      } else if (connectionError) {
+        setError(`Connection error: ${connectionError}. Please refresh the page.`);
+      } else {
+        setError('Not connected to server. Please wait for connection...');
+      }
     }
   };
 
@@ -623,8 +629,14 @@ function Lobby() {
     }
 
     if (!room) {
-      setError('Not connected to server. Please wait for connection...');
-      console.error('Room is null when trying to start matchmaking');
+      if (isConnecting) {
+        setError('Connecting to server. Please wait...');
+      } else if (connectionError) {
+        setError(`Connection error: ${connectionError}. Please refresh the page.`);
+      } else {
+        setError('Not connected to server. Please wait for connection...');
+      }
+      console.error('Room is null when trying to start matchmaking', { isConnecting, connectionError });
       return;
     }
 
@@ -684,6 +696,9 @@ function Lobby() {
   // For parties, check that party size doesn't exceed the maximum required size
   const isPartySizeValid = party.length === 1 || selectedQueues.length === 0 || party.length <= maxPartySize;
 
+  // Show connection status at the top
+  const showConnectionStatus = isConnecting || connectionError || !room;
+
   return (
     <div className="lobby">
       <div className="lobby-header">
@@ -692,6 +707,21 @@ function Lobby() {
           ← Back to Dashboard
         </button>
       </div>
+
+      {showConnectionStatus && (
+        <div className={`connection-status ${isConnecting ? 'connecting' : connectionError ? 'error' : 'waiting'}`}>
+          {isConnecting && <div className="connection-message">🔄 Connecting to server...</div>}
+          {connectionError && !isConnecting && (
+            <div className="connection-message error">
+              ❌ Connection error: {connectionError}
+              <button onClick={clearConnectionError} className="retry-button">Dismiss</button>
+            </div>
+          )}
+          {!room && !isConnecting && !connectionError && (
+            <div className="connection-message">⏳ Waiting for connection...</div>
+          )}
+        </div>
+      )}
 
       {error && <div className="error-message">{error}</div>}
 
