@@ -988,12 +988,20 @@ function createGroundEffect(groundEffectVfxDef, position, scene, name) {
       );
       
       setTimeout(() => {
+        // MEMORY FIX: Dispose material before mesh to prevent leak
+        if (groundMesh.material && !groundMesh.material.isDisposed) {
+          groundMesh.material.dispose();
+        }
         groundMesh.dispose();
       }, fadeDuration);
     }, fadeStart);
   } else if (groundEffectVfxDef.duration) {
     // Clean up after duration
     setTimeout(() => {
+      // MEMORY FIX: Dispose material before mesh to prevent leak
+      if (groundMesh.material && !groundMesh.material.isDisposed) {
+        groundMesh.material.dispose();
+      }
       groundMesh.dispose();
     }, groundEffectVfxDef.duration);
   }
@@ -1231,6 +1239,10 @@ export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime
             if (particleSystem) {
               particleSystem.dispose();
             }
+            // MEMORY FIX: Dispose material before mesh to prevent leak
+            if (projectileMesh.material && !projectileMesh.material.isDisposed) {
+              projectileMesh.material.dispose();
+            }
             projectileMesh.dispose();
             if (impactVfx) {
               const impactDelay = impactVfx.delayMs || 0;
@@ -1382,6 +1394,10 @@ function createHealCircle(position, scene, config = {}) {
     // Clean up when done
     if (progress >= 1.0) {
       scene.onBeforeRenderObservable.remove(observer);
+      // MEMORY FIX: Dispose material before mesh to prevent leak
+      if (material && !material.isDisposed) {
+        material.dispose();
+      }
       circleMesh.dispose();
     }
   });
@@ -1920,12 +1936,16 @@ function createRunicMotes(projectileMesh, scene, name) {
         material.alpha = 0.4 * (1 - (elapsed - fadeTime) / fadeTime);
         if (material.alpha <= 0) {
           scene.onBeforeRenderObservable.remove(observer);
+          // MEMORY FIX: Dispose material before mesh to prevent leak
+          if (material && !material.isDisposed) {
+            material.dispose();
+          }
           mote.dispose();
         }
       }
     });
     
-    motes.push({ mote, observer });
+    motes.push({ mote, observer, material });
   }
   
   return motes;
@@ -1970,6 +1990,10 @@ function createArcaneImpact(position, scene, name) {
       coreGlow.scaling = new Vector3(1.0 + progress * 0.15, 1.0 + progress * 0.15, 1.0 + progress * 0.15);
     } else {
       scene.onBeforeRenderObservable.remove(coreObserver);
+      // MEMORY FIX: Dispose material before mesh to prevent leak
+      if (coreMaterial && !coreMaterial.isDisposed) {
+        coreMaterial.dispose();
+      }
       coreGlow.dispose();
     }
   });
@@ -2042,6 +2066,10 @@ function createArcaneImpact(position, scene, name) {
     
     if (progress >= 1.0) {
       scene.onBeforeRenderObservable.remove(ringObserver);
+      // MEMORY FIX: Dispose material before mesh to prevent leak
+      if (ringMaterial && !ringMaterial.isDisposed) {
+        ringMaterial.dispose();
+      }
       ring.dispose();
     }
   });
@@ -2278,8 +2306,12 @@ export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStar
           
           // Third: Clean up motes
           if (core.metadata.motes) {
-            core.metadata.motes.forEach(({ observer, mote }) => {
+            core.metadata.motes.forEach(({ observer, mote, material }) => {
               if (observer) scene.onBeforeRenderObservable.remove(observer);
+              // MEMORY FIX: Dispose material before mesh to prevent leak
+              if (material && !material.isDisposed) {
+                material.dispose();
+              }
               if (mote && !mote.isDisposed()) mote.dispose();
             });
             core.metadata.motes = null;
@@ -2295,8 +2327,20 @@ export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStar
           core.metadata = null;
         }
         
-        // Finally: Dispose core mesh
+        // Finally: Dispose core mesh and its material
         if (core && !core.isDisposed()) {
+          // MEMORY FIX: Dispose material before mesh to prevent leak
+          if (core.material && !core.material.isDisposed) {
+            core.material.dispose();
+          }
+          // Also dispose materials on child meshes (for GLB models)
+          if (core.getChildMeshes) {
+            core.getChildMeshes().forEach(child => {
+              if (child.material && !child.material.isDisposed) {
+                child.material.dispose();
+              }
+            });
+          }
           core.dispose();
         }
         

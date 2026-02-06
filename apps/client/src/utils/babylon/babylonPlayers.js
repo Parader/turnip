@@ -263,11 +263,16 @@ export function buildPlayerCharacters(scene, gameState, userId, mapWidth, mapHei
 
   // Store player meshes and animation groups in scene metadata for updates
   if (!scene.metadata) {
-    scene.metadata = { 
-      playerMeshes: new Map(),
-      playerAnimationGroups: new Map(),
-      modelCache: new Map() // Cache loaded models to avoid reloading
-    };
+    scene.metadata = {};
+  }
+  if (!scene.metadata.playerMeshes) {
+    scene.metadata.playerMeshes = new Map();
+  }
+  if (!scene.metadata.playerAnimationGroups) {
+    scene.metadata.playerAnimationGroups = new Map();
+  }
+  if (!scene.metadata.modelCache) {
+    scene.metadata.modelCache = new Map(); // Cache loaded models to avoid reloading
   }
 
   // Clear existing player meshes

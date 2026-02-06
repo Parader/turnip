@@ -1,6 +1,7 @@
 # Phase 1 Implementation Summary
 
 ## ✅ Completed Features
+"Realistic Trees Collection" (https://skfb.ly/pDzJR) by Jungle Jim is licensed under Creative Commons Attribution (http://creativecommons.org/licenses/by/4.0/).
 
 ### 1. Status Effects System
 - **StatusEffectState Schema**: Added new schema class for tracking status effects

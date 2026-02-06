@@ -2222,53 +2222,79 @@ export class GameRoom extends Room {
     const userId = client.userId;
     const team = this.userTeams.get(userId);
     
-    if (!team || this.state.phase !== GAME_PHASES.PREPARATION) {
+    if (!team) {
+      console.warn(`Player ${userId} tried to ready but team not found in userTeams`);
+      return;
+    }
+    
+    if (this.state.phase !== GAME_PHASES.PREPARATION) {
+      console.log(`Player ${userId} tried to ready but phase is ${this.state.phase}`);
       return;
     }
 
     const teamState = team === 'A' ? this.state.teamA : this.state.teamB;
     const player = teamState.players.get(userId);
     
-    if (player) {
-      // Toggle ready state based on message
-      // If message.ready is explicitly false, set to false
-      // Otherwise, toggle the current state
-      if (message.ready === false) {
-        player.ready = false;
-      } else if (message.ready === true) {
-        player.ready = true;
-      } else {
-        // If not specified, toggle
-        player.ready = !player.ready;
-      }
-      
-      console.log(`Player ${userId} ready status: ${player.ready}`);
-      this.broadcastFilteredState();
-
-      // Check if all players are ready and start game
-      this.checkAllPlayersReady();
+    if (!player) {
+      console.warn(`Player ${userId} tried to ready but not found in team ${team} players`);
+      return;
     }
+    
+    // Toggle ready state based on message
+    if (message.ready === false) {
+      player.ready = false;
+    } else if (message.ready === true) {
+      player.ready = true;
+    } else {
+      player.ready = !player.ready;
+    }
+    
+    console.log(`Player ${userId} ready status: ${player.ready}`);
+    this.broadcastFilteredState();
+
+    // Check if all players are ready and start game
+    this.checkAllPlayersReady();
   }
 
   /**
    * Check if all players are ready and start the game
    */
   checkAllPlayersReady() {
+    const teamASize = this.state.teamA.players.size;
+    const teamBSize = this.state.teamB.players.size;
+    
+    // Determine expected team size based on queue type
+    const expectedPlayersPerTeam = this.state.queueType === '2v2' ? 2 : 1;
+    
+    // Don't start if teams aren't fully populated
+    if (teamASize < expectedPlayersPerTeam || teamBSize < expectedPlayersPerTeam) {
+      console.log(`Waiting for players: Team A ${teamASize}/${expectedPlayersPerTeam}, Team B ${teamBSize}/${expectedPlayersPerTeam}`);
+      return;
+    }
+    
     // Check if all players in both teams are ready
     let allTeamAReady = true;
     let allTeamBReady = true;
+    let teamAReadyCount = 0;
+    let teamBReadyCount = 0;
 
     this.state.teamA.players.forEach((player) => {
       if (!player.ready) {
         allTeamAReady = false;
+      } else {
+        teamAReadyCount++;
       }
     });
 
     this.state.teamB.players.forEach((player) => {
       if (!player.ready) {
         allTeamBReady = false;
+      } else {
+        teamBReadyCount++;
       }
     });
+
+    console.log(`Ready check: Team A ${teamAReadyCount}/${teamASize}, Team B ${teamBReadyCount}/${teamBSize}`);
 
     if (allTeamAReady && allTeamBReady) {
       console.log(`All players ready, starting game for match ${this.state.matchId}`);

@@ -88,7 +88,9 @@ process.on('SIGTERM', shutdown);
 
 // Define Colyseus rooms
 const friendRoomDefinition = gameServer.define('friendRoom', FriendRoom);
-const gameRoomDefinition = gameServer.define('gameRoom', GameRoom);
+// filterBy matchId ensures players with the same matchId join the same room
+const gameRoomDefinition = gameServer.define('gameRoom', GameRoom)
+  .filterBy(['matchId']);
 
 // Listen for room creation to store instance
 friendRoomDefinition.on('create', (room) => {

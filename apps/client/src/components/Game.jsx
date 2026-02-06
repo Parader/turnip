@@ -8,9 +8,11 @@ import { babylonToServerOrientation } from '../utils/babylon/babylonPlayers';
 import { Vector3 } from '@babylonjs/core';
 import { getMap, getClassSpells } from '../utils/api';
 import { connectToGameRoom } from '../utils/colyseus';
+import { preloadGameAssets } from '../utils/assetLoader';
 import GameDataPanel from './GameDataPanel';
 import TurnOrderDisplay from './TurnOrderDisplay';
 import SpellActionBar from './SpellActionBar';
+import LoadingScreen from './LoadingScreen';
 import '../styles/game.scss';
 
 const MATCH_INFO_KEY = 'currentMatchInfo';
@@ -31,6 +33,10 @@ const Game = () => {
   const [showGameDataPanel, setShowGameDataPanel] = useState(false);
   const [selectedSpell, setSelectedSpell] = useState(null);
   const [spellDefs, setSpellDefs] = useState({});
+  const [assetsLoaded, setAssetsLoaded] = useState(false);
+  const [sceneReady, setSceneReady] = useState(false); // True when all scene assets (ground, trees) are loaded
+  const [loadingProgress, setLoadingProgress] = useState(0);
+  const [loadingMessage, setLoadingMessage] = useState('Loading game assets...');
   const canvasRef = useRef(null);
   const babylonResourcesRef = useRef(null);
   const gameRoomRef = useRef(null);
@@ -207,22 +213,88 @@ const Game = () => {
     }
   }, [friendRoom, user, matchInfo]);
 
-  // Initialize Babylon.js 3D scene when canvas and map data are ready
+  // Preload assets when map data is ready (before Babylon scene creation)
   useEffect(() => {
-    if (!canvasRef.current || !mapData || !matchInfo || !user) return;
-
+    if (!mapData || !matchInfo || !user) return;
+    if (assetsLoaded) return; // Already loaded
+    
+    let cancelled = false;
+    
+    const loadAssets = async () => {
+      try {
+        // Preload all game assets by fetching them into browser cache
+        await preloadGameAssets((progress) => {
+          if (!cancelled) {
+            setLoadingProgress(progress);
+          }
+        });
+        
+        if (!cancelled) {
+          setAssetsLoaded(true);
+        }
+      } catch (err) {
+        console.error('Failed to preload assets:', err);
+        if (!cancelled) {
+          // Continue without preloaded assets (they'll load during scene creation)
+          setAssetsLoaded(true);
+        }
+      }
+    };
+    
+    loadAssets();
+    
+    return () => {
+      cancelled = true;
+    };
+  }, [mapData, matchInfo, user, assetsLoaded]);
+  
+  // Initialize Babylon.js 3D scene when assets are loaded
+  useEffect(() => {
+    if (!canvasRef.current || !mapData || !matchInfo || !user || !assetsLoaded) return;
+    
+    let cancelled = false;
+    
+    // Reset sceneReady when scene is being (re)created
+    setSceneReady(false);
+    
     // Create Babylon.js 3D scene with map and initial game state
-    const babylonResources = createBabylonScene(canvasRef.current, mapData, matchInfo, user.id, gameState);
+    // Assets will load from browser cache (already preloaded)
+    setLoadingMessage('Building game world...');
+    const babylonResources = createBabylonScene(
+      canvasRef.current, 
+      mapData, 
+      matchInfo, 
+      user.id, 
+      gameState
+    );
     babylonResourcesRef.current = babylonResources;
+    
+    // Wait for map assets (ground, trees) to finish loading before showing the scene
+    if (babylonResources.mapLoadPromise) {
+      babylonResources.mapLoadPromise.then(() => {
+        if (!cancelled) {
+          setSceneReady(true);
+        }
+      }).catch(() => {
+        if (!cancelled) {
+          // Still mark as ready even on error so the game can proceed
+          setSceneReady(true);
+        }
+      });
+    } else {
+      // No map load promise, scene is ready immediately
+      setSceneReady(true);
+    }
 
     // Cleanup on unmount
     return () => {
+      cancelled = true;
       if (babylonResourcesRef.current) {
         disposeBabylonScene(babylonResourcesRef.current);
         babylonResourcesRef.current = null;
       }
     };
-  }, [mapData, matchInfo, user]);
+  }, [mapData, matchInfo, user, assetsLoaded]);
 
   // Update player positions when game state changes
   useEffect(() => {
@@ -633,11 +705,18 @@ const Game = () => {
 
   return (
     <div className="game-container-full">
+      {/* Canvas must always be rendered so ref is available for Babylon.js initialization */}
       <canvas 
         ref={canvasRef} 
         className="game-canvas-3d"
+        style={{ visibility: sceneReady ? 'visible' : 'hidden' }}
       />
-      <div className="game-ui-overlay">
+      
+      {/* Show loading screen overlay until scene is fully ready */}
+      {!sceneReady && <LoadingScreen progress={loadingProgress} message={loadingMessage} />}
+      
+      {/* Game UI - only visible when scene is ready */}
+      <div className="game-ui-overlay" style={{ visibility: sceneReady ? 'visible' : 'hidden' }}>
         <button className="leave-game-btn" onClick={handleLeaveGame}>
           Leave Game
         </button>

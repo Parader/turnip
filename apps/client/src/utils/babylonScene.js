@@ -149,16 +149,18 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   let allStartPositionTiles = []; // Store all starting position tiles (player + enemy) for visibility control
   let playerStartMaterial = null;
   let enemyStartMaterial = null;
-  let createTileMaterial = null;
+  let neutralTileMaterial = null; // Pre-made material for resetting starting tiles after preparation
   let allTiles = new Map(); // Store all tiles for movement range highlighting
+  let mapLoadPromise = Promise.resolve(); // Default to resolved promise if no map
   if (mapData && terrain.length > 0) {
     const mapResult = build3DMap(scene, terrain, mapWidth, mapHeight, mapData.startZones, playerTeam, enemyTeam, userId, gameState);
     startPositionTiles = mapResult.interactiveTiles;
     allStartPositionTiles = mapResult.allStartTiles;
     playerStartMaterial = mapResult.playerStartMaterial;
     enemyStartMaterial = mapResult.enemyStartMaterial;
-    createTileMaterial = mapResult.createTileMaterial;
+    neutralTileMaterial = mapResult.neutralTileMaterial;
     allTiles = mapResult.allTiles;
+    mapLoadPromise = mapResult.mapLoadPromise; // Promise that resolves when all map assets are loaded
     
     // Store terrain data in scene metadata for pathfinding during movement animation
     if (!scene.metadata) {
@@ -178,6 +180,9 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   let selectedSpell = null; // Currently selected spell for casting
   let selectedSpellDef = null; // Spell definition
   let isCasting = false; // Track if currently casting (prevents movement during cast animation)
+  
+  // Track phase for phase transition handling
+  let previousPhase = gameState?.phase || 'preparation';
 
   // Build player characters (spheres) if game state is available
   if (gameState) {
@@ -1155,6 +1160,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     scene, 
     camera, 
     handleResize, 
+    mapLoadPromise, // Promise that resolves when all map assets (ground, trees) are loaded
     recordSpellHit: (targetUserId, hitDelayMs, hitCount) => {
       recordCombatTextHit(scene, targetUserId, hitDelayMs, hitCount);
     },
@@ -1162,6 +1168,22 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       // Function to update player positions when game state changes
       if (newGameState) {
         currentGameState = newGameState; // Update current game state reference
+        
+        // Handle phase transition from preparation to game
+        // Reset starting position tiles to normal appearance so they don't show blue during game
+        if (previousPhase === 'preparation' && newGameState.phase === 'game') {
+          allStartPositionTiles.forEach(tile => {
+            // Reset material to neutral transparent tile
+            if (neutralTileMaterial) {
+              tile.material = neutralTileMaterial;
+            }
+            // Clear originalMaterial so future hovers capture the correct (normal) material
+            if (tile.userData) {
+              delete tile.userData.originalMaterial;
+            }
+          });
+        }
+        previousPhase = newGameState.phase;
         
         // Store game state in scene metadata for movement animation
         if (!scene.metadata) {
@@ -1318,8 +1340,8 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         
         // Update starting position tiles material based on phase
         // During preparation: show colored tiles (blue/red)
-        // During game: show as regular tiles
-        if (playerStartMaterial && enemyStartMaterial && createTileMaterial) {
+        // During game: show as regular tiles (neutral transparent)
+        if (playerStartMaterial && enemyStartMaterial && neutralTileMaterial) {
           const isPreparationPhase = newGameState.phase === 'preparation';
           allStartPositionTiles.forEach(tile => {
             // Check if this is a player start tile or enemy start tile from userData
@@ -1342,12 +1364,8 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                   tile.material = enemyStartMaterial;
                 }
               } else {
-                // Always change to regular tile material during game phase
-                const isLight = (tile.userData?.tileX + tile.userData?.tileY) % 2 === 0;
-                const baseColor = isLight 
-                  ? new Color3(0.83, 0.65, 0.45) // Light beige
-                  : new Color3(0.72, 0.58, 0.42); // Dark beige
-                tile.material = createTileMaterial(baseColor, scene);
+                // Use neutral transparent tile material during game phase
+                tile.material = neutralTileMaterial;
               }
             }
           });
