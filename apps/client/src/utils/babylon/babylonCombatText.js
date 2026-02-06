@@ -516,6 +516,9 @@ export function initCombatTextSystem(scene, camera) {
     return;
   }
 
+  // Store observer reference for cleanup
+  let updateObserver = null;
+
   const combatText = {
     pool: [],
     active: [],
@@ -529,7 +532,8 @@ export function initCombatTextSystem(scene, camera) {
     expectedHits: new Map(),
     tempVec: new Vector3(),
     camera,
-    initializedUnits: new Set()
+    initializedUnits: new Set(),
+    updateObserver: null
   };
 
   for (let i = 0; i < COMBAT_TEXT_CONFIG.poolSize; i += 1) {
@@ -538,11 +542,79 @@ export function initCombatTextSystem(scene, camera) {
 
   scene.metadata.combatText = combatText;
 
-  scene.onBeforeRenderObservable.add(() => {
+  updateObserver = scene.onBeforeRenderObservable.add(() => {
     const now = Date.now();
     flushCombatTextAggregates(scene, now);
     updateCombatTextSystem(scene, now);
   });
+  
+  combatText.updateObserver = updateObserver;
+}
+
+/**
+ * Dispose the combat text system and clean up all resources
+ * Call this when disposing the scene
+ * @param {Scene} scene - Babylon.js scene
+ */
+export function disposeCombatTextSystem(scene) {
+  if (!scene.metadata || !scene.metadata.combatText) {
+    return;
+  }
+  
+  const combatText = scene.metadata.combatText;
+  
+  // Remove the update observer
+  if (combatText.updateObserver) {
+    scene.onBeforeRenderObservable.remove(combatText.updateObserver);
+    combatText.updateObserver = null;
+  }
+  
+  // Dispose all pooled meshes (including textures and materials)
+  combatText.pool.forEach(mesh => {
+    if (mesh && !mesh.isDisposed()) {
+      if (mesh.metadata) {
+        if (mesh.metadata.texture && !mesh.metadata.texture.isDisposed) {
+          mesh.metadata.texture.dispose();
+        }
+        if (mesh.metadata.material && !mesh.metadata.material.isDisposed) {
+          mesh.metadata.material.dispose();
+        }
+      }
+      mesh.dispose();
+    }
+  });
+  combatText.pool.length = 0;
+  
+  // Dispose all active combat text meshes
+  combatText.active.forEach(entry => {
+    if (entry.mesh && !entry.mesh.isDisposed()) {
+      if (entry.mesh.metadata) {
+        if (entry.mesh.metadata.texture && !entry.mesh.metadata.texture.isDisposed) {
+          entry.mesh.metadata.texture.dispose();
+        }
+        if (entry.mesh.metadata.material && !entry.mesh.metadata.material.isDisposed) {
+          entry.mesh.metadata.material.dispose();
+        }
+      }
+      entry.mesh.dispose();
+    }
+  });
+  combatText.active.length = 0;
+  
+  // Clear all maps
+  combatText.pending.clear();
+  combatText.pendingDamage.clear();
+  combatText.targetStacks.clear();
+  combatText.lastUnits.clear();
+  combatText.hitTimes.clear();
+  combatText.hitDelays.clear();
+  combatText.expectedHits.clear();
+  combatText.initializedUnits.clear();
+  
+  // Remove reference
+  scene.metadata.combatText = null;
+  
+  console.log('[CombatText] System disposed');
 }
 
 /**

@@ -10,6 +10,14 @@ import '@babylonjs/loaders/glTF';
 import { createDiamondTexture, createLineStreakTexture } from './babylonVfx';
 
 /**
+ * Dispose teleport cache (placeholder for compatibility)
+ * Particle textures are not cached since ParticleSystems dispose them.
+ */
+export function disposeTeleportCache(scene) {
+  // No-op: Particle textures are created per-use and disposed with their particle systems
+}
+
+/**
  * Teleport VFX Controller - Phase-based state machine
  */
 export class TeleportVFXController {
@@ -736,7 +744,8 @@ export class TeleportVFXController {
   }
   
   /**
-   * Create vertical line texture for particles (TEST)
+   * Create vertical line texture for particles
+   * NOTE: Particle textures are NOT cached because ParticleSystems dispose their textures.
    */
   createVerticalLineTexture() {
     const size = 64;

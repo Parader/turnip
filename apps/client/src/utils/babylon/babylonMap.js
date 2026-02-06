@@ -3,8 +3,375 @@
  * Handles 3D map construction from terrain data
  */
 
-import { MeshBuilder, StandardMaterial, Color3, Vector3, Material, Texture, DynamicTexture, Animation } from '@babylonjs/core';
+import { MeshBuilder, StandardMaterial, Color3, Vector3, Material, Texture, DynamicTexture, Animation, Mesh, SceneLoader, VertexData, Matrix } from '@babylonjs/core';
+import '@babylonjs/loaders/glTF';
 import { TILE_TYPES } from '../mapRenderer';
+
+/**
+ * Scatter trees on the skirt around the map
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Object} skirtBounds - Map bounds {mapCenterX, mapCenterZ, mapHalfWidth, mapHalfHeight}
+ * @param {Object} options - {modelFile, treeCount, minDistance, maxDistance, minScale, maxScale, groundY, seed}
+ */
+async function scatterTrees(scene, skirtBounds, options = {}) {
+  const {
+    modelFile = 'tree1.glb',
+    treeCount = 50,
+    minDistance = 10,
+    maxDistance = 60,
+    minScale = 1.0,
+    maxScale = 1.0,
+    groundY = -0.25,
+    seed = 42069
+  } = options;
+  
+  const { mapCenterX, mapCenterZ, mapHalfWidth, mapHalfHeight } = skirtBounds;
+  const treeName = modelFile.replace('.glb', '');
+  
+  try {
+    const result = await SceneLoader.ImportMeshAsync('', '/assets/decor/', modelFile, scene);
+    
+    const meshes = result.meshes.filter(m => m.name !== '__root__' && m.getTotalVertices() > 0);
+    
+    if (meshes.length === 0) {
+      console.warn(`[Trees] No meshes found in ${modelFile}`);
+      return { treeInstances: [], instanceCount: 0 };
+    }
+    
+    // Hide source meshes
+    meshes.forEach(m => {
+      m.isVisible = false;
+      m.setEnabled(false);
+    });
+    
+    // Seeded random for consistent placement
+    let currentSeed = seed;
+    const random = () => {
+      currentSeed = (currentSeed * 9301 + 49297) % 233280;
+      return currentSeed / 233280;
+    };
+    
+    // Generate positions in ring around map
+    const positions = [];
+    const distanceRange = maxDistance - minDistance;
+    const keepOutX = mapHalfWidth + minDistance;
+    const keepOutZ = mapHalfHeight + minDistance;
+    const outerX = mapHalfWidth + maxDistance;
+    const outerZ = mapHalfHeight + maxDistance;
+    
+    let attempts = 0;
+    while (positions.length < treeCount && attempts < treeCount * 20) {
+      attempts++;
+      
+      const x = mapCenterX + (random() * 2 - 1) * outerX;
+      const z = mapCenterZ + (random() * 2 - 1) * outerZ;
+      
+      // Skip if too close to map
+      if (Math.abs(x - mapCenterX) < keepOutX && Math.abs(z - mapCenterZ) < keepOutZ) continue;
+      
+      // Skip if too close to another tree
+      if (positions.some(p => Math.hypot(p.x - x, p.z - z) < 4)) continue;
+      
+      // Calculate scale based on distance
+      const dist = Math.max(Math.abs(x - mapCenterX) - mapHalfWidth, Math.abs(z - mapCenterZ) - mapHalfHeight);
+      const t = Math.min(1, Math.max(0, (dist - minDistance) / distanceRange));
+      const baseScale = minScale + t * (maxScale - minScale);
+      const scale = baseScale * (0.7 + random() * 0.6); // ±30% variation
+      
+      // Random rotation and slight tilt
+      const rotationY = random() * Math.PI * 2;
+      const tiltX = (random() - 0.5) * 0.1;
+      const tiltZ = (random() - 0.5) * 0.1;
+      
+      positions.push({ x, z, scale, rotationY, tiltX, tiltZ });
+    }
+    
+    // Get mesh bounds for ground positioning
+    const meshMinY = meshes[0].getBoundingInfo().boundingBox.minimumWorld.y;
+    
+    // Clone trees at each position
+    const treeInstances = [];
+    const maxTrees = Math.min(positions.length, 100);
+    
+    for (let i = 0; i < maxTrees; i++) {
+      const pos = positions[i];
+      
+      meshes.forEach((sourceMesh, j) => {
+        const clone = sourceMesh.clone(`${treeName}_${i}_${j}`);
+        if (!clone) return;
+        
+        clone.parent = null;
+        clone.scaling = new Vector3(pos.scale, pos.scale, pos.scale);
+        clone.position = new Vector3(pos.x, groundY - meshMinY * pos.scale, pos.z);
+        clone.rotationQuaternion = null;
+        clone.rotation = new Vector3(pos.tiltX || 0, pos.rotationY, pos.tiltZ || 0);
+        clone.setEnabled(true);
+        clone.isVisible = true;
+        clone.isPickable = false;
+        clone.applyFog = true;
+        
+        treeInstances.push(clone);
+      });
+    }
+    
+    console.log(`[Trees] Placed ${maxTrees} ${treeName}`);
+    
+    return {
+      treeInstances,
+      instanceCount: maxTrees,
+      dispose: () => {
+        treeInstances.forEach(t => t.dispose());
+        result.meshes.forEach(m => m.dispose());
+      }
+    };
+    
+  } catch (error) {
+    console.error(`[Trees] Failed to load ${modelFile}:`, error);
+    return { treeInstances: [], instanceCount: 0 };
+  }
+}
+
+/**
+ * Detect contiguous regions of solid terrain (TILE + WALL) using flood fill
+ * @param {Array<Array<number>>} terrain - 2D array of tile types
+ * @returns {Array<Set<string>>} Array of regions, each region is a Set of "x_y" tile keys
+ */
+function detectSolidTerrainRegions(terrain) {
+  const mapHeight = terrain.length;
+  const mapWidth = terrain[0]?.length || 0;
+  const visited = new Set();
+  const regions = [];
+  
+  // Check if a tile is solid terrain (TILE or WALL)
+  const isSolidTerrain = (x, y) => {
+    if (y < 0 || y >= mapHeight || x < 0 || x >= mapWidth) return false;
+    const tileType = terrain[y][x];
+    return tileType === TILE_TYPES.TILE || tileType === TILE_TYPES.WALL;
+  };
+  
+  // Flood fill from a starting position
+  const floodFill = (startX, startY) => {
+    const region = new Set();
+    const queue = [{ x: startX, y: startY }];
+    
+    while (queue.length > 0) {
+      const { x, y } = queue.shift();
+      const key = `${x}_${y}`;
+      
+      if (visited.has(key)) continue;
+      if (!isSolidTerrain(x, y)) continue;
+      
+      visited.add(key);
+      region.add(key);
+      
+      // Check orthogonal neighbors (no diagonals)
+      queue.push({ x: x + 1, y: y }); // right
+      queue.push({ x: x - 1, y: y }); // left
+      queue.push({ x: x, y: y + 1 }); // down
+      queue.push({ x: x, y: y - 1 }); // up
+    }
+    
+    return region;
+  };
+  
+  // Scan all tiles and detect regions
+  for (let y = 0; y < mapHeight; y++) {
+    for (let x = 0; x < mapWidth; x++) {
+      const key = `${x}_${y}`;
+      if (!visited.has(key) && isSolidTerrain(x, y)) {
+        const region = floodFill(x, y);
+        if (region.size > 0) {
+          regions.push(region);
+        }
+      }
+    }
+  }
+  
+  return regions;
+}
+
+/**
+ * Create 1x1 ground tiles for each tile in the region
+ * All tiles same size = no visible scale differences
+ * @param {Set<string>} region - Set of "x_y" tile keys
+ * @returns {Array<Object>} Array of 1x1 squares
+ */
+function findRegionRectangles(region) {
+  if (region.size === 0) return [];
+  
+  const squares = [];
+  
+  // Create one 1x1 ground piece per tile
+  region.forEach(key => {
+    const [x, y] = key.split('_').map(Number);
+    
+    squares.push({
+      minX: x,
+      maxX: x,
+      minY: y,
+      maxY: y,
+      width: 1,
+      height: 1,
+      centerX: x,
+      centerZ: y
+    });
+  });
+  
+  return squares;
+}
+
+/**
+ * Build continuous ground terrain underneath the map using ground.glb
+ * Creates multiple ground pieces that follow the actual terrain shape (avoids water/empty)
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Array<Array<number>>} terrain - 2D array of tile types
+ * @param {number} mapWidth - Width of the map
+ * @param {number} mapHeight - Height of the map
+ * @param {Mesh} mapContainer - Parent container for ground meshes
+ * @returns {Object} Ground building result with meshes (async loading)
+ */
+export function buildGroundTerrain(scene, terrain, mapWidth, mapHeight, mapContainer) {
+  const tileSize = 1;
+  const groundMeshes = [];
+  const groundY = -0.05; // Slightly below gameplay tiles
+  
+  // Detect contiguous regions of solid terrain
+  const regions = detectSolidTerrainRegions(terrain);
+  
+  console.log(`Ground terrain: detected ${regions.length} solid terrain region(s)`);
+  
+  if (regions.length === 0) {
+    return {
+      groundMeshes: [],
+      regionCount: 0
+    };
+  }
+  
+  // Find all rectangles needed (across all regions)
+  const allRectangles = [];
+  regions.forEach((region, regionIndex) => {
+    const rectangles = findRegionRectangles(region);
+    rectangles.forEach(rect => {
+      rect.regionIndex = regionIndex;
+      allRectangles.push(rect);
+    });
+    console.log(`Region ${regionIndex}: ${region.size} tiles -> ${rectangles.length} rectangles`);
+  });
+  
+  console.log(`Ground terrain: total ${allRectangles.length} ground rectangles to create`);
+  
+  if (allRectangles.length === 0) {
+    return {
+      groundMeshes: [],
+      regionCount: regions.length
+    };
+  }
+  
+  // Possible rotations (0°, 90°, 180°, 270°) for visual variety
+  const rotations = [0, Math.PI / 2, Math.PI, Math.PI * 1.5];
+  
+  // Load both ground.glb and ground2.glb models for variety
+  Promise.all([
+    SceneLoader.ImportMeshAsync('', '/assets/', 'ground.glb', scene),
+    SceneLoader.ImportMeshAsync('', '/assets/', 'ground2.glb', scene)
+  ]).then(([result1, result2]) => {
+    const groundModels = [result1.meshes[0], result2.meshes[0]];
+    
+    // Hide the original models (we'll clone them for each rectangle)
+    groundModels.forEach(model => model.setEnabled(false));
+    
+    // Get bounds for each model to calculate scaling
+    const modelData = groundModels.map((model, i) => {
+      const bounds = model.getHierarchyBoundingVectors();
+      const width = bounds.max.x - bounds.min.x;
+      const depth = bounds.max.z - bounds.min.z;
+      console.log(`Ground GLB ${i + 1} loaded: original size ${width.toFixed(2)} x ${depth.toFixed(2)}`);
+      return { model, width, depth };
+    });
+    
+    // Create a ground instance for each rectangle
+    allRectangles.forEach((rect, index) => {
+      // Calculate required size in world units
+      const requiredWidth = rect.width * tileSize;
+      const requiredDepth = rect.height * tileSize;
+      
+      // Randomly choose between the two ground models
+      const modelIndex = Math.floor(Math.random() * 2);
+      const { model, width: originalWidth, depth: originalDepth } = modelData[modelIndex];
+      
+      // Clone the model for this rectangle
+      const rectGround = model.clone(`ground_r${rect.regionIndex}_${index}`, null);
+      rectGround.setEnabled(true);
+      
+      // Enable all child meshes
+      rectGround.getChildMeshes().forEach(child => {
+        child.setEnabled(true);
+        child.isPickable = false;
+      });
+      
+      // Calculate scale to fit the rectangle
+      const scaleX = requiredWidth / originalWidth;
+      const scaleZ = requiredDepth / originalDepth;
+      
+      // Apply scaling
+      rectGround.scaling = new Vector3(scaleX, 1, scaleZ);
+      
+      // Position at rectangle center
+      rectGround.position = new Vector3(rect.centerX, groundY, rect.centerZ);
+      
+      // Apply random rotation (one of 4 directions) for visual variety
+      // Clear quaternion so euler rotation works (GLB models use quaternion by default)
+      rectGround.rotationQuaternion = null;
+      const rotationIndex = Math.floor(Math.random() * 4);
+      rectGround.rotation.y = rotations[rotationIndex];
+      
+      // Make not pickable
+      rectGround.isPickable = false;
+      
+      groundMeshes.push(rectGround);
+    });
+    
+    console.log(`Created ${groundMeshes.length} ground meshes (using 2 ground variants)`);
+    
+    // Dispose the original hidden models
+    groundModels.forEach(model => model.dispose());
+    
+  }).catch((error) => {
+    console.error('Failed to load ground GLB models:', error);
+    
+    // Fallback: create simple ground planes
+    allRectangles.forEach((rect, index) => {
+      const requiredWidth = rect.width * tileSize;
+      const requiredDepth = rect.height * tileSize;
+      
+      const fallbackGround = MeshBuilder.CreateGround(`ground_fallback_${index}`, {
+        width: requiredWidth,
+        height: requiredDepth
+      }, scene);
+      
+      fallbackGround.position = new Vector3(rect.centerX, groundY, rect.centerZ);
+      
+      // Apply random rotation for visual variety
+      const rotationIndex = Math.floor(Math.random() * 4);
+      fallbackGround.rotation.y = rotations[rotationIndex];
+      
+      const fallbackMaterial = new StandardMaterial(`groundMaterial_${index}`, scene);
+      fallbackMaterial.diffuseColor = new Color3(0.5, 0.4, 0.3);
+      fallbackMaterial.emissiveColor = new Color3(0.15, 0.1, 0.08);
+      fallbackGround.material = fallbackMaterial;
+      fallbackGround.isPickable = false;
+      
+      groundMeshes.push(fallbackGround);
+    });
+    
+    console.log(`Created ${groundMeshes.length} fallback ground meshes`);
+  });
+  
+  return {
+    groundMeshes,
+    regionCount: regions.length
+  };
+}
 
 /**
  * Builds a 3D representation of the map terrain
@@ -43,36 +410,39 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
     }
   }
 
-  // Base tile material - transparent
+  // Base tile material - fully transparent with wireframe outline
   const createTileMaterial = (color, scene) => {
     const material = new StandardMaterial('tileMaterial', scene);
-    material.diffuseColor = color;
-    material.alpha = 0.3; // Transparent
-    material.wireframe = false;
-    material.emissiveColor = color.scale(0.2); // Slight glow
+    material.diffuseColor = new Color3(0, 0, 0); // Black (invisible when alpha is 0)
+    material.alpha = 0; // Fully transparent
+    material.wireframe = true; // Show outline only
+    material.emissiveColor = color.scale(0.5); // Outline color based on tile color
+    material.disableLighting = true; // Ensure outline is always visible
     return material;
   };
 
-  // Starting position materials
+  // Starting position materials - filled tiles visible during preparation phase
   const playerStartMaterial = new StandardMaterial('playerStartMaterial', scene);
   playerStartMaterial.diffuseColor = new Color3(0.2, 0.4, 1.0); // Blue
-  playerStartMaterial.emissiveColor = new Color3(0.2, 0.4, 1.0);
-  playerStartMaterial.alpha = 0.6;
+  playerStartMaterial.emissiveColor = new Color3(0.2, 0.4, 0.8); // Blue glow
+  playerStartMaterial.alpha = 0.5; // Semi-transparent fill
+  playerStartMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
 
   const enemyStartMaterial = new StandardMaterial('enemyStartMaterial', scene);
   enemyStartMaterial.diffuseColor = new Color3(1.0, 0.2, 0.2); // Red
-  enemyStartMaterial.emissiveColor = new Color3(1.0, 0.2, 0.2);
-  enemyStartMaterial.alpha = 0.6;
+  enemyStartMaterial.emissiveColor = new Color3(0.8, 0.2, 0.2); // Red glow
+  enemyStartMaterial.alpha = 0.5; // Semi-transparent fill
+  enemyStartMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
 
   // Wall material
   const wallMaterial = new StandardMaterial('wallMaterial', scene);
   wallMaterial.diffuseColor = new Color3(0.35, 0.35, 0.35); // Gray
   wallMaterial.specularColor = new Color3(0.2, 0.2, 0.2);
 
-  // Empty material
+  // Empty material - invisible (no ground underneath empty tiles)
   const emptyMaterial = new StandardMaterial('emptyMaterial', scene);
-  emptyMaterial.diffuseColor = new Color3(0.05, 0.05, 0.05); // Very dark
-  emptyMaterial.alpha = 0.1;
+  emptyMaterial.diffuseColor = new Color3(0, 0, 0);
+  emptyMaterial.alpha = 0; // Fully invisible
 
   // Brown ground/earth material for water channel base
   const waterGroundMaterial = new StandardMaterial('waterGroundMaterial', scene);
@@ -258,7 +628,24 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
   const waterAnimationData = {
     observer: waterScrollObserver,
     flowDirectionGroups: flowDirectionGroups,
-    tileFlowDirections: tileFlowDirections
+    tileFlowDirections: tileFlowDirections,
+    // Cleanup function to dispose water animation resources
+    dispose: () => {
+      // Remove the observer
+      if (waterScrollObserver) {
+        scene.onBeforeRenderObservable.remove(waterScrollObserver);
+      }
+      // Dispose textures and materials
+      flowDirectionGroups.forEach((group, flowKey) => {
+        if (group.texture && !group.texture.isDisposed) {
+          group.texture.dispose();
+        }
+        if (group.material && !group.material.isDisposed) {
+          group.material.dispose();
+        }
+      });
+      flowDirectionGroups.clear();
+    }
   };
   
   // Array to store all water meshes
@@ -267,6 +654,10 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
   // Create a parent mesh to hold all tiles
   const mapContainer = MeshBuilder.CreateBox('mapContainer', { size: 0.01 }, scene);
   mapContainer.isVisible = false;
+
+  // Build continuous ground terrain underneath the gameplay tiles
+  // This creates merged ground meshes for contiguous regions of solid terrain (TILE + WALL)
+  const groundResult = buildGroundTerrain(scene, terrain, mapWidth, mapHeight, mapContainer);
 
   // Map to store starting position tiles for interaction (player team only)
   const startPositionTiles = new Map();
@@ -369,14 +760,14 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
           height: wallHeight,
           depth: tileSize
         }, scene);
-        wall.position = new Vector3(xPos, wallHeight / 2, zPos);
+        wall.position = new Vector3(xPos, wallHeight / 2 - 0.05, zPos); // Lowered to match ground level
         wall.material = wallMaterial;
         wall.parent = mapContainer;
       } else if (tileType === TILE_TYPES.WATER) {
-        // Water channel depth (below floor level)
-        const channelDepth = 0.8; // Depth of the channel (increased from 0.15)
-        const groundHeight = 0.01; // Height of ground layer
-        const waterSurfaceHeight = 0.005; // Height of water surface layer
+        // Water channel - flush with ground level at -0.15
+        const waterSurfaceY = -0.05; // Slightly below gameplay tiles
+        const channelDepth = 0.5; // Depth below water surface
+        const groundHeight = 0.01; // Height of ground layer at bottom
         const wallThickness = 0.02; // Thickness of side walls
         
         // 1. Create brown ground/earth layer at the bottom of the channel
@@ -385,7 +776,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
           height: groundHeight,
           depth: tileSize
         }, scene);
-        ground.position = new Vector3(xPos, -channelDepth + groundHeight / 2, zPos);
+        ground.position = new Vector3(xPos, waterSurfaceY - channelDepth + groundHeight / 2, zPos);
         ground.material = waterGroundMaterial;
         ground.parent = mapContainer;
         
@@ -411,6 +802,9 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
             let wall;
             let wallPosition;
             
+            // Wall center Y position (from water surface down to channel bottom)
+            const wallCenterY = waterSurfaceY - channelDepth / 2;
+            
             if (neighbor.dir === 'top') {
               // Wall on top edge (facing negative Z)
               wall = MeshBuilder.CreateBox(`waterWall_${x}_${y}_top`, {
@@ -418,7 +812,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
                 height: channelDepth,
                 depth: wallThickness
               }, scene);
-              wallPosition = new Vector3(xPos, -channelDepth / 2, zPos - tileSize / 2 + wallThickness / 2);
+              wallPosition = new Vector3(xPos, wallCenterY, zPos - tileSize / 2 + wallThickness / 2);
             } else if (neighbor.dir === 'right') {
               // Wall on right edge (facing positive X)
               wall = MeshBuilder.CreateBox(`waterWall_${x}_${y}_right`, {
@@ -426,7 +820,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
                 height: channelDepth,
                 depth: tileSize
               }, scene);
-              wallPosition = new Vector3(xPos + tileSize / 2 - wallThickness / 2, -channelDepth / 2, zPos);
+              wallPosition = new Vector3(xPos + tileSize / 2 - wallThickness / 2, wallCenterY, zPos);
             } else if (neighbor.dir === 'bottom') {
               // Wall on bottom edge (facing positive Z)
               wall = MeshBuilder.CreateBox(`waterWall_${x}_${y}_bottom`, {
@@ -434,7 +828,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
                 height: channelDepth,
                 depth: wallThickness
               }, scene);
-              wallPosition = new Vector3(xPos, -channelDepth / 2, zPos + tileSize / 2 - wallThickness / 2);
+              wallPosition = new Vector3(xPos, wallCenterY, zPos + tileSize / 2 - wallThickness / 2);
             } else if (neighbor.dir === 'left') {
               // Wall on left edge (facing negative X)
               wall = MeshBuilder.CreateBox(`waterWall_${x}_${y}_left`, {
@@ -442,7 +836,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
                 height: channelDepth,
                 depth: tileSize
               }, scene);
-              wallPosition = new Vector3(xPos - tileSize / 2 + wallThickness / 2, -channelDepth / 2, zPos);
+              wallPosition = new Vector3(xPos - tileSize / 2 + wallThickness / 2, wallCenterY, zPos);
             }
             
             if (wall) {
@@ -458,7 +852,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
           width: tileSize,
           height: tileSize
         }, scene);
-        waterSurface.position = new Vector3(xPos, 0.01, zPos);
+        waterSurface.position = new Vector3(xPos, waterSurfaceY, zPos);
         waterSurface.rotation.x = Math.PI / 2; // Rotate to horizontal
         
         // Get flow direction for this tile and use corresponding material
@@ -507,14 +901,195 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
     }
   }
   
+  // Tiles are centered at (x * tileSize, z * tileSize), so actual map edges are offset by half a tile
+  const mapLeftEdge = -tileSize / 2;
+  const mapRightEdge = (mapWidth - 1) * tileSize + tileSize / 2;
+  const mapBottomEdge = -tileSize / 2;
+  const mapTopEdge = (mapHeight - 1) * tileSize + tileSize / 2;
+  const actualMapWidth = mapRightEdge - mapLeftEdge;
+  const actualMapHeight = mapTopEdge - mapBottomEdge;
+  const mapCenterX = (mapRightEdge + mapLeftEdge) / 2;
+  const mapCenterZ = (mapTopEdge + mapBottomEdge) / 2;
+  
+  // Ramp parameters
+  const rampWidth = 3.0; // How far the ramp extends outward
+  const innerY = -0.05; // Height at board edge (matches ground mesh level)
+  const outerY = -0.25; // Height at skirt level
+  const innerRadius = 0.3; // Corner roundness at board edge
+  const outerRadius = rampWidth + innerRadius; // Corner roundness at outer edge
+  const segmentsPerCorner = 8; // Quality of rounded corners
+  const skirtSize = 100; // How far the flat skirt extends beyond the ramp
+  const skirtMeshes = [];
+  
+  // Create skirt/ramp material (shared)
+  const skirtMaterial = new StandardMaterial('skirtMaterial', scene);
+  skirtMaterial.diffuseColor = new Color3(0.35, 0.3, 0.22);
+  skirtMaterial.specularColor = new Color3(0.1, 0.1, 0.1);
+  skirtMaterial.emissiveColor = new Color3(0.05, 0.04, 0.03);
+  skirtMaterial.backFaceCulling = false;
+  
+  /**
+   * Generate points for a rounded rectangle centered at origin
+   * @param {number} width - Total width of rectangle
+   * @param {number} height - Total height of rectangle  
+   * @param {number} radius - Corner radius
+   * @param {number} segments - Segments per corner
+   * @param {number} y - Y height
+   * @returns {Vector3[]} Array of points forming the rounded rectangle
+   */
+  function generateRoundedRectPoints(width, height, radius, segments, y) {
+    const points = [];
+    const halfW = width / 2;
+    const halfH = height / 2;
+    
+    // Clamp radius to maximum possible
+    const maxRadius = Math.min(halfW, halfH);
+    const r = Math.min(radius, maxRadius);
+    
+    // Corner centers (inside the rectangle)
+    const corners = [
+      { cx: halfW - r, cz: halfH - r, startAngle: 0 },           // Top-right
+      { cx: -halfW + r, cz: halfH - r, startAngle: Math.PI / 2 }, // Top-left
+      { cx: -halfW + r, cz: -halfH + r, startAngle: Math.PI },    // Bottom-left
+      { cx: halfW - r, cz: -halfH + r, startAngle: 3 * Math.PI / 2 } // Bottom-right
+    ];
+    
+    corners.forEach(corner => {
+      for (let i = 0; i <= segments; i++) {
+        const angle = corner.startAngle + (i / segments) * (Math.PI / 2);
+        const x = corner.cx + r * Math.cos(angle);
+        const z = corner.cz + r * Math.sin(angle);
+        points.push(new Vector3(x, y, z));
+      }
+    });
+    
+    return points;
+  }
+  
+  // Generate inner and outer rounded rectangle paths
+  const innerPoints = generateRoundedRectPoints(actualMapWidth, actualMapHeight, innerRadius, segmentsPerCorner, innerY);
+  const outerPoints = generateRoundedRectPoints(actualMapWidth + rampWidth * 2, actualMapHeight + rampWidth * 2, outerRadius, segmentsPerCorner, outerY);
+  
+  // Offset points to map center
+  innerPoints.forEach(p => { p.x += mapCenterX; p.z += mapCenterZ; });
+  outerPoints.forEach(p => { p.x += mapCenterX; p.z += mapCenterZ; });
+  
+  // Close the paths by adding first point at the end
+  innerPoints.push(innerPoints[0].clone());
+  outerPoints.push(outerPoints[0].clone());
+  
+  // Create the ramp surface using ribbon
+  const rampMesh = MeshBuilder.CreateRibbon('pyramidRamp', {
+    pathArray: [outerPoints, innerPoints],
+    closeArray: false,
+    closePath: false,
+    sideOrientation: Mesh.DOUBLESIDE
+  }, scene);
+  rampMesh.material = skirtMaterial;
+  rampMesh.isPickable = false;
+  rampMesh.receiveShadows = true;
+  skirtMeshes.push(rampMesh);
+  
+  // Create flat skirt around the map (extends from map edge outward, under the ramp)
+  // Left skirt - from map left edge outward
+  const leftSkirt = MeshBuilder.CreateGround('skirtLeft', {
+    width: skirtSize + rampWidth,
+    height: actualMapHeight + skirtSize * 2
+  }, scene);
+  leftSkirt.position = new Vector3(mapCenterX - actualMapWidth / 2 - (skirtSize + rampWidth) / 2, outerY, mapCenterZ);
+  leftSkirt.material = skirtMaterial;
+  leftSkirt.isPickable = false;
+  leftSkirt.receiveShadows = true;
+  skirtMeshes.push(leftSkirt);
+  
+  // Right skirt - from map right edge outward
+  const rightSkirt = MeshBuilder.CreateGround('skirtRight', {
+    width: skirtSize + rampWidth,
+    height: actualMapHeight + skirtSize * 2
+  }, scene);
+  rightSkirt.position = new Vector3(mapCenterX + actualMapWidth / 2 + (skirtSize + rampWidth) / 2, outerY, mapCenterZ);
+  rightSkirt.material = skirtMaterial;
+  rightSkirt.isPickable = false;
+  rightSkirt.receiveShadows = true;
+  skirtMeshes.push(rightSkirt);
+  
+  // Top skirt - from map top edge outward
+  const topSkirt = MeshBuilder.CreateGround('skirtTop', {
+    width: actualMapWidth,
+    height: skirtSize + rampWidth
+  }, scene);
+  topSkirt.position = new Vector3(mapCenterX, outerY, mapCenterZ + actualMapHeight / 2 + (skirtSize + rampWidth) / 2);
+  topSkirt.material = skirtMaterial;
+  topSkirt.isPickable = false;
+  topSkirt.receiveShadows = true;
+  skirtMeshes.push(topSkirt);
+  
+  // Bottom skirt - from map bottom edge outward
+  const bottomSkirt = MeshBuilder.CreateGround('skirtBottom', {
+    width: actualMapWidth,
+    height: skirtSize + rampWidth
+  }, scene);
+  bottomSkirt.position = new Vector3(mapCenterX, outerY, mapCenterZ - actualMapHeight / 2 - (skirtSize + rampWidth) / 2);
+  bottomSkirt.material = skirtMaterial;
+  bottomSkirt.isPickable = false;
+  bottomSkirt.receiveShadows = true;
+  skirtMeshes.push(bottomSkirt);
+  
+  // Scatter trees on the skirt
+  const skirtBounds = {
+    mapCenterX,
+    mapCenterZ,
+    mapHalfWidth: actualMapWidth / 2,
+    mapHalfHeight: actualMapHeight / 2
+  };
+  
+  // Load different tree types with their own placement rules
+  const treePromise = Promise.all([
+    scatterTrees(scene, skirtBounds, {
+      modelFile: 'tree1.glb',
+      treeCount: 100,
+      minDistance: 10,
+      maxDistance: 50,
+      groundY: outerY,
+      seed: 42069
+    }),
+    scatterTrees(scene, skirtBounds, {
+      modelFile: 'tree2.glb',
+      treeCount: 10,
+      minDistance: 10,
+      maxDistance: 30,
+      groundY: outerY,
+      seed: 12345
+    }),
+    scatterTrees(scene, skirtBounds, {
+      modelFile: 'tree3.glb',
+      treeCount: 40,
+      minDistance: 15,
+      maxDistance: 40,
+      groundY: outerY,
+      seed: 77777
+    }),
+    scatterTrees(scene, skirtBounds, {
+      modelFile: 'tree5.glb',
+      treeCount: 80,
+      minDistance: 20,
+      maxDistance: 50,
+      groundY: outerY,
+      seed: 55555
+    })
+  ]);
+  
   return {
-    interactiveTiles: startPositionTiles, // Tiles that can be clicked (player team only)
-    allStartTiles: allStartPositionTiles, // All starting position tiles (player + enemy) for visibility
-    allTiles: allTiles, // All tiles for movement range highlighting
-    playerStartMaterial: playerStartMaterial, // Material for player team starting positions
-    enemyStartMaterial: enemyStartMaterial, // Material for enemy team starting positions
-    createTileMaterial: createTileMaterial, // Function to create regular tile material
-    waterMeshes: waterMeshes, // Water meshes for potential future updates
-    waterAnimationData: waterAnimationData // Water animation observer for cleanup
+    interactiveTiles: startPositionTiles,
+    allStartTiles: allStartPositionTiles,
+    allTiles: allTiles,
+    playerStartMaterial,
+    enemyStartMaterial,
+    createTileMaterial,
+    waterMeshes,
+    waterAnimationData,
+    groundMeshes: groundResult.groundMeshes,
+    skirtMeshes,
+    treePromise
   };
 }

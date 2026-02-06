@@ -6,6 +6,135 @@
 import { MeshBuilder, StandardMaterial, Color3, Color4, Vector3, Animation, AnimationGroup, ParticleSystem, Texture, DynamicTexture, Material, SceneLoader } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
 
+// ============================================================================
+// SHARED TEXTURE & MATERIAL CACHE
+// Prevents memory leaks by reusing textures and materials across VFX instances
+// ============================================================================
+
+// Cache key prefixes
+const CACHE_PREFIX = '__vfx_cache__';
+
+/**
+ * Get or create a cached texture
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} key - Unique cache key
+ * @param {Function} createFn - Function to create texture if not cached
+ * @returns {Texture} Cached or newly created texture
+ */
+function getCachedTexture(scene, key, createFn) {
+  if (!scene.metadata) {
+    scene.metadata = {};
+  }
+  if (!scene.metadata[CACHE_PREFIX + 'textures']) {
+    scene.metadata[CACHE_PREFIX + 'textures'] = new Map();
+  }
+  
+  const cache = scene.metadata[CACHE_PREFIX + 'textures'];
+  
+  if (cache.has(key)) {
+    const cached = cache.get(key);
+    // Check if texture is still valid (not disposed)
+    if (cached && !cached.isDisposed) {
+      return cached;
+    }
+  }
+  
+  // Create new texture and cache it
+  const texture = createFn();
+  cache.set(key, texture);
+  return texture;
+}
+
+/**
+ * Get or create a cached material
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} key - Unique cache key
+ * @param {Function} createFn - Function to create material if not cached
+ * @returns {Material} Cached or newly created material
+ */
+function getCachedMaterial(scene, key, createFn) {
+  if (!scene.metadata) {
+    scene.metadata = {};
+  }
+  if (!scene.metadata[CACHE_PREFIX + 'materials']) {
+    scene.metadata[CACHE_PREFIX + 'materials'] = new Map();
+  }
+  
+  const cache = scene.metadata[CACHE_PREFIX + 'materials'];
+  
+  if (cache.has(key)) {
+    const cached = cache.get(key);
+    // Check if material is still valid (not disposed)
+    if (cached && !cached.isDisposed) {
+      return cached;
+    }
+  }
+  
+  // Create new material and cache it
+  const material = createFn();
+  cache.set(key, material);
+  return material;
+}
+
+/**
+ * Dispose all cached VFX resources
+ * Call this when scene is being disposed
+ * @param {Scene} scene - Babylon.js scene
+ */
+export function disposeVfxCache(scene) {
+  if (!scene.metadata) return;
+  
+  // Dispose cached textures
+  const textureCache = scene.metadata[CACHE_PREFIX + 'textures'];
+  if (textureCache) {
+    textureCache.forEach((texture, key) => {
+      if (texture && !texture.isDisposed) {
+        texture.dispose();
+      }
+    });
+    textureCache.clear();
+  }
+  
+  // Dispose cached materials
+  const materialCache = scene.metadata[CACHE_PREFIX + 'materials'];
+  if (materialCache) {
+    materialCache.forEach((material, key) => {
+      if (material && !material.isDisposed) {
+        material.dispose();
+      }
+    });
+    materialCache.clear();
+  }
+  
+  // Dispose cached models (fireball, shard)
+  if (scene.metadata.fireballModel) {
+    if (!scene.metadata.fireballModel.isDisposed) {
+      scene.metadata.fireballModel.dispose();
+    }
+    scene.metadata.fireballModel = null;
+  }
+  if (scene.metadata.fireballAnimationGroups) {
+    scene.metadata.fireballAnimationGroups.forEach(ag => {
+      if (ag && !ag.isDisposed) {
+        ag.dispose();
+      }
+    });
+    scene.metadata.fireballAnimationGroups = null;
+  }
+  if (scene.metadata.arcaneShardModel) {
+    if (!scene.metadata.arcaneShardModel.isDisposed) {
+      scene.metadata.arcaneShardModel.dispose();
+    }
+    scene.metadata.arcaneShardModel = null;
+  }
+  
+  console.log('[VFX] Cache disposed');
+}
+
+// ============================================================================
+// VFX MESH CREATION
+// ============================================================================
+
 /**
  * Create a VFX mesh based on VFX definition
  * @param {Object} vfxDef - VFX definition from spell
@@ -135,6 +264,8 @@ function createVfxMesh(vfxDef, scene, name) {
  */
 /**
  * Create a simple particle texture (white circle that can be tinted)
+ * NOTE: Particle textures are NOT cached because ParticleSystems dispose their textures.
+ * Each particle system needs its own texture instance.
  */
 function createParticleTexture(scene) {
   const size = 64;
@@ -162,6 +293,7 @@ function createParticleTexture(scene) {
 
 /**
  * Create a star texture for sparkle particles
+ * NOTE: Particle textures are NOT cached because ParticleSystems dispose their textures.
  */
 function createStarTexture(scene) {
   const size = 64;
@@ -216,6 +348,7 @@ function createStarTexture(scene) {
 
 /**
  * Create a diamond texture for geometric particles
+ * NOTE: Particle textures are NOT cached because ParticleSystems dispose their textures.
  */
 export function createDiamondTexture(scene) {
   const size = 64;
@@ -255,6 +388,7 @@ export function createDiamondTexture(scene) {
 
 /**
  * Create a line-streak texture for linear particles
+ * NOTE: Particle textures are NOT cached because ParticleSystems dispose their textures.
  */
 export function createLineStreakTexture(scene) {
   const size = 64;
@@ -462,6 +596,9 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
   const startTime = Date.now();
   const speed = adjustedSpeed;
   
+  // Store observer reference for cleanup
+  let observer = null;
+  
   // Store animation state
   projectileMesh.metadata = {
     startPos: startPos.clone(),
@@ -473,14 +610,34 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
     onComplete: onComplete,
     observer: null,
     particleSystem: particleSystem,
-    lastPosition: startPos.clone() // For orientation
+    lastPosition: startPos.clone(), // For orientation
+    // Cleanup function to ensure observer is removed
+    cleanup: () => {
+      if (observer) {
+        scene.onBeforeRenderObservable.remove(observer);
+        observer = null;
+      }
+      if (particleSystem && !particleSystem.isDisposed?.()) {
+        particleSystem.dispose();
+      }
+    }
   };
   
   // Use scene's render loop to update position along curve
-  const observer = scene.onBeforeRenderObservable.add(() => {
-    if (!projectileMesh || !projectileMesh.metadata) {
+  observer = scene.onBeforeRenderObservable.add(() => {
+    // Safety check: if mesh was disposed externally, clean up observer
+    if (!projectileMesh || projectileMesh.isDisposed?.()) {
       if (observer) {
         scene.onBeforeRenderObservable.remove(observer);
+        observer = null;
+      }
+      return;
+    }
+    
+    if (!projectileMesh.metadata) {
+      if (observer) {
+        scene.onBeforeRenderObservable.remove(observer);
+        observer = null;
       }
       return;
     }
@@ -503,9 +660,9 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
     );
     
     // Calculate direction for orientation and orient shard along path
-    const direction = newPos.subtract(projectileMesh.metadata.lastPosition);
-    if (direction.length() > 0.001) {
-      const normalizedDir = direction.clone().normalize();
+    const directionVec = newPos.subtract(projectileMesh.metadata.lastPosition);
+    if (directionVec.length() > 0.001) {
+      const normalizedDir = directionVec.clone().normalize();
       // Orient shard to face direction of travel
       // Calculate target point ahead in the direction of travel
       const targetPoint = newPos.clone().add(normalizedDir.scale(1.0));
@@ -517,6 +674,7 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
     const metadata = projectileMesh.metadata;
     if (!metadata) {
       scene.onBeforeRenderObservable.remove(observer);
+      observer = null;
       return;
     }
     
@@ -541,6 +699,7 @@ function animateProjectileCurved(projectileMesh, startPos, endPos, speedCellsPer
       // Set final position
       projectileMesh.position = finalPos;
       scene.onBeforeRenderObservable.remove(observer);
+      observer = null;
       
       // Dispose particle system if it exists
       if (particleSys) {
@@ -584,6 +743,9 @@ function animateProjectile(projectileMesh, startPos, endPos, speedCellsPerSec, s
   const startTime = Date.now();
   const speed = speedCellsPerSec;
   
+  // Store observer reference for cleanup
+  let observer = null;
+  
   projectileMesh.metadata = {
     startPos: startPos.clone(),
     endPos: endPos.clone(),
@@ -591,16 +753,36 @@ function animateProjectile(projectileMesh, startPos, endPos, speedCellsPerSec, s
     startTime: startTime,
     onComplete: onComplete,
     observer: null,
-    particleSystem: particleSystem
+    particleSystem: particleSystem,
+    // Cleanup function to ensure observer is removed
+    cleanup: () => {
+      if (observer) {
+        scene.onBeforeRenderObservable.remove(observer);
+        observer = null;
+      }
+      if (particleSystem && !particleSystem.isDisposed?.()) {
+        particleSystem.dispose();
+      }
+    }
   };
   
   const startPosLocal = startPos.clone();
   const endPosLocal = endPos.clone();
   
-  const observer = scene.onBeforeRenderObservable.add(() => {
-    if (!projectileMesh || !projectileMesh.metadata) {
+  observer = scene.onBeforeRenderObservable.add(() => {
+    // Safety check: if mesh was disposed externally, clean up observer
+    if (!projectileMesh || projectileMesh.isDisposed?.()) {
       if (observer) {
         scene.onBeforeRenderObservable.remove(observer);
+        observer = null;
+      }
+      return;
+    }
+    
+    if (!projectileMesh.metadata) {
+      if (observer) {
+        scene.onBeforeRenderObservable.remove(observer);
+        observer = null;
       }
       return;
     }
@@ -614,6 +796,7 @@ function animateProjectile(projectileMesh, startPos, endPos, speedCellsPerSec, s
     if (!projectileMesh.metadata.explosionTriggered && progress >= 0.95) {
       projectileMesh.metadata.explosionTriggered = true;
       scene.onBeforeRenderObservable.remove(observer);
+      observer = null;
       projectileMesh.isVisible = false;
       projectileMesh.setEnabled(false);
       if (projectileMesh.metadata.onComplete) {
@@ -627,6 +810,7 @@ function animateProjectile(projectileMesh, startPos, endPos, speedCellsPerSec, s
       // Reached destination - hide mesh before impact, then complete
       projectileMesh.position = endPosLocal.clone();
       scene.onBeforeRenderObservable.remove(observer);
+      observer = null;
       projectileMesh.isVisible = false;
       projectileMesh.setEnabled(false);
       

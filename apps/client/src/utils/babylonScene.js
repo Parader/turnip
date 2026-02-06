@@ -1,14 +1,17 @@
-import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput, Animation } from '@babylonjs/core';
+import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput, Animation, CubeTexture } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
 import { TILE_TYPES, doesTileBlockLOS } from './mapRenderer';
 import { findPath, getMovementRange } from './pathfinding';
 import { build3DMap } from './babylon/babylonMap';
 import { buildPlayerCharacters, updatePlayerCharacters } from './babylon/babylonPlayers';
 import { startMovementAnimation, startStanceAnimation, stopStanceAnimation, playCastAnimation, playHitAnimation, updateMovementAnimations, blendAnimations } from './babylon/babylonAnimations';
-import { playSpellVfx, preWarmArcaneMissileShaders } from './babylon/babylonVfx';
-import { startTeleportVFX, onServerTeleportConfirmed } from './babylon/babylonTeleport';
+import { playSpellVfx, preWarmArcaneMissileShaders, disposeVfxCache } from './babylon/babylonVfx';
+import { startTeleportVFX, onServerTeleportConfirmed, activeTeleports, disposeTeleportCache } from './babylon/babylonTeleport';
 import { hasLOS, createTerrainBlocksFunction } from './lineOfSight';
-import { initCombatTextSystem, updateCombatTextFromState, recordCombatTextHit } from './babylon/babylonCombatText';
+import { initCombatTextSystem, updateCombatTextFromState, recordCombatTextHit, disposeCombatTextSystem } from './babylon/babylonCombatText';
+
+// Re-export memory diagnostics for easy access
+export { startMemoryDiagnostics, stopMemoryDiagnostics, getMemorySnapshot, logMemoryReport, runLeakTest } from './babylon/babylonMemoryDiagnostics';
 
 // Helper to convert angle in radians to Babylon.js rotation (Y axis)
 // In Babylon.js, rotation around Y axis: 
@@ -103,6 +106,38 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   const directionalLight = new DirectionalLight('directionalLight', new Vector3(-1, -1, -1), scene);
   directionalLight.intensity = 0.8;
   directionalLight.position = new Vector3(mapWidth, 10, mapHeight);
+
+  // Create skybox and environment lighting from .env cubemap
+  try {
+    const envTexture = CubeTexture.CreateFromPrefilteredData('/assets/skybox.env', scene);
+    
+    if (envTexture && envTexture.onLoadObservable) {
+      envTexture.onLoadObservable.addOnce(() => {
+        console.log('Skybox environment texture loaded successfully');
+        
+        // Set environment texture for IBL reflections
+        scene.environmentTexture = envTexture;
+        
+        // Use Babylon's built-in skybox helper - handles infinite distance properly
+        // Parameters: environmentTexture, pbr, blur, scale, disablePBRWithoutEnvironment
+        scene.createDefaultSkybox(envTexture, true, 10000, 0, false);
+        
+        // Reduce ambient light since we have IBL
+        ambientLight.intensity = 0.4;
+        console.log('Skybox created');
+      });
+      
+      if (envTexture.onLoadErrorObservable) {
+        envTexture.onLoadErrorObservable.addOnce((error) => {
+          console.error('Failed to load skybox ENV:', error);
+        });
+      }
+    } else {
+      console.warn('Skybox texture creation returned invalid result');
+    }
+  } catch (error) {
+    console.warn('Could not create skybox:', error.message);
+  }
 
   // Determine which team the user is on
   const isOnTeam1 = matchInfo?.team1?.some(m => m.id === userId) || false;
@@ -2344,52 +2379,218 @@ function animateEarthBlockRemoval(mesh, scene, entityId) {
 
 /**
  * Cleanup function to dispose of Babylon.js resources
+ * Performs comprehensive cleanup of all resources to prevent memory leaks
  * @param {Object} babylonResources - Object containing engine, scene, camera, and handleResize
  */
 export function disposeBabylonScene({ engine, scene, camera, handleResize }) {
-  // Clean up player meshes
-  if (scene && scene.metadata && scene.metadata.playerMeshes) {
-    scene.metadata.playerMeshes.forEach((mesh) => {
-      if (mesh.rootMesh) {
-        mesh.rootMesh.dispose();
-      } else {
-        mesh.dispose();
-      }
-    });
-    scene.metadata.playerMeshes.clear();
-  }
+  console.log('[BabylonScene] Starting comprehensive cleanup...');
   
-  // Clean up animation groups
-  if (scene && scene.metadata && scene.metadata.playerAnimationGroups) {
-    scene.metadata.playerAnimationGroups.forEach((animGroup) => {
-      animGroup.dispose();
-    });
-    scene.metadata.playerAnimationGroups.clear();
-  }
-  
-  // Clear model cache
-  if (scene && scene.metadata && scene.metadata.modelCache) {
-    scene.metadata.modelCache.clear();
+  if (scene && scene.metadata) {
+    // 1. Dispose combat text system (pool, observers, textures)
+    disposeCombatTextSystem(scene);
+    
+    // 2. Dispose VFX cache (shared textures, materials, cached models)
+    disposeVfxCache(scene);
+    
+    // 2b. Dispose teleport cache (shared textures)
+    disposeTeleportCache(scene);
+    
+    // 3. Clean up active teleport controllers
+    if (activeTeleports) {
+      activeTeleports.forEach((controller, userId) => {
+        try {
+          controller.dispose();
+        } catch (e) {
+          console.warn(`[BabylonScene] Error disposing teleport controller for ${userId}:`, e);
+        }
+      });
+      activeTeleports.clear();
+    }
+    
+    // 4. Clean up water animation data
+    if (scene.metadata.waterAnimationData && scene.metadata.waterAnimationData.dispose) {
+      scene.metadata.waterAnimationData.dispose();
+    }
+    
+    // 5. Clean up target markers (spell targeting)
+    if (scene.metadata.targetMarkers) {
+      scene.metadata.targetMarkers.forEach((markers, tileKey) => {
+        markers.forEach(markerData => {
+          if (markerData) {
+            if (markerData.observer) {
+              scene.onBeforeRenderObservable.remove(markerData.observer);
+            }
+            if (markerData.marker && !markerData.marker.isDisposed()) {
+              if (markerData.marker.material && !markerData.marker.material.isDisposed) {
+                markerData.marker.material.dispose();
+              }
+              markerData.marker.dispose();
+            }
+          }
+        });
+      });
+      scene.metadata.targetMarkers.clear();
+    }
+    
+    // 6. Clean up player meshes
+    if (scene.metadata.playerMeshes) {
+      scene.metadata.playerMeshes.forEach((mesh, userId) => {
+        try {
+          // Dispose materials first
+          if (mesh.material && !mesh.material.isDisposed) {
+            mesh.material.dispose();
+          }
+          // If it's a container, dispose children
+          if (mesh.getChildMeshes) {
+            mesh.getChildMeshes().forEach(child => {
+              if (child.material && !child.material.isDisposed) {
+                child.material.dispose();
+              }
+              if (!child.isDisposed()) {
+                child.dispose();
+              }
+            });
+          }
+          // Dispose model mesh if it's stored in metadata
+          if (mesh.metadata && mesh.metadata.modelMesh && !mesh.metadata.modelMesh.isDisposed()) {
+            mesh.metadata.modelMesh.dispose();
+          }
+          if (!mesh.isDisposed()) {
+            mesh.dispose();
+          }
+        } catch (e) {
+          console.warn(`[BabylonScene] Error disposing player mesh for ${userId}:`, e);
+        }
+      });
+      scene.metadata.playerMeshes.clear();
+    }
+    
+    // 7. Clean up entity meshes
+    if (scene.metadata.entityMeshes) {
+      scene.metadata.entityMeshes.forEach((mesh, entityId) => {
+        try {
+          if (mesh.material && !mesh.material.isDisposed) {
+            mesh.material.dispose();
+          }
+          if (mesh.metadata && mesh.metadata.modelMesh && !mesh.metadata.modelMesh.isDisposed()) {
+            mesh.metadata.modelMesh.dispose();
+          }
+          if (!mesh.isDisposed()) {
+            mesh.dispose();
+          }
+        } catch (e) {
+          console.warn(`[BabylonScene] Error disposing entity mesh for ${entityId}:`, e);
+        }
+      });
+      scene.metadata.entityMeshes.clear();
+    }
+    
+    // 8. Clean up animation groups
+    if (scene.metadata.playerAnimationGroups) {
+      scene.metadata.playerAnimationGroups.forEach((animGroup, userId) => {
+        try {
+          // Could be a Map or a single AnimationGroup
+          if (animGroup instanceof Map) {
+            animGroup.forEach(ag => {
+              if (ag && !ag.isDisposed) {
+                ag.dispose();
+              }
+            });
+          } else if (animGroup && !animGroup.isDisposed) {
+            animGroup.dispose();
+          }
+        } catch (e) {
+          console.warn(`[BabylonScene] Error disposing animation group for ${userId}:`, e);
+        }
+      });
+      scene.metadata.playerAnimationGroups.clear();
+    }
+    
+    // 9. Clear model cache (dispose cached models properly)
+    if (scene.metadata.modelCache) {
+      scene.metadata.modelCache.forEach((cached, modelPath) => {
+        try {
+          if (cached.root && !cached.root.isDisposed()) {
+            cached.root.dispose();
+          }
+          if (cached.animationGroups) {
+            cached.animationGroups.forEach(ag => {
+              if (ag && !ag.isDisposed) {
+                ag.dispose();
+              }
+            });
+          }
+        } catch (e) {
+          console.warn(`[BabylonScene] Error disposing cached model ${modelPath}:`, e);
+        }
+      });
+      scene.metadata.modelCache.clear();
+    }
+    
+    // 10. Clean up movement animations
+    if (scene.metadata.playerMovementAnimations) {
+      scene.metadata.playerMovementAnimations.clear();
+    }
+    if (scene.metadata.playerPreviousPositions) {
+      scene.metadata.playerPreviousPositions.clear();
+    }
+    if (scene.metadata.pendingMovementPaths) {
+      scene.metadata.pendingMovementPaths.clear();
+    }
+    
+    // 11. Clean up stance and cast animations
+    if (scene.metadata.playerStanceAnimations) {
+      scene.metadata.playerStanceAnimations.clear();
+    }
+    if (scene.metadata.playerCastAnimations) {
+      scene.metadata.playerCastAnimations.clear();
+    }
+    if (scene.metadata.playerHitAnimations) {
+      scene.metadata.playerHitAnimations.clear();
+    }
+    
+    // 12. Clean up ground meshes
+    if (scene.metadata.groundMeshes) {
+      scene.metadata.groundMeshes.forEach(mesh => {
+        try {
+          if (!mesh.isDisposed()) {
+            if (mesh.material && !mesh.material.isDisposed) {
+              mesh.material.dispose();
+            }
+            mesh.dispose();
+          }
+        } catch (e) {
+          console.warn('[BabylonScene] Error disposing ground mesh:', e);
+        }
+      });
+    }
   }
 
+  // 13. Detach camera controls
   if (camera) {
-    // Detach camera controls if the method exists
     if (typeof camera.detachControls === 'function') {
-    camera.detachControls();
+      camera.detachControls();
     } else if (camera.inputs && typeof camera.inputs.removeByType === 'function') {
-      // Alternative method for some Babylon.js versions
       camera.inputs.removeByType('ArcRotateCameraPointersInput');
       camera.inputs.removeByType('ArcRotateCameraKeyboardMoveInput');
       camera.inputs.removeByType('ArcRotateCameraMouseWheelInput');
     }
   }
+  
+  // 14. Remove window resize listener
   if (handleResize) {
     window.removeEventListener('resize', handleResize);
   }
+  
+  // 15. Dispose scene (this will dispose remaining meshes, materials, textures)
   if (scene) {
     scene.dispose();
   }
+  
+  // 16. Dispose engine
   if (engine) {
     engine.dispose();
   }
+  
+  console.log('[BabylonScene] Cleanup complete');
 }
