@@ -4,6 +4,7 @@
  */
 
 import { AnimationGroup, TransformNode } from '@babylonjs/core';
+import { activeTeleports } from './babylonTeleport';
 
 /**
  * Blend two animations smoothly over a duration
@@ -594,6 +595,15 @@ export async function playHitAnimation(scene, userId) {
     return;
   }
   
+  // Check if player is currently teleporting
+  const teleportController = activeTeleports?.get(userId);
+  if (teleportController && teleportController.state !== 'idle' && teleportController.state !== 'cleaning') {
+    // Player is teleporting - wait for teleport to complete before playing hit
+    console.log(`[HitAnim] Player ${userId} is teleporting (state: ${teleportController.state}), waiting for completion`);
+    waitForTeleportAndPlayHit(scene, userId, hitAnim);
+    return;
+  }
+  
   // Find current animation (stance, cast, idle, or movement)
   let currentAnim = null;
   const stanceState = scene.metadata.playerStanceAnimations?.get(userId);
@@ -717,6 +727,128 @@ export async function playHitAnimation(scene, userId) {
 }
 
 /**
+ * Wait for a player's teleport to complete, then play hit animation
+ * Polls for teleport completion with a timeout
+ * 
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - Player's user ID
+ * @param {AnimationGroup} hitAnim - The hit animation to play
+ */
+const TELEPORT_WAIT_POLL_MS = 50;
+const TELEPORT_WAIT_MAX_MS = 2000; // Max 2 seconds wait
+
+function waitForTeleportAndPlayHit(scene, userId, hitAnim) {
+  const startTime = Date.now();
+  
+  const pollForCompletion = () => {
+    const elapsed = Date.now() - startTime;
+    const teleportController = activeTeleports?.get(userId);
+    
+    // Check if teleport is complete (idle/cleaning state or no longer in map)
+    const teleportComplete = !teleportController || 
+                            teleportController.state === 'idle' || 
+                            teleportController.state === 'cleaning';
+    
+    if (teleportComplete) {
+      console.log(`[HitAnim] Teleport complete for ${userId} after ${elapsed}ms, playing hit animation`);
+      // Small additional delay to ensure character is fully visible
+      setTimeout(() => {
+        playHitAnimationDirect(scene, userId, hitAnim);
+      }, 200);
+      return;
+    }
+    
+    // Check for timeout
+    if (elapsed >= TELEPORT_WAIT_MAX_MS) {
+      console.log(`[HitAnim] Timeout waiting for teleport (${userId}), playing hit animation anyway`);
+      playHitAnimationDirect(scene, userId, hitAnim);
+      return;
+    }
+    
+    // Continue polling
+    setTimeout(pollForCompletion, TELEPORT_WAIT_POLL_MS);
+  };
+  
+  pollForCompletion();
+}
+
+/**
+ * Play hit animation directly (internal function, skips teleport check)
+ * @param {Scene} scene - Babylon.js scene  
+ * @param {string} userId - Player's user ID
+ * @param {AnimationGroup} hitAnim - The hit animation to play
+ */
+function playHitAnimationDirect(scene, userId, hitAnim) {
+  if (!scene.metadata || !scene.metadata.playerAnimationGroups) {
+    return;
+  }
+  
+  const playerAnims = scene.metadata.playerAnimationGroups.get(userId);
+  if (!playerAnims || !(playerAnims instanceof Map)) {
+    return;
+  }
+  
+  // Find idle animation for transition after hit
+  let idleAnim = null;
+  for (const [animName, anim] of playerAnims) {
+    if (animName.includes('idle') || animName.includes('stand')) {
+      idleAnim = anim;
+      break;
+    }
+  }
+  
+  // Stop other animations
+  playerAnims.forEach((anim) => {
+    if (anim !== hitAnim && anim !== idleAnim) {
+      anim.setWeightForAllAnimatables(0.0);
+      anim.stop();
+    }
+  });
+  
+  // Prepare idle for transition
+  if (idleAnim) {
+    idleAnim.setWeightForAllAnimatables(0.0);
+    idleAnim.play(true);
+  }
+  
+  // Start hit animation
+  hitAnim.setWeightForAllAnimatables(1.0);
+  hitAnim.play(false);
+  
+  console.log(`[HitAnim] Playing hit animation for ${userId}`);
+  
+  // Store hit animation state
+  if (!scene.metadata.playerHitAnimations) {
+    scene.metadata.playerHitAnimations = new Map();
+  }
+  scene.metadata.playerHitAnimations.set(userId, {
+    animation: hitAnim,
+    startTime: Date.now()
+  });
+  
+  // Handle animation completion
+  const observer = hitAnim.onAnimationGroupEndObservable.add(() => {
+    hitAnim.onAnimationGroupEndObservable.remove(observer);
+    
+    const hitState = scene.metadata.playerHitAnimations?.get(userId);
+    if (hitState && hitState.animation === hitAnim) {
+      scene.metadata.playerHitAnimations.delete(userId);
+      
+      // Blend to idle
+      if (idleAnim) {
+        blendAnimations(hitAnim, idleAnim, 200, scene, () => {
+          hitAnim.setWeightForAllAnimatables(0.0);
+          hitAnim.stop();
+        });
+      } else {
+        hitAnim.setWeightForAllAnimatables(0.0);
+        hitAnim.stop();
+      }
+    }
+  });
+}
+
+/**
  * Update movement animations in the render loop
  * @param {Scene} scene - Babylon.js scene
  */
@@ -805,6 +937,9 @@ export function updateMovementAnimations(scene) {
             const finalRotation = animState.characterMesh.rotation?.y ?? 0;
             animState.onComplete(userId, finalRotation);
           }
+          
+          // Execute any pending trap triggers for this player
+          executePendingTrapTriggers(scene, userId);
         }
       } else {
         // If transition didn't start (very short movement), stop immediately
@@ -822,6 +957,9 @@ export function updateMovementAnimations(scene) {
           const finalRotation = animState.characterMesh.rotation?.y ?? 0;
           animState.onComplete(userId, finalRotation);
         }
+        
+        // Execute any pending trap triggers for this player
+        executePendingTrapTriggers(scene, userId);
       }
       
       // Keep the final rotation from the last movement step
@@ -895,4 +1033,154 @@ export function updateMovementAnimations(scene) {
     
     animState.currentStep = currentStep;
   });
+}
+
+// ============================================================================
+// PENDING TRAP TRIGGER SYSTEM
+// Queues trap triggers to execute after movement animation completes
+// ============================================================================
+
+/**
+ * Check if a player is currently animating movement
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - Player's user ID
+ * @returns {boolean} True if player has active movement animation
+ */
+export function isPlayerMoving(scene, userId) {
+  if (!scene.metadata || !scene.metadata.playerMovementAnimations) {
+    return false;
+  }
+  
+  const animState = scene.metadata.playerMovementAnimations.get(userId);
+  return animState && animState.isAnimating;
+}
+
+/**
+ * Check if a player has a pending movement path that hasn't started animating yet
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - Player's user ID
+ * @returns {boolean} True if player has pending movement path
+ */
+export function hasPendingMovement(scene, userId) {
+  if (!scene.metadata || !scene.metadata.pendingMovementPaths) {
+    return false;
+  }
+  
+  const pending = scene.metadata.pendingMovementPaths.get(userId);
+  return pending && pending.path && pending.path.length > 0;
+}
+
+/**
+ * Check if a player is either moving or about to move
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - Player's user ID
+ * @returns {boolean} True if player is moving or has pending movement
+ */
+export function isPlayerMovingOrPending(scene, userId) {
+  return isPlayerMoving(scene, userId) || hasPendingMovement(scene, userId);
+}
+
+/**
+ * Queue a trap trigger to execute when player's movement animation completes
+ * 
+ * This handles the timing issue where the trap message may arrive before the
+ * movement animation starts on the client (especially for remote players).
+ * We poll briefly to wait for the animation to start, then queue the callback.
+ * 
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - Player's user ID (the one who triggered the trap)
+ * @param {Function} callback - Function to call when movement completes
+ */
+export function queueTrapTrigger(scene, userId, callback) {
+  // Initialize pending trap triggers storage if needed
+  if (!scene.metadata) {
+    scene.metadata = {};
+  }
+  if (!scene.metadata.pendingTrapTriggers) {
+    scene.metadata.pendingTrapTriggers = new Map(); // userId -> Array of callbacks
+  }
+  
+  // Check if player is currently moving OR has pending movement about to start
+  if (isPlayerMovingOrPending(scene, userId)) {
+    // Queue the callback
+    const pending = scene.metadata.pendingTrapTriggers.get(userId) || [];
+    pending.push(callback);
+    scene.metadata.pendingTrapTriggers.set(userId, pending);
+    console.log(`[TrapTrigger] Queued trap trigger for ${userId} (waiting for movement to complete)`);
+  } else {
+    // Player isn't moving yet - this can happen if the trap message arrives
+    // before the movement animation starts (common for remote players)
+    // Poll briefly to see if movement starts
+    console.log(`[TrapTrigger] Player ${userId} not moving yet, waiting for animation to start...`);
+    waitForMovementAndQueue(scene, userId, callback, 0);
+  }
+}
+
+/**
+ * Poll to wait for movement animation to start, then queue the callback
+ * Times out after a short period and executes immediately if no movement starts
+ * 
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - Player's user ID
+ * @param {Function} callback - Callback to execute
+ * @param {number} attempts - Current number of poll attempts
+ */
+const MAX_WAIT_ATTEMPTS = 20; // ~500ms max wait (20 * 25ms)
+const POLL_INTERVAL_MS = 25;
+
+function waitForMovementAndQueue(scene, userId, callback, attempts) {
+  // Check if movement has started
+  if (isPlayerMovingOrPending(scene, userId)) {
+    // Movement started - queue the callback
+    const pending = scene.metadata.pendingTrapTriggers.get(userId) || [];
+    pending.push(callback);
+    scene.metadata.pendingTrapTriggers.set(userId, pending);
+    console.log(`[TrapTrigger] Movement detected for ${userId} after ${attempts} polls, queued trap trigger`);
+    return;
+  }
+  
+  // Check if we've exceeded max attempts
+  if (attempts >= MAX_WAIT_ATTEMPTS) {
+    // Timeout - execute immediately (animation may have already completed or never started)
+    console.log(`[TrapTrigger] Timeout waiting for ${userId} movement, executing immediately`);
+    callback();
+    return;
+  }
+  
+  // Schedule another poll
+  setTimeout(() => {
+    waitForMovementAndQueue(scene, userId, callback, attempts + 1);
+  }, POLL_INTERVAL_MS);
+}
+
+/**
+ * Execute all pending trap triggers for a player
+ * Called when a player's movement animation completes
+ * 
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - Player's user ID
+ */
+export function executePendingTrapTriggers(scene, userId) {
+  if (!scene.metadata || !scene.metadata.pendingTrapTriggers) {
+    return;
+  }
+  
+  const pending = scene.metadata.pendingTrapTriggers.get(userId);
+  if (!pending || pending.length === 0) {
+    return;
+  }
+  
+  console.log(`[TrapTrigger] Executing ${pending.length} pending trap trigger(s) for ${userId}`);
+  
+  // Execute all pending callbacks
+  pending.forEach(callback => {
+    try {
+      callback();
+    } catch (error) {
+      console.error(`[TrapTrigger] Error executing pending trap trigger:`, error);
+    }
+  });
+  
+  // Clear pending triggers for this player
+  scene.metadata.pendingTrapTriggers.delete(userId);
 }

@@ -1,7 +1,7 @@
 export const gameData = {
     classes: {
       assassin: {
-        starterSpells: ['dash', 'backstab', 'poison_dagger', 'kick', 'trap'],
+        starterSpells: ['dash', 'backstab', 'poison_dagger', 'kick', 'spike_trap'],
         baseStats: {
           movement: 7,
           energy: 16,

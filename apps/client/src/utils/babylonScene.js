@@ -358,16 +358,25 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   spellTargetMaterial.emissiveColor = new Color3(0.5, 0.1, 0.1);
   spellTargetMaterial.alpha = 0.7;
   
-  // Create material for disabled/invalid spell target tiles (dimmed)
+  // Create material for disabled/invalid spell target tiles (dimmed but visible)
   let spellDisabledMaterial = new StandardMaterial('spellDisabledMaterial', scene);
-  spellDisabledMaterial.diffuseColor = new Color3(0.3, 0.3, 0.3); // Dark gray
-  spellDisabledMaterial.emissiveColor = new Color3(0.1, 0.1, 0.1); // Very dim
-  spellDisabledMaterial.alpha = 0.3; // More transparent
+  spellDisabledMaterial.diffuseColor = new Color3(0.5, 0.35, 0.35); // Muted dark red/maroon
+  spellDisabledMaterial.emissiveColor = new Color3(0.25, 0.15, 0.15); // Dim red glow for visibility
+  spellDisabledMaterial.alpha = 0.5; // More opaque than before for better visibility
+  
+  // Create material for trap AoE visualization (orange/yellow - distinct from spell range)
+  // This shows the trigger zone for visible traps owned by the current player's team
+  let trapAoEMaterial = new StandardMaterial('trapAoEMaterial', scene);
+  trapAoEMaterial.diffuseColor = new Color3(0.9, 0.6, 0.2); // Orange
+  trapAoEMaterial.emissiveColor = new Color3(0.5, 0.3, 0.1); // Warm glow
+  trapAoEMaterial.alpha = 0.4; // Semi-transparent to not be too distracting
   
   let spellRangeTiles = []; // Currently highlighted spell range tiles
   let spellTargetTiles = []; // Currently highlighted spell target tiles
+  let trapAoETiles = []; // Currently highlighted trap trigger zone tiles
   
   // Function to clear movement visualization
+  // After clearing, re-applies trap AoE overlay if traps are visible
   const clearMovementVisualization = () => {
     // Clear path
     movementPath.forEach(tileKey => {
@@ -377,9 +386,15 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       }
     });
     movementPath = [];
+    
+    // Re-apply trap AoE overlay for tiles that were suppressed during movement preview
+    if (currentGameState) {
+      updateTrapAoEOverlay(currentGameState);
+    }
   };
   
   // Function to clear spell targeting visualization
+  // After clearing, re-applies trap AoE overlay if traps are visible
   const clearSpellTargeting = () => {
     // Clear range tiles
     spellRangeTiles.forEach(tileKey => {
@@ -398,6 +413,115 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       }
     });
     spellTargetTiles = [];
+    
+    // Re-apply trap AoE overlay for tiles that were suppressed during spell targeting
+    // This ensures trap zones are visible again after spell casting ends
+    if (currentGameState) {
+      updateTrapAoEOverlay(currentGameState);
+    }
+  };
+  
+  // Function to clear trap AoE overlay
+  const clearTrapAoEOverlay = () => {
+    trapAoETiles.forEach(tileKey => {
+      const tile = allTiles.get(tileKey);
+      if (tile && tile.userData && tile.userData.originalMaterial) {
+        // Only restore if not currently highlighted by movement or spell systems
+        const isInMovementPath = movementPath.includes(tileKey);
+        const isInSpellRange = spellRangeTiles.includes(tileKey);
+        const isInSpellTarget = spellTargetTiles.includes(tileKey);
+        
+        if (!isInMovementPath && !isInSpellRange && !isInSpellTarget) {
+          tile.material = tile.userData.originalMaterial;
+        }
+      }
+    });
+    trapAoETiles = [];
+  };
+  
+  /**
+   * Update trap AoE overlay for all visible traps
+   * Shows the trigger zone (AoE) for traps that the current player can see
+   * Priority: Spell target > Spell range > Movement path > Trap AoE > Original
+   * 
+   * @param {Object} currentGameState - Current game state with spawnedEntities
+   */
+  const updateTrapAoEOverlay = (currentGameState) => {
+    // First, clear existing trap overlay
+    clearTrapAoEOverlay();
+    
+    if (!currentGameState || !currentGameState.spawnedEntities) {
+      return;
+    }
+    
+    // Collect all trap tiles to highlight
+    const trapTilesToHighlight = new Set();
+    
+    Object.values(currentGameState.spawnedEntities).forEach(entity => {
+      // Only process trap entities
+      if (entity.entityType !== 'trap') return;
+      
+      // Parse entity data to get trigger configuration
+      let entityData = {};
+      try {
+        entityData = entity.data ? JSON.parse(entity.data) : {};
+      } catch (e) {
+        console.warn(`Failed to parse trap entity data for ${entity.entityId}`);
+        return;
+      }
+      
+      // Get trigger configuration
+      const trigger = entityData.trigger || {};
+      const triggerRadius = trigger.radius || 0;
+      
+      // Calculate all tiles in the trigger zone
+      const centerX = entity.position.x;
+      const centerY = entity.position.y;
+      
+      // For radius 0, only the trap tile itself
+      // For radius > 0, include all tiles within Manhattan distance
+      for (let dx = -triggerRadius; dx <= triggerRadius; dx++) {
+        for (let dy = -triggerRadius; dy <= triggerRadius; dy++) {
+          const distance = Math.abs(dx) + Math.abs(dy);
+          if (distance <= triggerRadius) {
+            const tileX = centerX + dx;
+            const tileY = centerY + dy;
+            const tileKey = `${tileX}_${tileY}`;
+            trapTilesToHighlight.add(tileKey);
+          }
+        }
+      }
+    });
+    
+    // Apply trap AoE highlight to tiles (respecting priority)
+    trapTilesToHighlight.forEach(tileKey => {
+      const tile = allTiles.get(tileKey);
+      if (!tile) return;
+      
+      // Check if tile is already highlighted by higher priority systems
+      const isInMovementPath = movementPath.includes(tileKey);
+      const isInSpellRange = spellRangeTiles.includes(tileKey);
+      const isInSpellTarget = spellTargetTiles.includes(tileKey);
+      
+      // Trap AoE has lowest priority - don't overwrite other highlights
+      if (isInMovementPath || isInSpellRange || isInSpellTarget) {
+        // Still track it for later cleanup, but don't change material
+        trapAoETiles.push(tileKey);
+        return;
+      }
+      
+      // Store original material if not already stored
+      if (!tile.userData) {
+        tile.userData = {};
+      }
+      if (!tile.userData.originalMaterial) {
+        tile.userData.originalMaterial = tile.material;
+      }
+      
+      // Apply trap AoE material
+      tile.material = trapAoEMaterial;
+      trapAoETiles.push(tileKey);
+    });
   };
   
   // Function to update target markers (3D arcane torus rings) for multi-target spells
@@ -500,6 +624,123 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       scene.metadata = {};
     }
     scene.metadata.targetMarkers = targetMarkers;
+  };
+  
+  /**
+   * Check if a tile is occupied by a unit or entity
+   * Returns detailed occupancy info for targeting validation
+   * 
+   * @param {number} x - Tile X coordinate
+   * @param {number} y - Tile Y coordinate  
+   * @param {Object} gameState - Current game state
+   * @returns {Object} Occupancy result:
+   *   - hasUnit: boolean - true if a player character is on this tile
+   *   - hasBlockingEntity: boolean - true if a blocking entity (blocksMovement/blocksVision) is on this tile
+   *   - hasAnyEntity: boolean - true if any entity (including non-blocking) is on this tile
+   *   - unit: Object|null - the unit on this tile (if any)
+   *   - entity: Object|null - the entity on this tile (if any)
+   */
+  const getTileOccupancy = (x, y, gameState) => {
+    const result = {
+      hasUnit: false,
+      hasBlockingEntity: false,
+      hasAnyEntity: false,
+      unit: null,
+      entity: null
+    };
+    
+    if (!gameState) return result;
+    
+    // Check for units (player characters)
+    if (gameState.myTeam && gameState.myTeam.players) {
+      const unit = Object.values(gameState.myTeam.players).find(p => 
+        p.position && p.position.x === x && p.position.y === y
+      );
+      if (unit) {
+        result.hasUnit = true;
+        result.unit = unit;
+      }
+    }
+    
+    if (!result.hasUnit && gameState.enemyTeam && gameState.enemyTeam.players) {
+      const unit = Object.values(gameState.enemyTeam.players).find(p => 
+        p.position && p.position.x === x && p.position.y === y
+      );
+      if (unit) {
+        result.hasUnit = true;
+        result.unit = unit;
+      }
+    }
+    
+    // Check for entities
+    if (gameState.spawnedEntities) {
+      const entityAtTile = Object.values(gameState.spawnedEntities).find(e => 
+        e.position && e.position.x === x && e.position.y === y
+      );
+      
+      if (entityAtTile) {
+        result.hasAnyEntity = true;
+        result.entity = entityAtTile;
+        
+        // Check if entity is blocking
+        try {
+          const entityData = JSON.parse(entityAtTile.data || '{}');
+          if (entityData.blocksMovement || entityData.blocksVision) {
+            result.hasBlockingEntity = true;
+          }
+        } catch (error) {
+          // Parse error - assume not blocking
+        }
+      }
+    }
+    
+    return result;
+  };
+  
+  /**
+   * Check if a tile is a valid target for CELL targeting based on occupancy rules
+   * Uses allowOccupiedCellTarget and allowBlockedCellTarget flags
+   * 
+   * @param {number} x - Tile X coordinate
+   * @param {number} y - Tile Y coordinate
+   * @param {Object} targeting - Spell targeting definition
+   * @param {Object} gameState - Current game state
+   * @returns {boolean} true if tile is valid for targeting
+   */
+  const isCellTargetValid = (x, y, targeting, gameState) => {
+    const occupancy = getTileOccupancy(x, y, gameState);
+    
+    // Check if tile is occupied by a unit
+    if (occupancy.hasUnit) {
+      // allowOccupiedCellTarget defaults to true for backward compatibility
+      const allowOccupied = targeting.allowOccupiedCellTarget !== false;
+      if (!allowOccupied) {
+        return false;
+      }
+    }
+    
+    // Check if tile has a blocking entity
+    if (occupancy.hasBlockingEntity) {
+      // allowBlockedCellTarget defaults to true for backward compatibility
+      const allowBlocked = targeting.allowBlockedCellTarget !== false;
+      if (!allowBlocked) {
+        return false;
+      }
+    }
+    
+    // Check for any entity (non-blocking) - future-proof flag
+    // By default, non-blocking entities don't prevent targeting
+    // unless allowOccupiedCellTarget is explicitly false AND entity exists
+    if (occupancy.hasAnyEntity && !occupancy.hasBlockingEntity) {
+      // For placement spells like traps, any entity on the tile should block
+      // We use allowOccupiedCellTarget for this - if it's false, no entities allowed
+      const allowOccupied = targeting.allowOccupiedCellTarget !== false;
+      if (!allowOccupied) {
+        return false;
+      }
+    }
+    
+    return true;
   };
   
   // Function to get all tiles within spell range
@@ -627,6 +868,10 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             }
             // Only walkable tiles (TILE) can be targeted
             else if (tileType !== TILE_TYPES.TILE) {
+              isValidTarget = false;
+            }
+            // Check occupancy constraints (units/entities)
+            else if (!isCellTargetValid(x, y, targeting, latestGameState)) {
               isValidTarget = false;
             }
           }
@@ -763,7 +1008,20 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             // For SELF targeting, only valid if targeting the caster's own position
             isValidTarget = (tileX === playerX && tileY === playerY);
           }
-          // For CELL targeting, any tile in range is valid (isValidTarget stays true)
+          // For CELL targeting, check occupancy constraints
+          if (targeting.targetType === 'CELL') {
+            // Check terrain type
+            if (terrain && terrain[tileY] && terrain[tileY][tileX] !== undefined) {
+              const tileType = terrain[tileY][tileX];
+              if (tileType === TILE_TYPES.WATER || tileType !== TILE_TYPES.TILE) {
+                isValidTarget = false;
+              }
+            }
+            // Check occupancy (units/entities)
+            if (isValidTarget && !isCellTargetValid(tileX, tileY, targeting, latestGameState)) {
+              isValidTarget = false;
+            }
+          }
           
           // Only highlight if target is valid
           if (isValidTarget) {
@@ -1195,6 +1453,10 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         updateSpawnedEntities(scene, newGameState, mapWidth, mapHeight);
         updateCombatTextFromState(scene, newGameState);
         
+        // Update trap AoE overlay for visible traps
+        // This shows trigger zones only for traps the player can see (their own team's traps)
+        updateTrapAoEOverlay(newGameState);
+        
         // If player is in cast mode, recalculate spell range to include newly spawned entities
         if (selectedSpell && selectedSpellDef && newGameState.phase === 'game') {
           const currentPlayer = newGameState.myTeam && 
@@ -1275,6 +1537,10 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                   }
                   // Only walkable tiles (TILE) can be targeted
                   else if (tileType !== TILE_TYPES.TILE) {
+                    isValidTarget = false;
+                  }
+                  // Check occupancy constraints (units/entities)
+                  else if (!isCellTargetValid(x, y, targeting, latestGameState)) {
                     isValidTarget = false;
                   }
                 }
@@ -1517,6 +1783,9 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                 // Check if this tile is a valid target
                 let isValidTarget = true;
                 
+                // Get latest game state for occupancy checks
+                const latestGameStateForValidation = scene.metadata?.gameState || currentGameState;
+                
                 // For CELL targeting, check if tile is valid (not water, not wall, etc.)
                 if (targeting.targetType === 'CELL') {
                   const tileType = terrain[y][x];
@@ -1526,6 +1795,10 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                   }
                   // Only walkable tiles (TILE) can be targeted
                   else if (tileType !== TILE_TYPES.TILE) {
+                    isValidTarget = false;
+                  }
+                  // Check occupancy constraints (units/entities)
+                  else if (!isCellTargetValid(x, y, targeting, latestGameStateForValidation)) {
                     isValidTarget = false;
                   }
                 }
@@ -2169,6 +2442,52 @@ async function createEntityMesh(entity, scene, tileSize) {
         mesh.material = material;
         mesh.position = new Vector3(xPos, (tileSize * 0.6) / 2, zPos);
       }
+      break;
+      
+    case 'trap':
+      // Trap entity - placeholder cube (to be replaced with GLB model later)
+      // Parse entity data to get subtype for potential different trap visuals
+      let trapData = {};
+      try {
+        trapData = entity.data ? JSON.parse(entity.data) : {};
+      } catch (e) {
+        console.warn(`Failed to parse trap entity data for ${entityId}`);
+      }
+      
+      const trapSubtype = trapData.entitySubtype || 'spike_trap';
+      
+      // Create a low-profile trap mesh (flat box or cylinder for now)
+      // The trap should be subtle - it's meant to be hidden from enemies
+      mesh = MeshBuilder.CreateBox(`entity_${entityId}`, {
+        width: tileSize * 0.6,
+        height: tileSize * 0.15,  // Very flat - trap is on the ground
+        depth: tileSize * 0.6
+      }, scene);
+      
+      // Create trap material - dark, slightly metallic look
+      const trapMaterial = new StandardMaterial(`entity_material_${entityId}`, scene);
+      trapMaterial.diffuseColor = new Color3(0.25, 0.22, 0.2);  // Dark gray/brown
+      trapMaterial.specularColor = new Color3(0.4, 0.35, 0.3);  // Slight metallic sheen
+      trapMaterial.emissiveColor = new Color3(0.05, 0.03, 0.03); // Very subtle glow
+      
+      // If this is the owner's trap, add a subtle highlight
+      // (Note: We determine ownership by checking if this trap should be visible)
+      // Since hidden traps are filtered on the server, if we receive it, we can see it
+      // For owner's traps, we could add a faint colored outline in the future
+      
+      mesh.material = trapMaterial;
+      
+      // Position slightly above ground so it's visible
+      mesh.position = new Vector3(xPos, tileSize * 0.08, zPos);
+      
+      // Add subtle rotation variation
+      mesh.rotation.y = Math.random() * Math.PI * 0.25; // Small random rotation
+      
+      // Store trap subtype in metadata for VFX routing
+      mesh.metadata = mesh.metadata || {};
+      mesh.metadata.trapSubtype = trapSubtype;
+      
+      console.log(`Created trap mesh: ${entityId} (${trapSubtype}) at (${xPos}, ${zPos})`);
       break;
       
     default:

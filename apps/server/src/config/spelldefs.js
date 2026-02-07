@@ -416,7 +416,7 @@ export const SpellDefs = {
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 2 },
+      cost: { energy: 5 },
       effects: [
         {
           kind: 'MOVEMENT',
@@ -446,29 +446,68 @@ export const SpellDefs = {
       }
     },
   
-    trap: {
-      spellId: 'trap',
-      name: 'Trap',
-      description: 'Place a trap on a target cell',
+    spike_trap: {
+      spellId: 'spike_trap',
+      name: 'Spike Trap',
+      description: 'Place a hidden spike trap that triggers when an enemy steps on it, dealing damage.',
       targeting: {
         targetType: 'CELL',
-        range: { min: 1, max: 3 },
+        range: { min: 1, max: 5 },
         requiresLoS: true,
         allowBlockedCellTarget: false,
         allowOccupiedCellTarget: false,
         pattern: 'SINGLE'
       },
-      cost: { energy: 2 },
+      cost: { energy: 6 },
       effects: [
         {
-          kind: 'DAMAGE',
-          amount: 2,
-          damageType: 'magic'
+          kind: 'SPAWN_ENTITY',
+          spawnEntity: {
+            entityType: 'trap',
+            entitySubtype: 'spike_trap', // For VFX routing
+            name: 'Spike Trap',
+            health: 0, // Invulnerable - can only be triggered
+            duration: 0, // Permanent until triggered
+            // Trap-specific configuration
+            trigger: {
+              type: 'MOVEMENT', // Triggers when unit enters the tile
+              targetFilter: 'ENEMY', // Only triggers on enemies (ENEMY, ALLY, ANY)
+              radius: 0, // 0 = single tile, >0 = AoE trigger zone
+              charges: 1, // Single use - remove after triggering
+              triggerOnPath: true // Triggers if enemy walks THROUGH the tile (not just ends there)
+            },
+            onTrigger: {
+              damage: 70,
+              damageType: 'physical',
+              // statusEffect: { effectId: 'bleed', duration: 2, ... } // Optional: can apply status
+            },
+            visibility: {
+              hiddenFromEnemies: true, // Enemy team cannot see this trap
+              revealOnTrigger: true, // Brief reveal when triggered (for VFX)
+              revealedByDetection: true // Can be revealed by detection spells (future)
+            },
+            blocksMovement: false, // Traps don't block movement
+            blocksVision: false
+          }
         }
       ],
       presentation: {
         castAnim: 'cast',
-        impactVfx: 'smoke_cloud',
+        // Placement VFX (owner sees this)
+        placementVfx: {
+          type: 'PARTICLE',
+          color: { r: 0.3, g: 0.3, b: 0.3 },
+          size: 0.3,
+          opacity: 0.5,
+          duration: 500
+        },
+        // Trigger VFX (everyone sees this when trap activates)
+        triggerVfx: {
+          type: 'spike_trap_trigger',
+          color: { r: 0.8, g: 0.2, b: 0.2 },
+          size: 1.0,
+          duration: 800
+        },
         sound: 'trap_place'
       },
       animations: {
@@ -502,11 +541,11 @@ export const SpellDefs = {
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 3 },
+      cost: { energy: 8 },
       effects: [
         {
           kind: 'DAMAGE',
-          amount: 6,
+          amount: 80,
           damageType: 'physical'
         }
       ],
@@ -546,11 +585,11 @@ export const SpellDefs = {
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 2 },
+      cost: { energy: 6 },
       effects: [
         {
           kind: 'DAMAGE',
-          amount: 3,
+          amount: 30,
           damageType: 'physical'
         }
       ],
@@ -590,11 +629,11 @@ export const SpellDefs = {
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 1 },
+      cost: { energy: 5 },
       effects: [
         {
           kind: 'DAMAGE',
-          amount: 2,
+          amount: 60,
           damageType: 'physical'
         }
       ],

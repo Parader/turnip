@@ -3,7 +3,7 @@
  * Handles rendering of spell projectiles, impacts, and ground effects
  */
 
-import { MeshBuilder, StandardMaterial, Color3, Color4, Vector3, Animation, AnimationGroup, ParticleSystem, Texture, DynamicTexture, Material, SceneLoader } from '@babylonjs/core';
+import { MeshBuilder, StandardMaterial, Color3, Color4, Vector3, Animation, AnimationGroup, ParticleSystem, Texture, DynamicTexture, Material, SceneLoader, QuadraticEase, EasingFunction } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
 
 // ============================================================================
@@ -2403,4 +2403,260 @@ export function playSpellVfx(scene, spellDef, startPos, endPos, castStartTime, m
   } else {
     console.warn(`VFX not implemented for spell: ${spellDef.spellId}`);
   }
+}
+
+// ============================================================================
+// TRAP VFX SYSTEM
+// Visual effects for trap triggers
+// ============================================================================
+
+/**
+ * Play trap trigger VFX at the specified position
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Object} trapData - Trap trigger data from server
+ * @param {string} trapData.entitySubtype - Type of trap (e.g., 'spike_trap')
+ * @param {Object} trapData.position - Position where trap triggered { x, y }
+ * @param {number} trapData.damage - Damage dealt by the trap
+ */
+export function playTrapTriggerVfx(scene, trapData) {
+  const { entitySubtype, position, damage } = trapData;
+  const tileSize = 1;
+  
+  // Convert grid position to world position
+  const worldPos = new Vector3(position.x * tileSize, 0.1, position.y * tileSize);
+  
+  // Route to specific trap VFX handler based on subtype
+  switch (entitySubtype) {
+    case 'spike_trap':
+      playSpikeTrapVfx(scene, worldPos, damage);
+      break;
+    default:
+      // Default trap trigger effect
+      playGenericTrapVfx(scene, worldPos, damage);
+      break;
+  }
+}
+
+/**
+ * Play spike trap trigger VFX
+ * Visual: Spikes shooting up from ground with particle burst
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Vector3} position - World position
+ * @param {number} damage - Damage dealt
+ */
+function playSpikeTrapVfx(scene, position, damage) {
+  // Create spike geometry - multiple vertical spikes shooting up
+  const spikeCount = 5;
+  const spikeMeshes = [];
+  
+  for (let i = 0; i < spikeCount; i++) {
+    // Random offset within tile
+    const offsetX = (Math.random() - 0.5) * 0.5;
+    const offsetZ = (Math.random() - 0.5) * 0.5;
+    
+    // Create a cone for the spike
+    const spike = MeshBuilder.CreateCylinder(`spike_${i}_${Date.now()}`, {
+      diameterTop: 0,
+      diameterBottom: 0.08 + Math.random() * 0.04,
+      height: 0.4 + Math.random() * 0.3,
+      tessellation: 6
+    }, scene);
+    
+    // Create material for spike (dark metallic)
+    const spikeMaterial = new StandardMaterial(`spikeMat_${i}_${Date.now()}`, scene);
+    spikeMaterial.diffuseColor = new Color3(0.3, 0.25, 0.2);
+    spikeMaterial.specularColor = new Color3(0.6, 0.5, 0.4);
+    spikeMaterial.emissiveColor = new Color3(0.1, 0.05, 0.05);
+    spike.material = spikeMaterial;
+    
+    // Position spike below ground initially
+    spike.position = new Vector3(
+      position.x + offsetX,
+      -0.5, // Start below ground
+      position.z + offsetZ
+    );
+    
+    spikeMeshes.push(spike);
+    
+    // Animate spike shooting up
+    const targetY = 0.2 + Math.random() * 0.2;
+    const animationDuration = 80 + Math.random() * 40; // 80-120ms
+    
+    // Create spike up animation
+    const upAnimation = new Animation(
+      `spikeUp_${i}`,
+      'position.y',
+      60, // 60 fps
+      Animation.ANIMATIONTYPE_FLOAT,
+      Animation.ANIMATIONLOOPMODE_CONSTANT
+    );
+    
+    const upFrames = Math.ceil(animationDuration / (1000 / 60));
+    upAnimation.setKeys([
+      { frame: 0, value: -0.5 },
+      { frame: upFrames, value: targetY }
+    ]);
+    
+    // Add easing for sharp spike motion
+    const easeOut = new QuadraticEase();
+    easeOut.setEasingMode(EasingFunction.EASINGMODE_EASEOUT);
+    upAnimation.setEasingFunction(easeOut);
+    
+    spike.animations = [upAnimation];
+    scene.beginAnimation(spike, 0, upFrames, false);
+    
+    // Schedule spike retraction and disposal
+    setTimeout(() => {
+      // Animate spike going back down
+      const downAnimation = new Animation(
+        `spikeDown_${i}`,
+        'position.y',
+        60,
+        Animation.ANIMATIONTYPE_FLOAT,
+        Animation.ANIMATIONLOOPMODE_CONSTANT
+      );
+      
+      downAnimation.setKeys([
+        { frame: 0, value: targetY },
+        { frame: 20, value: -0.5 }
+      ]);
+      
+      spike.animations = [downAnimation];
+      scene.beginAnimation(spike, 0, 20, false, 1.0, () => {
+        // Dispose spike after animation
+        spikeMaterial.dispose();
+        spike.dispose();
+      });
+    }, 300); // Retract after 300ms
+  }
+  
+  // Create blood/damage burst particle system
+  const particleSystem = new ParticleSystem(`trapBurst_${Date.now()}`, 50, scene);
+  
+  // Create a simple red particle texture
+  const particleTexture = createTrapParticleTexture(scene);
+  particleSystem.particleTexture = particleTexture;
+  
+  // Emitter at trap position
+  particleSystem.emitter = position.clone();
+  particleSystem.emitter.y = 0.3;
+  
+  // Particle colors - blood red
+  particleSystem.color1 = new Color4(0.8, 0.1, 0.1, 1.0);
+  particleSystem.color2 = new Color4(0.6, 0.05, 0.05, 0.8);
+  particleSystem.colorDead = new Color4(0.3, 0.02, 0.02, 0);
+  
+  // Particle size
+  particleSystem.minSize = 0.05;
+  particleSystem.maxSize = 0.15;
+  
+  // Particle lifetime
+  particleSystem.minLifeTime = 0.3;
+  particleSystem.maxLifeTime = 0.6;
+  
+  // Emission - burst
+  particleSystem.emitRate = 200;
+  particleSystem.manualEmitCount = 30;
+  
+  // Particle direction - upward burst
+  particleSystem.direction1 = new Vector3(-0.5, 1, -0.5);
+  particleSystem.direction2 = new Vector3(0.5, 2, 0.5);
+  
+  // Gravity pulls particles down
+  particleSystem.gravity = new Vector3(0, -3, 0);
+  
+  // Start particle system
+  particleSystem.start();
+  
+  // Stop and dispose after particles finish
+  setTimeout(() => {
+    particleSystem.stop();
+    setTimeout(() => {
+      particleSystem.dispose();
+    }, 700);
+  }, 200);
+}
+
+/**
+ * Create a simple particle texture for trap VFX
+ * @param {Scene} scene - Babylon.js scene
+ * @returns {DynamicTexture} Particle texture
+ */
+function createTrapParticleTexture(scene) {
+  const size = 32;
+  const texture = new DynamicTexture(`trapParticleTex_${Date.now()}`, size, scene, false);
+  const context = texture.getContext();
+  
+  // Draw a simple circular gradient
+  const center = size / 2;
+  const gradient = context.createRadialGradient(center, center, 0, center, center, center);
+  gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+  gradient.addColorStop(0.5, 'rgba(255, 200, 200, 0.8)');
+  gradient.addColorStop(1, 'rgba(255, 100, 100, 0)');
+  
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, size, size);
+  
+  texture.update();
+  texture.hasAlpha = true;
+  
+  return texture;
+}
+
+/**
+ * Play generic trap trigger VFX (fallback for unknown trap types)
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Vector3} position - World position
+ * @param {number} damage - Damage dealt
+ */
+function playGenericTrapVfx(scene, position, damage) {
+  // Simple flash effect
+  const flash = MeshBuilder.CreatePlane(`trapFlash_${Date.now()}`, {
+    width: 1,
+    height: 1
+  }, scene);
+  
+  flash.position = position.clone();
+  flash.position.y = 0.1;
+  flash.rotation.x = Math.PI / 2; // Lay flat on ground
+  
+  const flashMaterial = new StandardMaterial(`flashMat_${Date.now()}`, scene);
+  flashMaterial.diffuseColor = new Color3(1, 0.5, 0);
+  flashMaterial.emissiveColor = new Color3(1, 0.8, 0);
+  flashMaterial.alpha = 0.8;
+  flashMaterial.backFaceCulling = false;
+  flash.material = flashMaterial;
+  
+  // Animate flash expanding and fading
+  const scaleAnimation = new Animation(
+    'flashScale',
+    'scaling',
+    60,
+    Animation.ANIMATIONTYPE_VECTOR3,
+    Animation.ANIMATIONLOOPMODE_CONSTANT
+  );
+  
+  scaleAnimation.setKeys([
+    { frame: 0, value: new Vector3(0.3, 0.3, 0.3) },
+    { frame: 15, value: new Vector3(1.5, 1.5, 1.5) }
+  ]);
+  
+  const alphaAnimation = new Animation(
+    'flashAlpha',
+    'material.alpha',
+    60,
+    Animation.ANIMATIONTYPE_FLOAT,
+    Animation.ANIMATIONLOOPMODE_CONSTANT
+  );
+  
+  alphaAnimation.setKeys([
+    { frame: 0, value: 0.8 },
+    { frame: 15, value: 0 }
+  ]);
+  
+  flash.animations = [scaleAnimation, alphaAnimation];
+  scene.beginAnimation(flash, 0, 15, false, 1.0, () => {
+    flashMaterial.dispose();
+    flash.dispose();
+  });
 }

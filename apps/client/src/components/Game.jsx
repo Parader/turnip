@@ -3,8 +3,10 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useColyseus } from '../context/ColyseusContext';
 import { createBabylonScene, disposeBabylonScene } from '../utils/babylonScene';
-import { onServerTeleportConfirmed } from '../utils/babylon/babylonTeleport';
+import { onServerTeleportConfirmed, activeTeleports } from '../utils/babylon/babylonTeleport';
 import { babylonToServerOrientation } from '../utils/babylon/babylonPlayers';
+import { playTrapTriggerVfx } from '../utils/babylon/babylonVfx';
+import { queueTrapTrigger } from '../utils/babylon/babylonAnimations';
 import { Vector3 } from '@babylonjs/core';
 import { getMap, getClassSpells } from '../utils/api';
 import { connectToGameRoom } from '../utils/colyseus';
@@ -16,6 +18,96 @@ import LoadingScreen from './LoadingScreen';
 import '../styles/game.scss';
 
 const MATCH_INFO_KEY = 'currentMatchInfo';
+
+// Animation duration registry for different movement types (in milliseconds)
+// These are the total durations from when the position change starts to when
+// the character should be fully visible and ready for the trap to trigger
+const INSTANT_MOVEMENT_DELAYS = {
+  teleport: {
+    // Teleport phases: casting -> vanishing -> invisible -> appearing -> cleaning
+    // We want to trigger after the character is fully visible (end of appearing)
+    // The delay is calculated dynamically based on teleport controller state
+    baseDuration: 500,  // Fallback if no controller found
+    appearDuration: 500, // Duration of the appear phase
+    buffer: 1000,         // Extra buffer after appear (500 + 500 = 1s total)
+  },
+  knockback: {
+    baseDuration: 400,  // Typical knockback animation duration
+    buffer: 200,
+  },
+  jump: {
+    baseDuration: 600,  // For future jump/leap abilities
+    buffer: 200,
+  },
+  dash: {
+    baseDuration: 300,  // For future dash abilities
+    buffer: 150,
+  },
+  // Default fallback for unknown trigger sources
+  default: {
+    baseDuration: 500,
+    buffer: 300,
+  }
+};
+
+/**
+ * Calculate the delay before triggering trap VFX based on what movement brought the character here
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - User ID of the character who triggered the trap
+ * @param {string} triggerSource - What caused the position change ('teleport', 'knockback', 'jump', etc.)
+ * @returns {number} Delay in milliseconds before trap should trigger
+ */
+function getTrapTriggerDelay(scene, userId, triggerSource) {
+  // Get config for this trigger source, or use default
+  const config = INSTANT_MOVEMENT_DELAYS[triggerSource] || INSTANT_MOVEMENT_DELAYS.default;
+  
+  // For teleport, try to get dynamic timing from the teleport controller
+  if (triggerSource === 'teleport') {
+    const teleportController = activeTeleports?.get(userId);
+    
+    if (teleportController) {
+      // Calculate remaining time based on current teleport state
+      const state = teleportController.state;
+      const timings = teleportController.timings;
+      
+      let remainingTime = 0;
+      
+      switch (state) {
+        case 'casting':
+          // Still in casting phase - wait for full sequence
+          remainingTime = timings.castLeadIn + timings.vanishDuration + timings.appearDuration;
+          break;
+        case 'vanishing':
+          // Character is shrinking - wait for vanish + appear
+          remainingTime = timings.vanishDuration + timings.appearDuration;
+          break;
+        case 'invisible':
+          // Character is invisible, waiting for server - estimate appear time
+          remainingTime = timings.appearDuration;
+          break;
+        case 'appearing':
+          // Character is growing back - wait for appear to finish
+          remainingTime = timings.appearDuration;
+          break;
+        case 'cleaning':
+        case 'idle':
+          // Already visible - minimal delay
+          remainingTime = 0;
+          break;
+        default:
+          remainingTime = config.baseDuration;
+      }
+      
+      console.log(`[TrapDelay] Teleport state: ${state}, calculated remaining time: ${remainingTime}ms + ${config.buffer}ms buffer`);
+      return remainingTime + config.buffer;
+    }
+  }
+  
+  // For other trigger sources or if no dynamic timing available, use base duration + buffer
+  const totalDelay = config.baseDuration + config.buffer;
+  console.log(`[TrapDelay] Using base delay for ${triggerSource}: ${totalDelay}ms`);
+  return totalDelay;
+}
 
 const Game = () => {
   const { user } = useAuth();
@@ -622,12 +714,62 @@ const Game = () => {
       }
     };
     
+    // Handle trap trigger events - play VFX and apply visual feedback
+    // For movement triggers: VFX is queued to play after movement animation completes
+    // For teleport/knockback triggers: VFX plays immediately (no walking animation to wait for)
+    const handleTrapTriggered = (message) => {
+      console.log('[Game] Trap triggered:', message);
+      
+      if (babylonResourcesRef.current && babylonResourcesRef.current.scene) {
+        const scene = babylonResourcesRef.current.scene;
+        const triggeredUserId = message.triggerPlayerUserId;
+        const triggerSource = message.triggerSource || 'movement';
+        
+        // Create a callback function that plays the trap VFX and hit animation
+        const executeTrapTrigger = () => {
+          console.log('[Game] Executing trap trigger VFX for', triggeredUserId, 'source:', triggerSource);
+          
+          // Play the trap VFX at the trigger position
+          playTrapTriggerVfx(scene, {
+            entitySubtype: message.entitySubtype || 'spike_trap',
+            position: message.position,
+            damage: message.damage || 0
+          });
+          
+          // If the triggered player is visible, play hit animation
+          if (babylonResourcesRef.current && babylonResourcesRef.current.playHitAnimation) {
+            babylonResourcesRef.current.playHitAnimation(triggeredUserId);
+          }
+          
+          // Record damage for combat text display
+          if (babylonResourcesRef.current && babylonResourcesRef.current.recordSpellHit && message.damage > 0) {
+            babylonResourcesRef.current.recordSpellHit(triggeredUserId, 0, 1);
+          }
+        };
+        
+        // For teleport/knockback triggers, calculate dynamic delay based on animation duration
+        // For movement triggers, queue to wait until walking animation completes
+        if (triggerSource === 'teleport' || triggerSource === 'knockback') {
+          const delayMs = getTrapTriggerDelay(scene, triggeredUserId, triggerSource);
+          console.log(`[Game] Trap triggered via ${triggerSource}, executing VFX after ${delayMs}ms delay`);
+          setTimeout(() => {
+            executeTrapTrigger(); // This plays trap VFX, hit animation, and records damage
+          }, delayMs);
+        } else {
+          // Queue the trap trigger - it will execute immediately if player is not moving,
+          // or wait until their movement animation completes
+          queueTrapTrigger(scene, triggeredUserId, executeTrapTrigger);
+        }
+      }
+    };
+    
     // Store removal functions to properly clean up listeners
     const removeSpellCast = room.onMessage('spellCast', handleSpellCast);
     const removeSpellPrep = room.onMessage('spellPrep', handleSpellPrep);
     const removeSpellPrepCancel = room.onMessage('spellPrepCancel', handleSpellPrepCancel);
     const removeSpellHit = room.onMessage('spellHit', handleSpellHit);
     const removeTeleportConfirm = room.onMessage('teleportConfirm', handleTeleportConfirm);
+    const removeTrapTriggered = room.onMessage('trapTriggered', handleTrapTriggered);
     
     // Mark listeners as registered
     spellMessageListenersRegisteredRef.current = true;
@@ -640,6 +782,7 @@ const Game = () => {
       if (typeof removeSpellPrepCancel === 'function') removeSpellPrepCancel();
       if (typeof removeSpellHit === 'function') removeSpellHit();
       if (typeof removeTeleportConfirm === 'function') removeTeleportConfirm();
+      if (typeof removeTrapTriggered === 'function') removeTrapTriggered();
       
       // Reset registration flag
       spellMessageListenersRegisteredRef.current = false;

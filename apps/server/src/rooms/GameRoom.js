@@ -1376,9 +1376,28 @@ export class GameRoom extends Room {
       };
     });
     
-    // Convert spawned entities to object for client
+    // Convert spawned entities to object for client (with visibility filtering)
     const spawnedEntities = {};
     this.state.spawnedEntities.forEach((entity, entityId) => {
+      // Check visibility for traps and hidden entities
+      try {
+        const entityData = JSON.parse(entity.data || '{}');
+        const visibility = entityData.visibility || {};
+        
+        // If entity is hidden from enemies and viewer is on enemy team, skip it
+        if (visibility.hiddenFromEnemies && entity.team !== userTeam) {
+          // Check if entity has been revealed (by detection spell, etc.)
+          const isRevealed = entityData.isRevealed || false;
+          if (!isRevealed) {
+            // Don't include this entity for enemy viewers
+            return;
+          }
+        }
+      } catch (error) {
+        // If we can't parse data, include the entity (safe default)
+        console.warn(`Failed to parse entity data for visibility check: ${entityId}`, error);
+      }
+      
       spawnedEntities[entityId] = {
         entityId: entity.entityId,
         entityType: entity.entityType,
@@ -1637,22 +1656,58 @@ export class GameRoom extends Room {
     }
     
     // Path cost is path length - 1 (excluding start position)
-    const pathCost = path.length - 1;
+    const originalPathCost = path.length - 1;
     
     // Check if player has enough movement points
     const availableMP = player.movementPoints - player.usedMovementPoints;
-    if (pathCost > availableMP) {
-      console.log(`Movement denied: not enough movement points (need ${pathCost}, have ${availableMP})`);
+    if (originalPathCost > availableMP) {
+      console.log(`Movement denied: not enough movement points (need ${originalPathCost}, have ${availableMP})`);
       return;
     }
     
-    // Update position and used movement points
-    player.position.x = x;
-    player.position.y = y;
-    player.usedMovementPoints += pathCost;
+    // Check for traps along the movement path BEFORE updating position
+    // This allows us to interrupt movement if a trap triggers
+    const trapResult = this.checkTrapsAlongPath(player, path);
     
-    // Check for ground effect at new position (onEnter)
-    const newPosKey = `${x}_${y}`;
+    // Determine actual movement: either full path or interrupted at trap
+    let actualPathCost;
+    let finalX, finalY;
+    let actualPath;
+    
+    if (trapResult.interrupted) {
+      // Movement was interrupted by a trap
+      // Unit stops at the trap tile, not the intended destination
+      finalX = trapResult.interruptPosition.x;
+      finalY = trapResult.interruptPosition.y;
+      actualPathCost = trapResult.interruptIndex; // Steps taken = index of interrupt tile
+      actualPath = path.slice(0, trapResult.interruptIndex + 1); // Include the interrupt tile
+      
+      const refundedMP = originalPathCost - actualPathCost;
+      console.log(`Movement interrupted! Planned: ${originalPathCost} tiles, Actual: ${actualPathCost} tiles, Refunded: ${refundedMP} MP`);
+    } else {
+      // Normal movement - no interruption
+      finalX = x;
+      finalY = y;
+      actualPathCost = originalPathCost;
+      actualPath = path;
+    }
+    
+    // Update position and used movement points (only charge for tiles actually traveled)
+    player.position.x = finalX;
+    player.position.y = finalY;
+    player.usedMovementPoints += actualPathCost;
+    
+    // Remove triggered traps
+    trapResult.entitiesToRemove.forEach(entityId => {
+      console.log(`Removing triggered trap: ${entityId}`);
+      this.state.spawnedEntities.delete(entityId);
+    });
+    
+    // Use the actual path (possibly truncated) for client animation
+    path = actualPath;
+    
+    // Check for ground effect at actual final position (onEnter)
+    const newPosKey = `${finalX}_${finalY}`;
     const groundEffect = this.state.groundEffects.get(newPosKey);
     if (groundEffect) {
       try {
@@ -1678,7 +1733,7 @@ export class GameRoom extends Room {
       }
     }
     
-    // Store the path for clients to use
+    // Store the actual path (possibly truncated) for clients to use
     player.movementPath = JSON.stringify(path);
     
     // Recalculate orientation to face movement direction (use last step of path)
@@ -1686,11 +1741,16 @@ export class GameRoom extends Room {
       const lastStep = path[path.length - 1];
       const secondLastStep = path[path.length - 2];
       player.orientation = Math.atan2(lastStep.y - secondLastStep.y, lastStep.x - secondLastStep.x);
-    } else if (x !== currentX || y !== currentY) {
-      player.orientation = Math.atan2(y - currentY, x - currentX);
+    } else if (finalX !== currentX || finalY !== currentY) {
+      player.orientation = Math.atan2(finalY - currentY, finalX - currentX);
     }
     
-    console.log(`Player ${userId} moved to (${x}, ${y}), used ${pathCost} MP (${player.usedMovementPoints}/${player.movementPoints}), path length: ${path.length}`);
+    // Log movement result with interruption info if applicable
+    if (trapResult.interrupted) {
+      console.log(`Player ${userId} moved to (${finalX}, ${finalY}) [INTERRUPTED], used ${actualPathCost} MP (${player.usedMovementPoints}/${player.movementPoints}), refunded ${originalPathCost - actualPathCost} MP`);
+    } else {
+      console.log(`Player ${userId} moved to (${finalX}, ${finalY}), used ${actualPathCost} MP (${player.usedMovementPoints}/${player.movementPoints}), path length: ${path.length}`);
+    }
     
     this.broadcastFilteredState();
     
@@ -1999,6 +2059,15 @@ export class GameRoom extends Room {
           }
           
           console.log(`Player ${userId} teleported from (${oldX}, ${oldY}) to (${newX}, ${newY})`);
+          
+          // Check for traps at the teleport destination
+          const trapResult = this.checkTrapsAtPosition(player, newX, newY);
+          
+          // Remove any triggered traps
+          trapResult.entitiesToRemove.forEach(entityId => {
+            console.log(`Removing triggered trap: ${entityId}`);
+            this.state.spawnedEntities.delete(entityId);
+          });
           
           // Broadcast updated state with new position
           this.broadcastFilteredState();
@@ -2698,6 +2767,16 @@ export class GameRoom extends Room {
       entityData.blocksVision = spawnDef.blocksVision;
     }
     
+    // Handle trap-specific visibility settings
+    if (entityData.visibility === undefined && spawnDef.visibility !== undefined) {
+      entityData.visibility = spawnDef.visibility;
+    }
+    
+    // Store entity subtype for VFX routing (traps have subtypes like 'spike_trap')
+    if (entityData.entitySubtype === undefined && spawnDef.entitySubtype !== undefined) {
+      entityData.entitySubtype = spawnDef.entitySubtype;
+    }
+    
     entity.data = JSON.stringify(entityData);
     
     // Debug log to verify blocking flags are set
@@ -2816,8 +2895,14 @@ export class GameRoom extends Room {
    * @param {SpawnedEntityState} entity - Entity being triggered
    * @param {Object} entityData - Parsed entity data
    * @param {PlayerState} triggerPlayer - Player that triggered the entity
+   * @param {Object} triggerPosition - Position where the trigger occurred { x, y }
+   * @param {string} triggerSource - How the trap was triggered: 'movement', 'teleport', 'knockback', etc.
+   * @returns {boolean} Whether the entity should be removed after triggering
    */
-  triggerEntity(entity, entityData, triggerPlayer) {
+  triggerEntity(entity, entityData, triggerPlayer, triggerPosition = null, triggerSource = 'movement') {
+    const effectivePosition = triggerPosition || { x: entity.position.x, y: entity.position.y };
+    let shouldRemove = false;
+    
     if (entityData.onTrigger) {
       if (entityData.onTrigger.damage) {
         triggerPlayer.health -= entityData.onTrigger.damage;
@@ -2833,6 +2918,195 @@ export class GameRoom extends Room {
         this.applyStatusEffect(triggerPlayer, entityData.onTrigger.statusEffect, entity.sourceSpellId, entity.sourceUserId);
       }
     }
+    
+    // Check if trap should be consumed (charges system)
+    if (entityData.trigger && entityData.trigger.charges !== undefined) {
+      if (entityData.trigger.charges <= 1) {
+        shouldRemove = true;
+      } else {
+        // Decrement charges
+        entityData.trigger.charges--;
+        entity.data = JSON.stringify(entityData);
+      }
+    } else {
+      // Default: single-use traps are removed after triggering
+      shouldRemove = true;
+    }
+    
+    // Broadcast trap trigger event to all clients for VFX
+    // Include triggerSource so client knows whether to wait for movement animation
+    this.broadcast('trapTriggered', {
+      entityId: entity.entityId,
+      entityType: entity.entityType,
+      entitySubtype: entityData.entitySubtype || entity.entityType,
+      position: effectivePosition,
+      triggerPlayerUserId: triggerPlayer.userId,
+      triggerPlayerTeam: triggerPlayer.team,
+      ownerTeam: entity.team,
+      damage: entityData.onTrigger?.damage || 0,
+      sourceSpellId: entity.sourceSpellId,
+      vfx: entityData.triggerVfx || null,
+      triggerSource: triggerSource // 'movement', 'teleport', 'knockback', etc.
+    });
+    
+    return shouldRemove;
+  }
+  
+  /**
+   * Check if any traps trigger along a movement path
+   * This is called immediately when a unit moves, not at turn end
+   * Returns the first trap triggered (movement interruption) along with removal info
+   * 
+   * @param {PlayerState} movingPlayer - The player moving
+   * @param {Array<{x: number, y: number}>} path - The movement path (including start position)
+   * @returns {Object} Result object:
+   *   - interrupted: boolean - whether movement was interrupted by a trap
+   *   - interruptIndex: number - path index where interruption occurred (0 = no movement)
+   *   - interruptPosition: {x, y} - tile position where unit should stop
+   *   - entitiesToRemove: Array<string> - entity IDs that should be removed
+   */
+  checkTrapsAlongPath(movingPlayer, path) {
+    const result = {
+      interrupted: false,
+      interruptIndex: -1,
+      interruptPosition: null,
+      entitiesToRemove: []
+    };
+    
+    const playerTeam = movingPlayer.team;
+    
+    // Check each tile in the path (skip the first tile - starting position)
+    for (let i = 1; i < path.length; i++) {
+      const tile = path[i];
+      
+      // Check all spawned entities for trap triggers at this tile
+      let trapTriggeredAtThisTile = false;
+      
+      this.state.spawnedEntities.forEach((entity, entityId) => {
+        // Skip if we already found a trap at this tile (one trigger per tile)
+        if (trapTriggeredAtThisTile) return;
+        // Skip if already marked for removal
+        if (result.entitiesToRemove.includes(entityId)) return;
+        
+        try {
+          const entityData = JSON.parse(entity.data || '{}');
+          
+          // Only check entities with MOVEMENT triggers
+          if (!entityData.trigger || entityData.trigger.type !== 'MOVEMENT') return;
+          
+          const trigger = entityData.trigger;
+          const triggerRadius = trigger.radius || 0;
+          
+          // Check if the tile is within trigger range
+          const distance = Math.abs(tile.x - entity.position.x) + Math.abs(tile.y - entity.position.y);
+          if (distance > triggerRadius) return;
+          
+          // Check target filter (ENEMY, ALLY, ANY)
+          const targetFilter = trigger.targetFilter || 'ENEMY';
+          const isEnemy = playerTeam !== entity.team;
+          const isAlly = playerTeam === entity.team;
+          
+          if (targetFilter === 'ENEMY' && !isEnemy) return;
+          if (targetFilter === 'ALLY' && !isAlly) return;
+          // ANY passes through
+          
+          // Trigger the trap!
+          console.log(`Trap ${entityId} triggered by ${movingPlayer.username} at (${tile.x}, ${tile.y}) [path index ${i}]`);
+          const shouldRemove = this.triggerEntity(entity, entityData, movingPlayer, tile);
+          
+          if (shouldRemove) {
+            result.entitiesToRemove.push(entityId);
+          }
+          
+          // Mark that we triggered a trap at this tile
+          trapTriggeredAtThisTile = true;
+          
+          // If this is the first trap triggered, record interruption point
+          if (!result.interrupted) {
+            result.interrupted = true;
+            result.interruptIndex = i;
+            result.interruptPosition = { x: tile.x, y: tile.y };
+            console.log(`Movement interrupted at path index ${i}, position (${tile.x}, ${tile.y})`);
+          }
+          
+        } catch (error) {
+          console.error(`Error checking trap ${entityId}:`, error);
+        }
+      });
+      
+      // If movement was interrupted, stop checking further tiles
+      // (the unit won't reach them)
+      if (result.interrupted) {
+        break;
+      }
+    }
+    
+    return result;
+  }
+
+  /**
+   * Check and trigger any traps at a specific position (for teleportation, knockback, etc.)
+   * Unlike checkTrapsAlongPath, this checks a single tile with no path interruption concept.
+   * 
+   * @param {PlayerState} player - The player arriving at the position
+   * @param {number} x - X coordinate to check
+   * @param {number} y - Y coordinate to check
+   * @returns {Object} Result object:
+   *   - triggered: boolean - whether any trap was triggered
+   *   - entitiesToRemove: Array<string> - entity IDs that should be removed
+   */
+  checkTrapsAtPosition(player, x, y) {
+    const result = {
+      triggered: false,
+      entitiesToRemove: []
+    };
+    
+    const playerTeam = player.team;
+    const position = { x, y };
+    
+    this.state.spawnedEntities.forEach((entity, entityId) => {
+      // Skip if already marked for removal
+      if (result.entitiesToRemove.includes(entityId)) return;
+      
+      try {
+        const entityData = JSON.parse(entity.data || '{}');
+        
+        // Check entities with MOVEMENT triggers (traps that trigger when you arrive on tile)
+        // This includes teleportation, knockback, or any other instant position change
+        if (!entityData.trigger || entityData.trigger.type !== 'MOVEMENT') return;
+        
+        const trigger = entityData.trigger;
+        const triggerRadius = trigger.radius || 0;
+        
+        // Check if position is within trigger range of the entity
+        const distance = Math.abs(x - entity.position.x) + Math.abs(y - entity.position.y);
+        if (distance > triggerRadius) return;
+        
+        // Check target filter (ENEMY, ALLY, ANY)
+        const targetFilter = trigger.targetFilter || 'ENEMY';
+        const isEnemy = playerTeam !== entity.team;
+        const isAlly = playerTeam === entity.team;
+        
+        if (targetFilter === 'ENEMY' && !isEnemy) return;
+        if (targetFilter === 'ALLY' && !isAlly) return;
+        // ANY passes through
+        
+        // Trigger the trap!
+        console.log(`Trap ${entityId} triggered by ${player.username} arriving at (${x}, ${y}) via teleport/knockback`);
+        const shouldRemove = this.triggerEntity(entity, entityData, player, position, 'teleport');
+        
+        if (shouldRemove) {
+          result.entitiesToRemove.push(entityId);
+        }
+        
+        result.triggered = true;
+        
+      } catch (error) {
+        console.error(`Error checking trap ${entityId} at position:`, error);
+      }
+    });
+    
+    return result;
   }
 
   /**
