@@ -374,28 +374,6 @@ function updateCombatTextSystem(scene, now) {
   }
 }
 
-function emitSplitDamage(scene, { targetKey, targetMesh, totalAmount, hitCount, delayMs }) {
-  let remaining = Math.max(0, totalAmount);
-  const hits = Math.max(1, hitCount);
-  const staggerMs = 180;
-
-  for (let i = 0; i < hits; i += 1) {
-    const hitsLeft = hits - i;
-    const chunk = i === hits - 1 ? remaining : Math.max(1, Math.round(remaining / hitsLeft));
-    remaining = Math.max(0, remaining - chunk);
-
-    const hitDelayMs = delayMs + i * staggerMs;
-    setTimeout(() => {
-      spawnCombatText(scene, {
-        targetKey,
-        targetMesh,
-        type: 'damage',
-        amount: chunk
-      });
-    }, hitDelayMs);
-  }
-}
-
 function flushPendingDamageTimeouts(scene, now) {
   const combatText = scene.metadata?.combatText;
   if (!combatText || combatText.pendingDamage.size === 0) {
@@ -412,25 +390,13 @@ function flushPendingDamageTimeouts(scene, now) {
       }
       
       const baseDelay = pending.hitDelayMs ?? COMBAT_TEXT_CONFIG.damageHitOffsetMs;
-      const expectedHits = combatText.expectedHits.get(key) || 0;
-      if (expectedHits > 1) {
-        emitSplitDamage(scene, {
-          targetKey: key,
-          targetMesh: pending.targetMesh,
-          totalAmount: pending.amount,
-          hitCount: expectedHits,
-          delayMs: baseDelay + COMBAT_TEXT_CONFIG.damageExtraDelayMs
-        });
-        combatText.expectedHits.delete(key);
-      } else {
-        queueCombatText(scene, {
-          targetKey: key,
-          targetMesh: pending.targetMesh,
-          type: 'damage',
-          amount: pending.amount,
-          delayMs: baseDelay + COMBAT_TEXT_CONFIG.damageExtraDelayMs
-        });
-      }
+      queueCombatText(scene, {
+        targetKey: key,
+        targetMesh: pending.targetMesh,
+        type: 'damage',
+        amount: pending.amount,
+        delayMs: baseDelay + COMBAT_TEXT_CONFIG.damageExtraDelayMs
+      });
     }
   });
 }
@@ -446,32 +412,42 @@ function flushPendingDamage(scene, targetKey) {
   }
 
   combatText.pendingDamage.delete(targetKey);
-  
-  // Skip if unit not yet initialized (startup noise)
   if (!combatText.initializedUnits.has(targetKey)) {
     return;
   }
-  
-  const baseDelay = pending.hitDelayMs ?? combatText.hitDelays.get(targetKey) ?? COMBAT_TEXT_CONFIG.damageHitOffsetMs;
-  const expectedHits = combatText.expectedHits.get(targetKey) || 0;
-  if (expectedHits > 1) {
-    emitSplitDamage(scene, {
-      targetKey,
-      targetMesh: pending.targetMesh,
-      totalAmount: pending.amount,
-      hitCount: expectedHits,
-      delayMs: baseDelay + COMBAT_TEXT_CONFIG.damageExtraDelayMs
-    });
-    combatText.expectedHits.delete(targetKey);
-    return;
-  }
 
+  const baseDelay = pending.hitDelayMs ?? combatText.hitDelays.get(targetKey) ?? COMBAT_TEXT_CONFIG.damageHitOffsetMs;
   queueCombatText(scene, {
     targetKey,
     targetMesh: pending.targetMesh,
     type: 'damage',
     amount: pending.amount,
     delayMs: baseDelay + COMBAT_TEXT_CONFIG.damageExtraDelayMs
+  });
+}
+
+/**
+ * Flush any pending damage for this target and show it immediately (0 delay).
+ * Call from VFX impact callback so damage text appears in sync with impact/hit animation.
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} targetUserId - Target player's user ID
+ */
+export function flushPendingDamageForImpact(scene, targetUserId) {
+  const combatText = scene.metadata?.combatText;
+  if (!combatText || !targetUserId) return;
+  const targetKey = `player:${targetUserId}`;
+  const pending = combatText.pendingDamage.get(targetKey);
+  if (!pending) return;
+
+  combatText.pendingDamage.delete(targetKey);
+  if (!combatText.initializedUnits.has(targetKey)) return;
+
+  queueCombatText(scene, {
+    targetKey,
+    targetMesh: pending.targetMesh,
+    type: 'damage',
+    amount: pending.amount,
+    delayMs: 0
   });
 }
 
@@ -529,7 +505,8 @@ export function initCombatTextSystem(scene, camera) {
     lastTurn: null,
     hitTimes: new Map(),
     hitDelays: new Map(),
-    expectedHits: new Map(),
+    /** When we showed effect (e.g. poison) damage so state update does not show it again: key -> { amount, at } */
+    effectDamageShown: new Map(),
     tempVec: new Vector3(),
     camera,
     initializedUnits: new Set(),
@@ -604,11 +581,11 @@ export function disposeCombatTextSystem(scene) {
   // Clear all maps
   combatText.pending.clear();
   combatText.pendingDamage.clear();
+  combatText.effectDamageShown?.clear();
   combatText.targetStacks.clear();
   combatText.lastUnits.clear();
   combatText.hitTimes.clear();
   combatText.hitDelays.clear();
-  combatText.expectedHits.clear();
   combatText.initializedUnits.clear();
   
   // Remove reference
@@ -698,18 +675,18 @@ export function updateCombatTextFromState(scene, newGameState) {
     // Skip damage if prev.health was 0 (initialization) or current health is 0 (init quirk)
     if (healthDelta < 0 && prev.health > 0 && health > 0) {
       const amount = Math.abs(healthDelta);
-      const expectedHits = combatText.expectedHits.get(key) || 0;
-      const baseDelay = combatText.hitDelays.get(key) ?? COMBAT_TEXT_CONFIG.damageHitOffsetMs;
-      if (expectedHits > 1) {
-        emitSplitDamage(scene, {
-          targetKey: key,
-          targetMesh,
-          totalAmount: amount,
-          hitCount: expectedHits,
-          delayMs: baseDelay + COMBAT_TEXT_CONFIG.damageExtraDelayMs
-        });
-        combatText.expectedHits.delete(key);
-      } else {
+      let skipDamage = false;
+      const shown = combatText.effectDamageShown?.get(key);
+      if (shown) {
+        const age = now - shown.at;
+        if (age <= EFFECT_DAMAGE_DEDUP_MS && shown.amount === amount) {
+          combatText.effectDamageShown.delete(key);
+          skipDamage = true;
+        } else if (age > EFFECT_DAMAGE_DEDUP_MS) {
+          combatText.effectDamageShown.delete(key);
+        }
+      }
+      if (!skipDamage) {
         const existing = combatText.pendingDamage.get(key);
         if (existing) {
           existing.amount += amount;
@@ -779,25 +756,48 @@ export function updateCombatTextFromState(scene, newGameState) {
 }
 
 /**
- * Record a spell hit for combat text synchronization
- * @param {Scene} scene - Babylon.js scene
- * @param {string} targetUserId - Target player's user ID
- * @param {number} hitDelayMs - Delay before showing damage text
- * @param {number} hitCount - Number of hits (for multi-hit spells)
+ * Record spell hit for combat text timing: set hit delay for this target and flush any pending
+ * damage so it shows in sync with the hit. Damage numbers come from state only (no per-hit from server).
  */
-export function recordCombatTextHit(scene, targetUserId, hitDelayMs = 0, hitCount = 1) {
+export function recordCombatTextHit(scene, targetUserId, hitDelayMs = 0) {
   const combatText = scene.metadata?.combatText;
-  if (!combatText || !targetUserId) {
-    return;
-  }
-
+  if (!combatText || !targetUserId) return;
   const targetKey = `player:${targetUserId}`;
   combatText.hitTimes.set(targetKey, Date.now());
   combatText.hitDelays.set(targetKey, hitDelayMs);
-
-  if (hitCount > 1) {
-    combatText.expectedHits.set(targetKey, hitCount);
-  }
-
   flushPendingDamage(scene, targetKey);
+}
+
+const EFFECT_DAMAGE_DEDUP_MS = 3000;
+
+/**
+ * Queue damage text for turn-start effect damage (e.g. poison) so it shows in sync with hit animation.
+ * Bypasses aggregation window so the number appears on the next frame with the hit.
+ * Records that we showed this damage so updateCombatTextFromState does not show it again when state arrives.
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} userId - Target player's user ID (activeEntityId)
+ * @param {number} amount - Total damage amount to show
+ */
+export function queueEffectDamageText(scene, userId, amount) {
+  const combatText = scene.metadata?.combatText;
+  const playerMeshes = scene.metadata?.playerMeshes;
+  if (!combatText || !playerMeshes || !userId || amount <= 0) {
+    return;
+  }
+  const targetMesh = playerMeshes.get(userId);
+  if (!targetMesh) {
+    return;
+  }
+  const targetKey = `player:${userId}`;
+  const now = Date.now();
+  combatText.effectDamageShown.set(targetKey, { amount, at: now });
+  const key = `${targetKey}:damage:effect`;
+  combatText.pending.set(key, {
+    targetKey,
+    targetMesh,
+    type: 'damage',
+    amount,
+    lastTime: now - (COMBAT_TEXT_CONFIG.aggregationWindowMs + 50),
+    availableAt: now
+  });
 }

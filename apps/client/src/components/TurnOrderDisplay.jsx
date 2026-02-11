@@ -51,6 +51,25 @@ const TurnOrderDisplay = ({ gameState, currentUserId }) => {
                 {player.team && (
                   <div className="player-team">Team {player.team}</div>
                 )}
+                {player.statusEffects && Object.keys(player.statusEffects).length > 0 && (
+                  <div className="card-status-effects">
+                    {Object.entries(player.statusEffects).map(([effectId, eff]) => {
+                      const id = eff.effectId || effectId;
+                      const letter = id.charAt(0).toUpperCase();
+                      const turns = eff.duration;
+                      const stacks = eff.stacks || 1;
+                      const tooltip = `${id} — ${turns} turn(s) left${stacks > 1 ? `, ${stacks} stacks` : ''}`;
+                      return (
+                        <span key={effectId} className="turn-effect-badge" title={tooltip}>
+                          <span className="turn-effect-letter">{letter}</span>
+                          <span className="turn-effect-turns">{turns}</span>
+                          <span className="turn-effect-stacks">{stacks}</span>
+                          <span className="turn-effect-tooltip" role="tooltip">{tooltip}</span>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
               {isCurrentPlayer && (
                 <div className="current-indicator">▶</div>

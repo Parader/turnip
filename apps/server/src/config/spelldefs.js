@@ -1,5 +1,6 @@
 // Canonical server-side spell definitions registry
 // This is the single source of truth for all spell rules
+import { getEffectDef } from './effectRegistry.js';
 
 /**
  * @typedef {Object} TargetingDef
@@ -247,8 +248,7 @@ export const SpellDefs = {
           explosionRadius: 1.5, // Explosion reaches 1.5 cells radius
           explosionDuration: 300 // Expansion takes 300ms
         },
-        // Hit animation delay to sync with explosion VFX
-        hitDelayMs: 1000, // Delay hit animation by 550ms to match explosion timing
+        // Note: Hit animation delay is now calculated dynamically based on projectile travel time
         // Ground effect: burning fire
         groundEffectVfx: {
           vfx: {
@@ -335,7 +335,7 @@ export const SpellDefs = {
         }
       }
     },
-  
+
     heal: {
       spellId: 'heal',
       name: 'Heal',
@@ -416,7 +416,7 @@ export const SpellDefs = {
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 5 },
+      cost: { energy: 4 },
       effects: [
         {
           kind: 'MOVEMENT',
@@ -449,7 +449,7 @@ export const SpellDefs = {
     spike_trap: {
       spellId: 'spike_trap',
       name: 'Spike Trap',
-      description: 'Place a hidden spike trap that triggers when an enemy steps on it, dealing damage.',
+      description: 'Place a hidden spike trap that triggers when any unit steps on it, dealing damage.',
       targeting: {
         targetType: 'CELL',
         range: { min: 1, max: 5 },
@@ -470,11 +470,11 @@ export const SpellDefs = {
             duration: 0, // Permanent until triggered
             // Trap-specific configuration
             trigger: {
-              type: 'MOVEMENT', // Triggers when unit enters the tile
-              targetFilter: 'ENEMY', // Only triggers on enemies (ENEMY, ALLY, ANY)
+              type: 'MOVEMENT', // Triggers when any unit enters the tile
+              targetFilter: 'ANY', // Triggers for any team (ENEMY, ALLY, ANY)
               radius: 0, // 0 = single tile, >0 = AoE trigger zone
               charges: 1, // Single use - remove after triggering
-              triggerOnPath: true // Triggers if enemy walks THROUGH the tile (not just ends there)
+              triggerOnPath: true // Triggers if unit walks THROUGH the tile (not just ends there)
             },
             onTrigger: {
               damage: 70,
@@ -550,7 +550,7 @@ export const SpellDefs = {
         }
       ],
       presentation: {
-        castAnim: 'melee',
+        castAnim: 'attack3',
         impactVfx: 'backstab_impact',
         sound: 'backstab_hit'
       },
@@ -563,11 +563,17 @@ export const SpellDefs = {
           canMoveWhilePreparing: false
         },
         cast: {
-          name: 'melee',
+          name: 'attack3',
           blendInMs: 50,
           blendOutMs: 150,
           lockMs: 700,
-          impactDelayMs: 400
+          impactDelayMs: 400,
+          weaponAttachment: {
+            meshUrl: '/assets/dagger.glb',
+            boneName: 'mixamorig:RightHandWeapon',
+            scale: 1
+            // Optional: positionOffset: { x: 0, y: 0, z: 0 }, rotationOffset: { x: 0, y: 0, z: 0 }
+          }
         }
       }
     },
@@ -588,13 +594,23 @@ export const SpellDefs = {
       cost: { energy: 6 },
       effects: [
         {
-          kind: 'DAMAGE',
-          amount: 30,
-          damageType: 'physical'
+          kind: 'STATUS_EFFECT',
+          statusEffect: {
+            effectId: 'poison',
+            name: 'Poison',
+            duration: 3,
+            stackable: true,
+            maxStacks: 3,
+            type: 'DEBUFF',
+            onApply: {},
+            onTurnStart: { damage: 20 },
+            onTurnEnd: {},
+            onRemove: {}
+          }
         }
       ],
       presentation: {
-        castAnim: 'melee',
+        castAnim: 'attack4',
         impactVfx: 'poison_cloud',
         sound: 'dagger_swing'
       },
@@ -607,11 +623,18 @@ export const SpellDefs = {
           canMoveWhilePreparing: false
         },
         cast: {
-          name: 'melee',
+          name: 'attack4',
           blendInMs: 50,
           blendOutMs: 150,
           lockMs: 600,
-          impactDelayMs: 300
+          impactDelayMs: 300,
+          // Attach dagger to hand bone during this cast animation (client-only)
+          weaponAttachment: {
+            meshUrl: '/assets/dagger.glb',
+            boneName: 'mixamorig:LeftHandWeapon',
+            scale: 1
+            // Optional: positionOffset: { x: 0, y: 0, z: 0 }, rotationOffset: { x: 0, y: 0, z: 0 }
+          }
         }
       }
     },
@@ -1750,7 +1773,19 @@ export const SpellDefs = {
     if (casterState.energyLeft < spell.cost.energy) {
       return { valid: false, error: `Not enough energy (need ${spell.cost.energy}, have ${casterState.energyLeft})` };
     }
-    
+
+    // Silence: cannot cast if any status effect blocks casting (effect def has blocksCasting)
+    if (casterState.statusEffects) {
+      const effects = casterState.statusEffects;
+      const keys = typeof effects.forEach === 'function' ? Array.from(effects.keys()) : Object.keys(effects);
+      for (const effectId of keys) {
+        const def = getEffectDef(effectId);
+        if (def && def.blocksCasting) {
+          return { valid: false, error: 'Silenced' };
+        }
+      }
+    }
+
     return { valid: true };
   };
   

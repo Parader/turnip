@@ -1,0 +1,141 @@
+.audio-settings-toggle {
+  position: fixed;
+  top: 10px;
+  right: 50px;
+  width: 36px;
+  height: 36px;
+  background: rgba(30, 30, 40, 0.9);
+  border: 1px solid rgba(100, 120, 140, 0.5);
+  border-radius: 6px;
+  color: #e0e0e0;
+  font-size: 18px;
+  cursor: pointer;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+
+  &:hover {
+    background: rgba(50, 50, 60, 0.95);
+    border-color: rgba(140, 160, 180, 0.7);
+  }
+
+  &.muted {
+    color: #ff6666;
+  }
+}
+
+.audio-settings-panel {
+  position: fixed;
+  top: 55px;
+  right: 10px;
+  width: 280px;
+  background: rgba(25, 25, 35, 0.95);
+  border: 1px solid rgba(100, 120, 140, 0.5);
+  border-radius: 8px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+  z-index: 1001;
+  backdrop-filter: blur(10px);
+}
+
+.audio-settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 15px;
+  border-bottom: 1px solid rgba(100, 120, 140, 0.3);
+
+  h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: #e0e0e0;
+  }
+}
+
+.audio-settings-close {
+  background: transparent;
+  border: none;
+  color: #888;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: all 0.2s ease;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #fff;
+  }
+}
+
+.audio-settings-content {
+  padding: 15px;
+}
+
+.audio-setting-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+
+  &:last-child {
+    margin-bottom: 0;
+  }
+
+  label {
+    flex: 0 0 60px;
+    font-size: 12px;
+    color: #b0b0b0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+
+    input[type="checkbox"] {
+      margin: 0;
+      cursor: pointer;
+    }
+  }
+
+  input[type="range"] {
+    flex: 1;
+    height: 4px;
+    background: rgba(100, 120, 140, 0.3);
+    border-radius: 2px;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+
+    &::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      background: #6090c0;
+      border-radius: 50%;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+
+    &::-webkit-slider-thumb:hover {
+      background: #70a0d0;
+    }
+
+    &:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+
+      &::-webkit-slider-thumb {
+        background: #666;
+        cursor: not-allowed;
+      }
+    }
+  }
+
+  .volume-value {
+    flex: 0 0 40px;
+    font-size: 11px;
+    color: #888;
+    text-align: right;
+  }
+}

@@ -1,14 +1,128 @@
-import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput, Animation, CubeTexture } from '@babylonjs/core';
+import { Engine, Scene, ArcRotateCamera, Vector3, HemisphericLight, MeshBuilder, StandardMaterial, Color3, DirectionalLight, SceneLoader, AnimationGroup, ShadowGenerator, PBRMaterial, TransformNode, ActionManager, ExecuteCodeAction, PointerEventTypes, ArcRotateCameraPointersInput, Animation, CubeTexture, AssetContainer } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
 import { TILE_TYPES, doesTileBlockLOS } from './mapRenderer';
 import { findPath, getMovementRange } from './pathfinding';
 import { build3DMap } from './babylon/babylonMap';
 import { buildPlayerCharacters, updatePlayerCharacters } from './babylon/babylonPlayers';
 import { startMovementAnimation, startStanceAnimation, stopStanceAnimation, playCastAnimation, playHitAnimation, updateMovementAnimations, blendAnimations } from './babylon/babylonAnimations';
-import { playSpellVfx, preWarmArcaneMissileShaders, disposeVfxCache } from './babylon/babylonVfx';
+import { playSpellVfx, preWarmArcaneMissileShaders, disposeVfxCache, createPoisonStatusParticles } from './babylon/babylonVfx';
 import { startTeleportVFX, onServerTeleportConfirmed, activeTeleports, disposeTeleportCache } from './babylon/babylonTeleport';
 import { hasLOS, createTerrainBlocksFunction } from './lineOfSight';
-import { initCombatTextSystem, updateCombatTextFromState, recordCombatTextHit, disposeCombatTextSystem } from './babylon/babylonCombatText';
+import { initCombatTextSystem, updateCombatTextFromState, recordCombatTextHit, flushPendingDamageForImpact, queueEffectDamageText, disposeCombatTextSystem } from './babylon/babylonCombatText';
+
+// ============================================================================
+// TRAP ASSET CACHING SYSTEM
+// Prevents lag spikes by loading trap model once and cloning instances
+// ============================================================================
+
+// Global trap asset container cache (shared across scene recreations)
+let trapAssetContainer = null;
+let trapAssetLoadingPromise = null;
+
+/**
+ * Preload trap asset into an AssetContainer for fast cloning
+ * Call this early (e.g., during game loading) to avoid lag on first trap
+ * @param {Scene} scene - Babylon.js scene
+ * @returns {Promise<AssetContainer>} - Loaded asset container
+ */
+export async function preloadTrapAsset(scene) {
+  // Return existing container if already loaded
+  if (trapAssetContainer) {
+    return trapAssetContainer;
+  }
+  
+  // Return existing promise if loading is in progress
+  if (trapAssetLoadingPromise) {
+    return trapAssetLoadingPromise;
+  }
+  
+  // Start loading
+  trapAssetLoadingPromise = SceneLoader.LoadAssetContainerAsync(
+    '/assets/',
+    'trap.glb',
+    scene
+  ).then(container => {
+    trapAssetContainer = container;
+    console.log('[TrapCache] Trap asset container loaded and cached');
+    return container;
+  }).catch(error => {
+    console.error('[TrapCache] Failed to preload trap asset:', error);
+    trapAssetLoadingPromise = null;
+    throw error;
+  });
+  
+  return trapAssetLoadingPromise;
+}
+
+/**
+ * Create a trap instance from the cached asset container
+ * Much faster than loading GLB fresh each time
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} entityId - Unique ID for this trap instance
+ * @param {Vector3} position - World position
+ * @returns {Promise<{container: TransformNode, animationGroups: AnimationGroup[]}>}
+ */
+export async function createTrapInstance(scene, entityId, position) {
+  // Ensure asset is loaded
+  if (!trapAssetContainer) {
+    await preloadTrapAsset(scene);
+  }
+  
+  if (!trapAssetContainer) {
+    throw new Error('Trap asset container not available');
+  }
+  
+  // Instantiate from container - this is very fast (no parsing)
+  const instantiated = trapAssetContainer.instantiateModelsToScene(
+    name => `${name}_${entityId}`,
+    false, // Don't clone materials (share them for better batching)
+    { doNotInstantiate: false }
+  );
+  
+  // Create a TransformNode container
+  const entityContainer = new TransformNode(`entityContainer_${entityId}`, scene);
+  
+  // Parent all root nodes to our container
+  instantiated.rootNodes.forEach(node => {
+    node.parent = entityContainer;
+    // Make meshes non-pickable
+    if (node.getChildMeshes) {
+      node.getChildMeshes().forEach(m => {
+        m.isPickable = false;
+      });
+    }
+    if (node.isPickable !== undefined) {
+      node.isPickable = false;
+    }
+  });
+  
+  // Position the container
+  entityContainer.position = position;
+  
+  // Stop and reset all animations (trap is dormant until triggered)
+  const animationGroups = instantiated.animationGroups || [];
+  animationGroups.forEach(ag => {
+    ag.stop();
+    ag.reset();
+  });
+  
+  return {
+    container: entityContainer,
+    animationGroups: animationGroups
+  };
+}
+
+/**
+ * Dispose trap cache - call on scene cleanup
+ */
+export function disposeTrapCache() {
+  if (trapAssetContainer) {
+    trapAssetContainer.dispose();
+    trapAssetContainer = null;
+  }
+  trapAssetLoadingPromise = null;
+  console.log('[TrapCache] Trap asset cache disposed');
+}
 
 // Re-export memory diagnostics for easy access
 export { startMemoryDiagnostics, stopMemoryDiagnostics, getMemorySnapshot, logMemoryReport, runLeakTest } from './babylon/babylonMemoryDiagnostics';
@@ -52,6 +166,11 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   
   // Minimal pre-warming: compile shaders for arcane missile VFX at initialization
   preWarmArcaneMissileShaders(scene);
+  
+  // Preload trap asset to avoid lag spike when first trap is placed
+  preloadTrapAsset(scene).catch(err => {
+    console.warn('[BabylonScene] Failed to preload trap asset:', err);
+  });
 
   // Create camera - positioned to look down at the map at an angle
   const terrain = mapData?.terrain || [];
@@ -521,6 +640,46 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       // Apply trap AoE material
       tile.material = trapAoEMaterial;
       trapAoETiles.push(tileKey);
+    });
+  };
+
+  /**
+   * Pooled status-effect VFX: poison = green particles emanating from body; start/stop by effect presence.
+   * No per-turn spawn/dispose; one particle system per poisoned player, reused.
+   */
+  const updateStatusEffectAuras = (scene, newGameState) => {
+    if (!scene.metadata || !scene.metadata.playerMeshes) return;
+    if (!newGameState || (newGameState.phase !== 'game' && newGameState.phase !== 'stats')) return;
+    if (!scene.metadata.statusEffectAuras) {
+      scene.metadata.statusEffectAuras = new Map();
+    }
+    const auras = scene.metadata.statusEffectAuras;
+    const playerMeshes = scene.metadata.playerMeshes;
+    const players = [];
+    if (newGameState.myTeam && newGameState.myTeam.players) {
+      players.push(...Object.values(newGameState.myTeam.players));
+    }
+    if (newGameState.enemyTeam && newGameState.enemyTeam.players) {
+      players.push(...Object.values(newGameState.enemyTeam.players));
+    }
+    players.forEach((player) => {
+      const mesh = playerMeshes.get(player.userId);
+      if (!mesh) return;
+      const hasPoison = player.statusEffects && player.statusEffects.poison;
+      let entry = auras.get(player.userId);
+      if (hasPoison) {
+        if (!entry || !entry.particleSystem || entry.particleSystem.isDisposed) {
+          const particleSystem = createPoisonStatusParticles(mesh, scene, `poison_${player.userId}`);
+          particleSystem.start();
+          auras.set(player.userId, { particleSystem });
+        } else if (!entry.particleSystem.isStarted) {
+          entry.particleSystem.start();
+        }
+      } else if (entry?.particleSystem) {
+        if (entry.particleSystem.isStarted) {
+          entry.particleSystem.stop();
+        }
+      }
     });
   };
   
@@ -1214,10 +1373,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
                 preferredPath
               );
               
-              // Debug: log pathfinding results
-              if (path.length === 0) {
-                console.log(`No path found from (${currentPlayer.position.x}, ${currentPlayer.position.y}) to (${tileX}, ${tileY}), availableMP: ${availableMP}`);
-              }
+              // Path not found is normal for unreachable tiles - no need to log
               
               // Clear previous visualization
               clearMovementVisualization();
@@ -1419,9 +1575,10 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     camera, 
     handleResize, 
     mapLoadPromise, // Promise that resolves when all map assets (ground, trees) are loaded
-    recordSpellHit: (targetUserId, hitDelayMs, hitCount) => {
-      recordCombatTextHit(scene, targetUserId, hitDelayMs, hitCount);
+    recordSpellHit: (targetUserId, hitDelayMs) => {
+      recordCombatTextHit(scene, targetUserId, hitDelayMs);
     },
+    onEffectResolved: () => { /* Optional: flash/tick VFX; state update drives combat text */ },
     updatePlayers: (newGameState) => {
       // Function to update player positions when game state changes
       if (newGameState) {
@@ -1452,6 +1609,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         updatePlayerCharacters(scene, newGameState, userId, mapWidth, mapHeight);
         updateSpawnedEntities(scene, newGameState, mapWidth, mapHeight);
         updateCombatTextFromState(scene, newGameState);
+        updateStatusEffectAuras(scene, newGameState);
         
         // Update trap AoE overlay for visible traps
         // This shows trigger zones only for traps the player can see (their own team's traps)
@@ -2130,28 +2288,43 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
             const spawnY = casterPos.y + 0.3; // Slightly above character center
             const spawnPos = new Vector3(spawnX, spawnY, spawnZ);
             
+            // Resolve target user id from position so we can trigger hit animation on impact (in sync with VFX)
+            const findPlayerAt = (gx, gy) => {
+              if (!gameState) return null;
+              const check = (team) => {
+                if (!team?.players) return null;
+                return Object.values(team.players).find(p => p.position?.x === gx && p.position?.y === gy) || null;
+              };
+              return check(gameState.myTeam) || check(gameState.enemyTeam) || null;
+            };
+
             // Process each target
             targetsToProcess.forEach((target, index) => {
-              // Convert target grid coordinates to world coordinates
-              // tileSize is 1 in Babylon.js, so grid coordinates = world coordinates
-              // But ensure we're using the correct coordinate system: game y -> Babylon z
-              const tileSize = 1; // Babylon.js uses 1 unit per tile
+              const tileSize = 1;
               const targetWorldX = target.x * tileSize;
-              const targetWorldZ = target.y * tileSize; // game y maps to Babylon z
-              const targetPos = new Vector3(targetWorldX, 0.3, targetWorldZ); // Target at same height
-              
-              // Delay each projectile slightly for multi-target spells
-              const delay = index * 150; // 150ms delay between each projectile
+              const targetWorldZ = target.y * tileSize;
+              const targetPos = new Vector3(targetWorldX, 0.3, targetWorldZ);
+              const playerAt = findPlayerAt(target.x, target.y);
+              const targetUserId = playerAt?.userId ?? null;
+              const options = {
+                targetUserId: targetUserId || undefined,
+                onImpact: targetUserId
+                  ? (userId) => {
+                      playHitAnimation(scene, userId);
+                      flushPendingDamageForImpact(scene, userId);
+                    }
+                  : undefined
+              };
+
+              const delay = index * 150;
               setTimeout(() => {
                 console.log(`Playing VFX for spell ${spellId} target ${index + 1}/${targetsToProcess.length}: spawn at (${spawnPos.x.toFixed(2)}, ${spawnPos.y.toFixed(2)}, ${spawnPos.z.toFixed(2)}), target at (${targetPos.x.toFixed(2)}, ${targetPos.z.toFixed(2)}), orientation: ${casterOrientation.toFixed(2)}`);
-                // Use actual spell definition for VFX
                 const vfxSpellDef = {
                   spellId: spellId,
                   presentation: spellDef.presentation || {}
                 };
-                // Pass missile index and total count for arcane_missile multi-target pattern
                 const totalMissiles = targetsToProcess.length;
-                playSpellVfx(scene, vfxSpellDef, spawnPos, targetPos, castStartTime, index, totalMissiles);
+                playSpellVfx(scene, vfxSpellDef, spawnPos, targetPos, castStartTime, index, totalMissiles, options);
               }, delay);
             });
           }
@@ -2180,6 +2353,9 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     playHitAnimation: (targetUserId) => {
       // Play hit animation for any player (for observers)
       playHitAnimation(scene, targetUserId);
+    },
+    queueEffectDamageText: (userId, amount) => {
+      queueEffectDamageText(scene, userId, amount);
     },
     clearMovementVisualization: () => {
       // Clear movement visualization
@@ -2351,7 +2527,7 @@ async function createEntityMesh(entity, scene, tileSize) {
             const animationStartTime = Date.now();
             const shakeIntensity = 0.04; // Shake intensity (increased for more shake)
             
-            console.log(`Rock animation starting now, mesh Y position: ${mesh.position.y}`);
+            // Rock animation starting
             
             const observer = scene.onBeforeRenderObservable.add(() => {
               if (!mesh || mesh.isDisposed()) {
@@ -2394,33 +2570,17 @@ async function createEntityMesh(entity, scene, tileSize) {
                 if (mesh.metadata) {
                   mesh.metadata.isAnimating = false;
                 }
-                console.log(`Rock rise animation completed, final position: ${finalY}`);
+                // Rock rise animation completed
               }
             });
             
-            console.log(`Rock animation observer registered, mesh visible: ${mesh.isVisible}`);
+            // Rock animation observer registered
           }, 800); // Delay animation start by 0.8 seconds
           
-          // Check and preserve textures/materials from GLB
-          // GLB loader should preserve materials, but we verify they're loaded
+          // Preserve textures/materials from GLB
           result.meshes.forEach(m => {
-            if (m.material) {
-              console.log(`Mesh ${m.name} has material: ${m.material.name}, type: ${m.material.getClassName()}`);
-              // If it's a PBR material, check textures
-              if (m.material.getClassName() === 'PBRMaterial') {
-                const pbrMat = m.material;
-                console.log(`PBR Material - Albedo texture: ${pbrMat.albedoTexture ? pbrMat.albedoTexture.name : 'none'}`);
-                console.log(`PBR Material - Normal texture: ${pbrMat.normalTexture ? pbrMat.normalTexture.name : 'none'}`);
-                // Ensure material is not disposed
-                pbrMat.doNotSerialize = false;
-              } else if (m.material.getClassName() === 'StandardMaterial') {
-                const stdMat = m.material;
-                console.log(`Standard Material - Diffuse texture: ${stdMat.diffuseTexture ? stdMat.diffuseTexture.name : 'none'}`);
-              }
-            } else {
-              console.warn(`Mesh ${m.name} has no material - textures may be missing`);
-              // If no material, the GLB might not have materials embedded
-              // In that case, textures would need to be loaded separately
+            if (m.material && m.material.getClassName() === 'PBRMaterial') {
+              m.material.doNotSerialize = false;
             }
           });
         } else {
@@ -2445,7 +2605,7 @@ async function createEntityMesh(entity, scene, tileSize) {
       break;
       
     case 'trap':
-      // Trap entity - placeholder cube (to be replaced with GLB model later)
+      // Use cached trap asset for fast instantiation (avoids GLB parsing lag)
       // Parse entity data to get subtype for potential different trap visuals
       let trapData = {};
       try {
@@ -2456,38 +2616,49 @@ async function createEntityMesh(entity, scene, tileSize) {
       
       const trapSubtype = trapData.entitySubtype || 'spike_trap';
       
-      // Create a low-profile trap mesh (flat box or cylinder for now)
-      // The trap should be subtle - it's meant to be hidden from enemies
-      mesh = MeshBuilder.CreateBox(`entity_${entityId}`, {
-        width: tileSize * 0.6,
-        height: tileSize * 0.15,  // Very flat - trap is on the ground
-        depth: tileSize * 0.6
-      }, scene);
-      
-      // Create trap material - dark, slightly metallic look
-      const trapMaterial = new StandardMaterial(`entity_material_${entityId}`, scene);
-      trapMaterial.diffuseColor = new Color3(0.25, 0.22, 0.2);  // Dark gray/brown
-      trapMaterial.specularColor = new Color3(0.4, 0.35, 0.3);  // Slight metallic sheen
-      trapMaterial.emissiveColor = new Color3(0.05, 0.03, 0.03); // Very subtle glow
-      
-      // If this is the owner's trap, add a subtle highlight
-      // (Note: We determine ownership by checking if this trap should be visible)
-      // Since hidden traps are filtered on the server, if we receive it, we can see it
-      // For owner's traps, we could add a faint colored outline in the future
-      
-      mesh.material = trapMaterial;
-      
-      // Position slightly above ground so it's visible
-      mesh.position = new Vector3(xPos, tileSize * 0.08, zPos);
-      
-      // Add subtle rotation variation
-      mesh.rotation.y = Math.random() * Math.PI * 0.25; // Small random rotation
-      
-      // Store trap subtype in metadata for VFX routing
-      mesh.metadata = mesh.metadata || {};
-      mesh.metadata.trapSubtype = trapSubtype;
-      
-      console.log(`Created trap mesh: ${entityId} (${trapSubtype}) at (${xPos}, ${zPos})`);
+      try {
+        // Use cached asset container for fast cloning (no GLB parsing)
+        const trapInstance = await createTrapInstance(
+          scene,
+          entityId,
+          new Vector3(xPos, 0.01, zPos) // Slightly above ground to be visible over hit tile effect
+        );
+        
+        const entityContainer = trapInstance.container;
+        
+        // Store animation groups for later playback on trigger
+        entityContainer.metadata = {
+          entityId: entityId,
+          entityType: entity.entityType,
+          trapSubtype: trapSubtype,
+          animationGroups: trapInstance.animationGroups,
+          gridPosition: { x: entity.position.x, y: entity.position.y }
+        };
+        
+        mesh = entityContainer;
+      } catch (error) {
+        console.error(`Failed to create trap instance for ${entityId}:`, error);
+        console.warn(`Using fallback box for trap`);
+        
+        // Fallback to simple box if cached model fails
+        mesh = MeshBuilder.CreateBox(`entity_${entityId}`, {
+          width: tileSize * 0.6,
+          height: tileSize * 0.15,
+          depth: tileSize * 0.6
+        }, scene);
+        
+        const trapMaterial = new StandardMaterial(`entity_material_${entityId}`, scene);
+        trapMaterial.diffuseColor = new Color3(0.25, 0.22, 0.2);
+        trapMaterial.specularColor = new Color3(0.4, 0.35, 0.3);
+        trapMaterial.emissiveColor = new Color3(0.05, 0.03, 0.03);
+        mesh.material = trapMaterial;
+        
+        mesh.position = new Vector3(xPos, 0.01, zPos); // Match GLB trap position
+        
+        mesh.metadata = mesh.metadata || {};
+        mesh.metadata.trapSubtype = trapSubtype;
+        mesh.metadata.gridPosition = { x: entity.position.x, y: entity.position.y };
+      }
       break;
       
     default:
@@ -2612,13 +2783,17 @@ function updateSpawnedEntities(scene, gameState, mapWidth, mapHeight) {
   // Remove meshes for entities that no longer exist
   scene.metadata.entityMeshes.forEach((mesh, entityId) => {
     if (!currentEntityIds.has(entityId)) {
-      // Check if this is an earth_block that needs to animate out
+      // Check entity type for special removal handling
       const entityType = mesh.metadata?.entityType;
       const isEarthBlock = entityType === 'earth_block';
+      const isTrap = entityType === 'trap';
       
       if (isEarthBlock && mesh.metadata?.animationFinalY !== undefined) {
         // Animate the rock sinking back into the ground
         animateEarthBlockRemoval(mesh, scene, entityId);
+      } else if (isTrap && mesh.metadata?.animationGroups?.length > 0) {
+        // Play trap trigger animation before removal
+        animateTrapRemoval(mesh, scene, entityId);
       } else {
         // For other entities, dispose immediately
         mesh.dispose();
@@ -2703,6 +2878,89 @@ function animateEarthBlockRemoval(mesh, scene, entityId) {
   });
 }
 
+/**
+ * Animate trap removal - play the trap's trigger animation then dispose
+ * @param {Mesh|TransformNode} mesh - The trap mesh/container
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} entityId - Entity ID
+ */
+function animateTrapRemoval(mesh, scene, entityId) {
+  const metadata = mesh.metadata;
+  const animationGroups = metadata?.animationGroups;
+  
+  if (!animationGroups || animationGroups.length === 0) {
+    // No animations, dispose immediately
+    disposeTrapMesh(mesh, scene, entityId);
+    return;
+  }
+  
+  // Check if already animating removal to prevent double-processing
+  if (metadata.isAnimatingRemoval) {
+    return;
+  }
+  metadata.isAnimatingRemoval = true;
+  
+  // Find the longest animation duration to know when to dispose
+  let longestDuration = 0;
+  
+  animationGroups.forEach(animGroup => {
+    // Calculate animation duration in milliseconds
+    const fps = animGroup.targetedAnimations?.[0]?.animation?.framePerSecond || 30;
+    const fromFrame = animGroup.from || 0;
+    const toFrame = animGroup.to || 0;
+    const durationMs = ((toFrame - fromFrame) / fps) * 1000;
+    
+    if (durationMs > longestDuration) {
+      longestDuration = durationMs;
+    }
+    
+    // Reset and play the animation once (don't loop)
+    animGroup.reset();
+    animGroup.play(false);
+  });
+  
+  // Add a buffer to ensure animation fully completes
+  const disposalDelay = Math.max(longestDuration + 500, 1500); // At least 1.5s, or animation + 500ms buffer
+  
+  // Schedule disposal after animation completes
+  setTimeout(() => {
+    disposeTrapMesh(mesh, scene, entityId);
+  }, disposalDelay);
+}
+
+/**
+ * Dispose a trap mesh and its resources
+ * @param {Mesh|TransformNode} mesh - The trap mesh/container
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} entityId - Entity ID
+ */
+function disposeTrapMesh(mesh, scene, entityId) {
+  // Stop and dispose all animation groups (they're cloned instances, must be disposed)
+  if (mesh.metadata?.animationGroups) {
+    mesh.metadata.animationGroups.forEach(animGroup => {
+      animGroup.stop();
+      animGroup.dispose(); // Dispose to prevent memory leaks
+    });
+    mesh.metadata.animationGroups = null;
+  }
+  
+  // Dispose all child meshes
+  // Note: Don't dispose materials as they're shared from the AssetContainer
+  if (mesh.getChildMeshes) {
+    mesh.getChildMeshes().forEach(child => {
+      child.dispose(false, false); // doNotRecurse=false, disposeMaterialAndTextures=false
+    });
+  }
+  
+  // Dispose the container/mesh itself
+  mesh.dispose();
+  
+  // Remove from entity meshes map
+  if (scene.metadata && scene.metadata.entityMeshes) {
+    scene.metadata.entityMeshes.delete(entityId);
+  }
+}
+
 // build3DMap moved to babylon/babylonMap.js
 
 // buildPlayerCharacters moved to babylon/babylonPlayers.js
@@ -2731,6 +2989,9 @@ export function disposeBabylonScene({ engine, scene, camera, handleResize }) {
     
     // 2b. Dispose teleport cache (shared textures)
     disposeTeleportCache(scene);
+    
+    // 2c. Dispose trap asset cache
+    disposeTrapCache();
     
     // 3. Clean up active teleport controllers
     if (activeTeleports) {
@@ -2769,6 +3030,22 @@ export function disposeBabylonScene({ engine, scene, camera, handleResize }) {
       scene.metadata.targetMarkers.clear();
     }
     
+    // 5b. Clean up status effect VFX (poison particle systems per player)
+    if (scene.metadata.statusEffectAuras) {
+      scene.metadata.statusEffectAuras.forEach((entry, userId) => {
+        try {
+          const ps = entry?.particleSystem;
+          if (ps && !ps.isDisposed) {
+            ps.stop();
+            ps.dispose();
+          }
+        } catch (e) {
+          console.warn(`[BabylonScene] Error disposing status effect VFX for ${userId}:`, e);
+        }
+      });
+      scene.metadata.statusEffectAuras.clear();
+    }
+
     // 6. Clean up player meshes
     if (scene.metadata.playerMeshes) {
       scene.metadata.playerMeshes.forEach((mesh, userId) => {

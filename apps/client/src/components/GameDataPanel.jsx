@@ -75,6 +75,15 @@ const GameDataPanel = ({ gameState, isOpen, onClose }) => {
                         {player.ready ? '✓ Ready' : 'Not Ready'}
                       </span>
                     )}
+                    {player.statusEffects && Object.keys(player.statusEffects).length > 0 && (
+                      <div className="status-effects-row">
+                        {Object.entries(player.statusEffects).map(([effectId, eff]) => (
+                          <span key={effectId} className="status-effect-badge" title={`${eff.effectId || effectId} (${eff.duration}t, ${eff.stacks || 1})`}>
+                            {eff.effectId || effectId}{(eff.stacks || 1) > 1 ? `×${eff.stacks}` : ''} ({eff.duration}t)
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
@@ -94,6 +103,15 @@ const GameDataPanel = ({ gameState, isOpen, onClose }) => {
                     <span>Health: {player.health}/{player.maxHealth}</span>
                     {player.position && (
                       <span>Position: ({player.position.x}, {player.position.y})</span>
+                    )}
+                    {player.statusEffects && Object.keys(player.statusEffects).length > 0 && (
+                      <div className="status-effects-row">
+                        {Object.entries(player.statusEffects).map(([effectId, eff]) => (
+                          <span key={effectId} className="status-effect-badge" title={`${eff.effectId || effectId} (${eff.duration}t, ${eff.stacks || 1})`}>
+                            {eff.effectId || effectId}{(eff.stacks || 1) > 1 ? `×${eff.stacks}` : ''} ({eff.duration}t)
+                          </span>
+                        ))}
+                      </div>
                     )}
                   </div>
                 </div>

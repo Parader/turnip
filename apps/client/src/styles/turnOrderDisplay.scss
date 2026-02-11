@@ -1,18 +1,29 @@
+// Matches game-ui-overlay pattern: pointer-events auto so hover/click work; same visual language as spell action bar
 .turn-order-display {
   position: fixed;
   top: 20px;
   left: 20px;
-  background: rgba(0, 0, 0, 0.8);
-  border: 2px solid rgba(255, 255, 255, 0.2);
+  z-index: 100;
+  min-width: 200px;
+  overflow: visible;
+  pointer-events: auto;
+
+  background: linear-gradient(to bottom, rgba(20, 20, 30, 0.95) 0%, rgba(10, 10, 15, 0.95) 100%);
+  border: 2px solid rgba(139, 115, 85, 0.8);
   border-radius: 8px;
   padding: 12px;
-  z-index: 1000;
-  min-width: 200px;
+  box-shadow:
+    0 0 20px rgba(0, 0, 0, 0.8),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.4);
   backdrop-filter: blur(10px);
 
   &.my-turn {
-    border-color: #4CAF50;
-    box-shadow: 0 0 20px rgba(76, 175, 80, 0.5);
+    border-color: rgba(76, 175, 80, 0.8);
+    box-shadow:
+      0 0 20px rgba(76, 175, 80, 0.4),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.4);
   }
 
   .turn-order-header {
@@ -53,6 +64,7 @@
     padding: 8px;
     position: relative;
     transition: all 0.3s ease;
+    overflow: visible;
 
     &.current {
       background: rgba(76, 175, 80, 0.3);
@@ -103,6 +115,8 @@
     }
 
     .card-body {
+      overflow: visible;
+
       .player-name {
         font-weight: bold;
         color: #fff;
@@ -120,6 +134,96 @@
       .player-team {
         color: rgba(255, 255, 255, 0.5);
         font-size: 10px;
+      }
+
+      .card-status-effects {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 6px;
+      }
+
+      .turn-effect-badge {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        border-radius: 6px;
+        font-size: 16px;
+        font-weight: 700;
+        background: rgba(255, 152, 0, 0.4);
+        color: #ffb74d;
+        border: 1px solid rgba(255, 152, 0, 0.6);
+        cursor: help;
+        z-index: 1;
+
+        .turn-effect-letter {
+          line-height: 1;
+        }
+
+        .turn-effect-turns {
+          position: absolute;
+          top: -4px;
+          right: -4px;
+          min-width: 14px;
+          height: 14px;
+          padding: 0 3px;
+          border-radius: 50%;
+          background: rgba(0, 0, 0, 0.9);
+          color: #ffb74d;
+          font-size: 9px;
+          font-weight: 700;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          line-height: 1;
+        }
+
+        .turn-effect-stacks {
+          position: absolute;
+          bottom: -4px;
+          left: -4px;
+          min-width: 14px;
+          height: 14px;
+          padding: 0 3px;
+          border-radius: 50%;
+          background: rgba(0, 0, 0, 0.9);
+          color: #ffcc80;
+          font-size: 9px;
+          font-weight: 700;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          line-height: 1;
+        }
+
+        .turn-effect-tooltip {
+          position: absolute;
+          left: 50%;
+          bottom: 100%;
+          transform: translateX(-50%) translateY(-6px);
+          padding: 6px 10px;
+          border-radius: 6px;
+          background: rgba(0, 0, 0, 0.95);
+          color: #fff;
+          font-size: 11px;
+          font-weight: 500;
+          white-space: nowrap;
+          visibility: hidden;
+          opacity: 0;
+          pointer-events: none;
+          transition: visibility 0s linear 0.1s, opacity 0.15s ease, transform 0.15s ease;
+          z-index: 1001;
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+
+        &:hover .turn-effect-tooltip {
+          visibility: visible;
+          opacity: 1;
+          transition-delay: 0s;
+        }
       }
     }
 

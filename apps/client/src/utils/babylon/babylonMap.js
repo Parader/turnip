@@ -620,7 +620,7 @@ function createWallCrumbles(scene, wallData, tileSize, wallMaterials, mapContain
 function createWaterRocks(scene, waterTileData, mapContainer, options = {}) {
   const {
     tileSize = 1,
-    waterBottomY = -0.55, // Bottom of water channel
+    waterBottomY = -0.52, // Bottom of water channel
     minRockSize = 0.06,
     maxRockSize = 0.15,
     rocksPerTile = { min: 2, max: 5 }, // Random rocks per tile
@@ -1286,19 +1286,20 @@ function findRegionRectangles(region) {
 }
 
 /**
- * Build continuous ground terrain underneath the map using ground.glb
+ * Build continuous ground terrain underneath the map using textured planes
  * Creates multiple ground pieces that follow the actual terrain shape (avoids water/empty)
+ * Uses rocky terrain textures for better performance than GLB models
  * @param {Scene} scene - Babylon.js scene
  * @param {Array<Array<number>>} terrain - 2D array of tile types
  * @param {number} mapWidth - Width of the map
  * @param {number} mapHeight - Height of the map
  * @param {Mesh} mapContainer - Parent container for ground meshes
- * @returns {Object} Ground building result with meshes (async loading)
+ * @returns {Object} Ground building result with meshes
  */
 export function buildGroundTerrain(scene, terrain, mapWidth, mapHeight, mapContainer) {
   const tileSize = 1;
   const groundMeshes = [];
-  const groundY = -0.05; // Slightly below gameplay tiles
+  const groundY = -0.02; // Slightly below gameplay tiles
   
   // Detect contiguous regions of solid terrain
   const regions = detectSolidTerrainRegions(terrain);
@@ -1309,7 +1310,7 @@ export function buildGroundTerrain(scene, terrain, mapWidth, mapHeight, mapConta
     return {
       groundMeshes: [],
       regionCount: 0,
-      loadPromise: Promise.resolve() // No loading needed
+      loadPromise: Promise.resolve()
     };
   }
   
@@ -1330,118 +1331,192 @@ export function buildGroundTerrain(scene, terrain, mapWidth, mapHeight, mapConta
     return {
       groundMeshes: [],
       regionCount: regions.length,
-      loadPromise: Promise.resolve() // No loading needed
+      loadPromise: Promise.resolve()
     };
   }
   
-  // Possible rotations (0°, 90°, 180°, 270°) for visual variety
-  const rotations = [0, Math.PI / 2, Math.PI, Math.PI * 1.5];
-  
-  // Load both ground.glb and ground2.glb models for variety
-  // (will use browser cache if already preloaded)
-  // Return promise so caller can wait for ground to be ready
-  const groundLoadPromise = Promise.all([
-    SceneLoader.ImportMeshAsync('', '/assets/', 'ground.glb', scene),
-    SceneLoader.ImportMeshAsync('', '/assets/', 'ground2.glb', scene)
-  ]).then(([result1, result2]) => {
-    const groundModels = [result1.meshes[0], result2.meshes[0]];
-    
-    // Hide the original models (we'll clone them for each rectangle)
-    groundModels.forEach(model => model.setEnabled(false));
-    
-    // Get bounds for each model to calculate scaling
-    const modelData = groundModels.map((model, i) => {
-      const bounds = model.getHierarchyBoundingVectors();
-      const width = bounds.max.x - bounds.min.x;
-      const depth = bounds.max.z - bounds.min.z;
-      console.log(`Ground GLB ${i + 1} loaded: original size ${width.toFixed(2)} x ${depth.toFixed(2)}`);
-      return { model, width, depth };
-    });
-    
-    // Create a ground instance for each rectangle
-    allRectangles.forEach((rect, index) => {
-      // Calculate required size in world units
-      const requiredWidth = rect.width * tileSize;
-      const requiredDepth = rect.height * tileSize;
+  // Create GPU-based anti-tiling shader for ground (SHARED by all ground planes)
+  const groundMaterial = new ShaderMaterial('groundAntiTile', scene, {
+    vertexSource: `
+      precision highp float;
       
-      // Randomly choose between the two ground models
-      const modelIndex = Math.floor(Math.random() * 2);
-      const { model, width: originalWidth, depth: originalDepth } = modelData[modelIndex];
+      attribute vec3 position;
+      attribute vec3 normal;
+      attribute vec2 uv;
       
-      // Clone the model for this rectangle
-      const rectGround = model.clone(`ground_r${rect.regionIndex}_${index}`, null);
-      rectGround.setEnabled(true);
+      uniform mat4 world;
+      uniform mat4 viewProjection;
       
-      // Enable all child meshes
-      rectGround.getChildMeshes().forEach(child => {
-        child.setEnabled(true);
-        child.isPickable = false;
-      });
+      varying vec3 vWorldPos;
+      varying vec3 vNormal;
+      varying vec2 vUV;
       
-      // Calculate scale to fit the rectangle
-      const scaleX = requiredWidth / originalWidth;
-      const scaleZ = requiredDepth / originalDepth;
+      void main() {
+        vec4 worldPos = world * vec4(position, 1.0);
+        vWorldPos = worldPos.xyz;
+        vNormal = normalize((world * vec4(normal, 0.0)).xyz);
+        vUV = uv;
+        gl_Position = viewProjection * worldPos;
+      }
+    `,
+    fragmentSource: `
+      precision highp float;
       
-      // Apply scaling
-      rectGround.scaling = new Vector3(scaleX, 1, scaleZ);
+      uniform sampler2D diffuseTexture;
+      uniform float tileSize;
+      uniform float textureScale;
       
-      // Position at rectangle center
-      rectGround.position = new Vector3(rect.centerX, groundY, rect.centerZ);
+      varying vec3 vWorldPos;
+      varying vec3 vNormal;
+      varying vec2 vUV;
       
-      // Apply random rotation (one of 4 directions) for visual variety
-      // Clear quaternion so euler rotation works (GLB models use quaternion by default)
-      rectGround.rotationQuaternion = null;
-      const rotationIndex = Math.floor(Math.random() * 4);
-      rectGround.rotation.y = rotations[rotationIndex];
+      // Hash function for pseudo-random values
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
       
-      // Make not pickable
-      rectGround.isPickable = false;
+      // 2D noise function for organic blending
+      float noise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        
+        float a = hash(i);
+        float b = hash(i + vec2(1.0, 0.0));
+        float c = hash(i + vec2(0.0, 1.0));
+        float d = hash(i + vec2(1.0, 1.0));
+        
+        return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+      }
       
-      groundMeshes.push(rectGround);
-    });
-    
-    console.log(`Created ${groundMeshes.length} ground meshes (using 2 ground variants)`);
-    
-    // Dispose the original hidden models
-    groundModels.forEach(model => model.dispose());
-    
-    return true; // Signal successful completion
-  }).catch((error) => {
-    console.error('Failed to load ground GLB models:', error);
-    
-    // Fallback: create simple ground planes
-    allRectangles.forEach((rect, index) => {
-      const requiredWidth = rect.width * tileSize;
-      const requiredDepth = rect.height * tileSize;
+      // Fractal noise for more organic patterns
+      float fbm(vec2 p) {
+        float value = 0.0;
+        float amplitude = 0.5;
+        for (int i = 0; i < 3; i++) {
+          value += amplitude * noise(p);
+          p *= 2.0;
+          amplitude *= 0.5;
+        }
+        return value;
+      }
       
-      const fallbackGround = MeshBuilder.CreateGround(`ground_fallback_${index}`, {
-        width: requiredWidth,
-        height: requiredDepth
-      }, scene);
+      // Get random rotation (0, 90, 180, or 270 degrees)
+      float getRotation(vec2 tileId) {
+        return floor(hash(tileId) * 4.0) * 1.5708;
+      }
       
-      fallbackGround.position = new Vector3(rect.centerX, groundY, rect.centerZ);
+      // Rotate UV coordinates
+      vec2 rotateUV(vec2 uv, float angle) {
+        float c = cos(angle);
+        float s = sin(angle);
+        vec2 center = vec2(0.5);
+        uv -= center;
+        uv = vec2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+        uv += center;
+        return uv;
+      }
       
-      // Apply random rotation for visual variety
-      const rotationIndex = Math.floor(Math.random() * 4);
-      fallbackGround.rotation.y = rotations[rotationIndex];
+      // Sample texture for a specific tile
+      vec3 sampleTile(vec2 tileId, vec2 localUV) {
+        float rotation = getRotation(tileId);
+        vec2 offset = vec2(hash(tileId + 0.5), hash(tileId + 1.5)) * 0.5;
+        vec2 rotatedUV = rotateUV(localUV, rotation);
+        vec2 finalUV = (rotatedUV + offset) * textureScale;
+        return texture2D(diffuseTexture, finalUV).rgb;
+      }
       
-      const fallbackMaterial = new StandardMaterial(`groundMaterial_${index}`, scene);
-      fallbackMaterial.diffuseColor = new Color3(0.5, 0.4, 0.3);
-      fallbackMaterial.emissiveColor = new Color3(0.15, 0.1, 0.08);
-      fallbackGround.material = fallbackMaterial;
-      fallbackGround.isPickable = false;
-      
-      groundMeshes.push(fallbackGround);
-    });
-    
-    console.log(`Created ${groundMeshes.length} fallback ground meshes`);
-    return true; // Signal completion even on fallback
+      void main() {
+        // Calculate which virtual tile this pixel is in
+        vec2 worldUV = vWorldPos.xz / tileSize;
+        vec2 tileId = floor(worldUV);
+        vec2 tileUV = fract(worldUV);
+        
+        // Blend zone size
+        float blendZone = 0.35;
+        
+        // Add noise to create organic, irregular blend boundaries
+        float noiseScale = 8.0;
+        float noiseValue = fbm(vWorldPos.xz * noiseScale / tileSize) * 0.3;
+        
+        // Calculate distance to nearest edge
+        float distToEdgeX = min(tileUV.x, 1.0 - tileUV.x);
+        float distToEdgeY = min(tileUV.y, 1.0 - tileUV.y);
+        
+        // Determine neighbor directions
+        float dirX = tileUV.x < 0.5 ? -1.0 : 1.0;
+        float dirY = tileUV.y < 0.5 ? -1.0 : 1.0;
+        
+        vec2 neighborX = tileId + vec2(dirX, 0.0);
+        vec2 neighborY = tileId + vec2(0.0, dirY);
+        vec2 neighborXY = tileId + vec2(dirX, dirY);
+        
+        // Calculate blend weights with noise for organic edges
+        float weightX = smoothstep(0.0, blendZone, distToEdgeX + noiseValue);
+        float weightY = smoothstep(0.0, blendZone, distToEdgeY + noiseValue);
+        
+        // Sample all tiles
+        vec3 colorMain = sampleTile(tileId, tileUV);
+        vec3 colorX = sampleTile(neighborX, tileUV);
+        vec3 colorY = sampleTile(neighborY, tileUV);
+        vec3 colorXY = sampleTile(neighborXY, tileUV);
+        
+        // Bilinear blend with noise-modulated weights
+        vec3 blendX = mix(colorX, colorMain, weightX);
+        vec3 blendXY = mix(colorXY, colorY, weightX);
+        vec3 finalColor = mix(blendXY, blendX, weightY);
+        
+        // Simple lighting
+        vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+        float NdotL = max(dot(vNormal, lightDir), 0.0);
+        float ambient = 0.4;
+        float light = ambient + NdotL * 0.6;
+        
+        gl_FragColor = vec4(finalColor * light, 1.0);
+      }
+    `
+  }, {
+    attributes: ['position', 'normal', 'uv'],
+    uniforms: ['world', 'viewProjection', 'diffuseTexture', 'tileSize', 'textureScale']
   });
+  
+  // Load textures
+  const texturePath = '/assets/decor/';
+  const diffuseTex = new Texture(texturePath + 'rocky_terrain_03_diff_1k.jpg', scene);
+  
+  groundMaterial.setTexture('diffuseTexture', diffuseTex);
+  groundMaterial.setFloat('tileSize', 6.0); // Virtual tile size for ground
+  groundMaterial.setFloat('textureScale', 0.8);
+  
+  // Create a ground plane for each rectangle, all sharing the same shader material
+  allRectangles.forEach((rect, index) => {
+    const requiredWidth = rect.width * tileSize;
+    const requiredDepth = rect.height * tileSize;
+    
+    // Create ground plane
+    const groundPlane = MeshBuilder.CreateGround(`ground_r${rect.regionIndex}_${index}`, {
+      width: requiredWidth,
+      height: requiredDepth,
+      subdivisions: 1
+    }, scene);
+    
+    // Position at rectangle center
+    groundPlane.position = new Vector3(rect.centerX, groundY, rect.centerZ);
+    
+    // Use shared shader material
+    groundPlane.material = groundMaterial;
+    groundPlane.isPickable = false;
+    groundPlane.receiveShadows = true;
+    
+    groundMeshes.push(groundPlane);
+  });
+  
+  console.log(`Ground terrain: created ${groundMeshes.length} planes with shared GPU anti-tiling shader`);
   
   return {
     groundMeshes,
     regionCount: regions.length,
-    loadPromise: groundLoadPromise
+    loadPromise: Promise.resolve()
   };
 }
 
@@ -2082,7 +2157,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
         wallDataForCrumbles.push({ x, y, height: wallHeight, materialIndex });
       } else if (tileType === TILE_TYPES.WATER) {
         // Water channel - flush with ground level at -0.15
-        const waterSurfaceY = -0.05; // Slightly below gameplay tiles
+        const waterSurfaceY = -0.02; // Flush with ground level
         const channelDepth = 0.5; // Depth below water surface
         const groundHeight = 0.01; // Height of ground layer at bottom
         const wallThickness = 0.02; // Thickness of side walls
@@ -2233,7 +2308,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
   // Create rock debris at the bottom of water tiles for visual relief
   const waterRocks = createWaterRocks(scene, waterTileDataForRocks, mapContainer, {
     tileSize: tileSize,
-    waterBottomY: -0.55, // Match water channel bottom position
+    waterBottomY: -0.52, // Match water channel bottom position (waterSurfaceY - channelDepth)
     minRockSize: 0.05,
     maxRockSize: 0.12,
     rocksPerTile: { min: 2, max: 4 },
@@ -2253,7 +2328,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
   
   // Ramp parameters
   const rampWidth = 3.0; // How far the ramp extends outward
-  const innerY = -0.05; // Height at board edge (matches ground mesh level)
+  const innerY = -0.02; // Height at board edge (matches ground mesh level)
   const outerY = -0.25; // Height at skirt level
   const innerRadius = 0.3; // Corner roundness at board edge
   const outerRadius = rampWidth + innerRadius; // Corner roundness at outer edge
@@ -2261,25 +2336,333 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
   const skirtSize = 100; // How far the flat skirt extends beyond the ramp
   const skirtMeshes = [];
   
-  // Create skirt/ramp material with triplanar mapping + anti-tiling (shared)
-  // Anti-tiling techniques: coordinate warping + dual-frequency macro noise
-  // One shared material = better GPU batching + consistent appearance + no seams
-  const skirtMaterial = createTerrainMaterial(scene, {
-    worldTilingScale: 0.32,    // Detail texture scale
-    blendSharpness: 4.0,       // Triplanar blend sharpness
-    normalStrength: 0.4,       // Reduced for distant terrain
-    roughnessMultiplier: 1.1,  // Slightly more matte
-    tint: new Color3(0.85, 0.8, 0.7), // Warm earth tone
-    useTriplanar: true,
-    // Coordinate warping - breaks up regular grid pattern
-    warpScale: 0.025,          // Warp noise frequency (~40m)
-    warpStrength: 1.2,         // Subtle UV distortion (world units)
-    // Dual-frequency macro variation
-    macroScaleLarge: 0.01,     // Large scale (~100m per tile)
-    macroScaleMedium: 0.04,    // Medium scale (~25m per tile)
-    macroStrengthColor: 0.1,   // Subtle color variation
-    macroStrengthRoughness: 0.08 // Subtle roughness variation
+  // Create ramp material with triplanar anti-tiling shader (for slopes)
+  const rampMaterial = new ShaderMaterial('rampAntiTile', scene, {
+    vertexSource: `
+      precision highp float;
+      
+      attribute vec3 position;
+      attribute vec3 normal;
+      
+      uniform mat4 world;
+      uniform mat4 viewProjection;
+      
+      varying vec3 vWorldPos;
+      varying vec3 vNormal;
+      
+      void main() {
+        vec4 worldPos = world * vec4(position, 1.0);
+        vWorldPos = worldPos.xyz;
+        vNormal = normalize((world * vec4(normal, 0.0)).xyz);
+        gl_Position = viewProjection * worldPos;
+      }
+    `,
+    fragmentSource: `
+      precision highp float;
+      
+      uniform sampler2D diffuseTexture;
+      uniform float tileSize;
+      uniform float textureScale;
+      uniform float blendSharpness;
+      
+      varying vec3 vWorldPos;
+      varying vec3 vNormal;
+      
+      // Hash function for pseudo-random values
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+      
+      // 2D noise function for organic blending
+      float noise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        
+        float a = hash(i);
+        float b = hash(i + vec2(1.0, 0.0));
+        float c = hash(i + vec2(0.0, 1.0));
+        float d = hash(i + vec2(1.0, 1.0));
+        
+        return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+      }
+      
+      // Fractal noise
+      float fbm(vec2 p) {
+        float value = 0.0;
+        float amplitude = 0.5;
+        for (int i = 0; i < 3; i++) {
+          value += amplitude * noise(p);
+          p *= 2.0;
+          amplitude *= 0.5;
+        }
+        return value;
+      }
+      
+      // Get random rotation (0, 90, 180, or 270 degrees)
+      float getRotation(vec2 tileId) {
+        return floor(hash(tileId) * 4.0) * 1.5708;
+      }
+      
+      // Rotate UV coordinates
+      vec2 rotateUV(vec2 uv, float angle) {
+        float c = cos(angle);
+        float s = sin(angle);
+        vec2 center = vec2(0.5);
+        uv -= center;
+        uv = vec2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+        uv += center;
+        return uv;
+      }
+      
+      // Sample texture for a specific tile with anti-tiling
+      vec3 sampleTileAntiTiled(vec2 worldUV, vec2 tileId, vec2 localUV) {
+        float rotation = getRotation(tileId);
+        vec2 offset = vec2(hash(tileId + 0.5), hash(tileId + 1.5)) * 0.5;
+        vec2 rotatedUV = rotateUV(localUV, rotation);
+        vec2 finalUV = (rotatedUV + offset) * textureScale;
+        return texture2D(diffuseTexture, finalUV).rgb;
+      }
+      
+      // Anti-tiled texture sampling with noise blending
+      vec3 sampleWithAntiTiling(vec2 worldUV) {
+        vec2 scaledUV = worldUV / tileSize;
+        vec2 tileId = floor(scaledUV);
+        vec2 tileUV = fract(scaledUV);
+        
+        float blendZone = 0.35;
+        float noiseScale = 8.0;
+        float noiseValue = fbm(worldUV * noiseScale / tileSize) * 0.3;
+        
+        float distToEdgeX = min(tileUV.x, 1.0 - tileUV.x);
+        float distToEdgeY = min(tileUV.y, 1.0 - tileUV.y);
+        
+        float dirX = tileUV.x < 0.5 ? -1.0 : 1.0;
+        float dirY = tileUV.y < 0.5 ? -1.0 : 1.0;
+        
+        vec2 neighborX = tileId + vec2(dirX, 0.0);
+        vec2 neighborY = tileId + vec2(0.0, dirY);
+        vec2 neighborXY = tileId + vec2(dirX, dirY);
+        
+        float weightX = smoothstep(0.0, blendZone, distToEdgeX + noiseValue);
+        float weightY = smoothstep(0.0, blendZone, distToEdgeY + noiseValue);
+        
+        vec3 colorMain = sampleTileAntiTiled(worldUV, tileId, tileUV);
+        vec3 colorX = sampleTileAntiTiled(worldUV, neighborX, tileUV);
+        vec3 colorY = sampleTileAntiTiled(worldUV, neighborY, tileUV);
+        vec3 colorXY = sampleTileAntiTiled(worldUV, neighborXY, tileUV);
+        
+        vec3 blendX = mix(colorX, colorMain, weightX);
+        vec3 blendXY = mix(colorXY, colorY, weightX);
+        return mix(blendXY, blendX, weightY);
+      }
+      
+      void main() {
+        // Triplanar blend weights
+        vec3 blend = abs(vNormal);
+        blend = pow(blend, vec3(blendSharpness));
+        blend /= (blend.x + blend.y + blend.z);
+        
+        // Sample with anti-tiling on each projection plane
+        vec3 xProjection = sampleWithAntiTiling(vWorldPos.yz);
+        vec3 yProjection = sampleWithAntiTiling(vWorldPos.xz);
+        vec3 zProjection = sampleWithAntiTiling(vWorldPos.xy);
+        
+        // Blend the three projections
+        vec3 finalColor = xProjection * blend.x + yProjection * blend.y + zProjection * blend.z;
+        
+        // Simple lighting
+        vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+        float NdotL = max(dot(vNormal, lightDir), 0.0);
+        float ambient = 0.4;
+        float light = ambient + NdotL * 0.6;
+        
+        gl_FragColor = vec4(finalColor * light, 1.0);
+      }
+    `
+  }, {
+    attributes: ['position', 'normal'],
+    uniforms: ['world', 'viewProjection', 'diffuseTexture', 'tileSize', 'textureScale', 'blendSharpness']
   });
+  
+  // Load ramp texture (same as skirt)
+  const rampDiffuseTex = new Texture('/assets/decor/forest_leaves_02_diffuse_1k.jpg', scene);
+  rampMaterial.setTexture('diffuseTexture', rampDiffuseTex);
+  rampMaterial.setFloat('tileSize', 12.0);
+  rampMaterial.setFloat('textureScale', 0.8);
+  rampMaterial.setFloat('blendSharpness', 4.0);
+  
+  // Create anti-tiling shader material for skirt (GPU-based, no extra meshes)
+  // This shader divides the surface into virtual tiles and applies random rotation/offset per tile
+  const skirtTexturePath = '/assets/decor/';
+  
+  /**
+   * Create a shader material with GPU-based anti-tiling
+   * Uses hash functions to generate per-tile random rotation and offset
+   */
+  function createAntiTilingSkirtMaterial(name) {
+    const shaderMaterial = new ShaderMaterial(name, scene, {
+      vertexSource: `
+        precision highp float;
+        
+        attribute vec3 position;
+        attribute vec3 normal;
+        attribute vec2 uv;
+        
+        uniform mat4 world;
+        uniform mat4 viewProjection;
+        
+        varying vec3 vWorldPos;
+        varying vec3 vNormal;
+        varying vec2 vUV;
+        
+        void main() {
+          vec4 worldPos = world * vec4(position, 1.0);
+          vWorldPos = worldPos.xyz;
+          vNormal = normalize((world * vec4(normal, 0.0)).xyz);
+          vUV = uv;
+          gl_Position = viewProjection * worldPos;
+        }
+      `,
+      fragmentSource: `
+        precision highp float;
+        
+        uniform sampler2D diffuseTexture;
+        uniform sampler2D normalTexture;
+        uniform sampler2D roughTexture;
+        uniform float tileSize;
+        uniform float textureScale;
+        
+        varying vec3 vWorldPos;
+        varying vec3 vNormal;
+        varying vec2 vUV;
+        
+        // Hash function for pseudo-random values
+        float hash(vec2 p) {
+          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+        }
+        
+        // 2D noise function for organic blending
+        float noise(vec2 p) {
+          vec2 i = floor(p);
+          vec2 f = fract(p);
+          f = f * f * (3.0 - 2.0 * f); // smoothstep
+          
+          float a = hash(i);
+          float b = hash(i + vec2(1.0, 0.0));
+          float c = hash(i + vec2(0.0, 1.0));
+          float d = hash(i + vec2(1.0, 1.0));
+          
+          return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
+        
+        // Fractal noise for more organic patterns
+        float fbm(vec2 p) {
+          float value = 0.0;
+          float amplitude = 0.5;
+          for (int i = 0; i < 3; i++) {
+            value += amplitude * noise(p);
+            p *= 2.0;
+            amplitude *= 0.5;
+          }
+          return value;
+        }
+        
+        // Get random rotation (0, 90, 180, or 270 degrees)
+        float getRotation(vec2 tileId) {
+          return floor(hash(tileId) * 4.0) * 1.5708;
+        }
+        
+        // Rotate UV coordinates
+        vec2 rotateUV(vec2 uv, float angle) {
+          float c = cos(angle);
+          float s = sin(angle);
+          vec2 center = vec2(0.5);
+          uv -= center;
+          uv = vec2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+          uv += center;
+          return uv;
+        }
+        
+        // Sample texture for a specific tile
+        vec3 sampleTile(vec2 tileId, vec2 localUV) {
+          float rotation = getRotation(tileId);
+          vec2 offset = vec2(hash(tileId + 0.5), hash(tileId + 1.5)) * 0.5;
+          vec2 rotatedUV = rotateUV(localUV, rotation);
+          vec2 finalUV = (rotatedUV + offset) * textureScale;
+          return texture2D(diffuseTexture, finalUV).rgb;
+        }
+        
+        void main() {
+          // Calculate which virtual tile this pixel is in
+          vec2 worldUV = vWorldPos.xz / tileSize;
+          vec2 tileId = floor(worldUV);
+          vec2 tileUV = fract(worldUV);
+          
+          // Blend zone size (0.0 to 0.5)
+          float blendZone = 0.35;
+          
+          // Add noise to create organic, irregular blend boundaries
+          float noiseScale = 8.0;
+          float noiseValue = fbm(vWorldPos.xz * noiseScale / tileSize) * 0.3;
+          
+          // Calculate distance to nearest edge (with noise offset)
+          float distToEdgeX = min(tileUV.x, 1.0 - tileUV.x);
+          float distToEdgeY = min(tileUV.y, 1.0 - tileUV.y);
+          
+          // Determine neighbor directions
+          float dirX = tileUV.x < 0.5 ? -1.0 : 1.0;
+          float dirY = tileUV.y < 0.5 ? -1.0 : 1.0;
+          
+          vec2 neighborX = tileId + vec2(dirX, 0.0);
+          vec2 neighborY = tileId + vec2(0.0, dirY);
+          vec2 neighborXY = tileId + vec2(dirX, dirY);
+          
+          // Calculate blend weights with noise for organic edges
+          float weightX = smoothstep(0.0, blendZone, distToEdgeX + noiseValue);
+          float weightY = smoothstep(0.0, blendZone, distToEdgeY + noiseValue);
+          
+          // Sample all tiles
+          vec3 colorMain = sampleTile(tileId, tileUV);
+          vec3 colorX = sampleTile(neighborX, tileUV);
+          vec3 colorY = sampleTile(neighborY, tileUV);
+          vec3 colorXY = sampleTile(neighborXY, tileUV);
+          
+          // Bilinear blend with noise-modulated weights
+          vec3 blendX = mix(colorX, colorMain, weightX);
+          vec3 blendXY = mix(colorXY, colorY, weightX);
+          vec3 finalColor = mix(blendXY, blendX, weightY);
+          
+          // Simple lighting
+          vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+          float NdotL = max(dot(vNormal, lightDir), 0.0);
+          float ambient = 0.4;
+          float light = ambient + NdotL * 0.6;
+          
+          gl_FragColor = vec4(finalColor * light, 1.0);
+        }
+      `
+    }, {
+      attributes: ['position', 'normal', 'uv'],
+      uniforms: ['world', 'viewProjection', 'diffuseTexture', 'normalTexture', 'roughTexture', 'tileSize', 'textureScale']
+    });
+    
+    // Load textures
+    const diffuseTex = new Texture(skirtTexturePath + 'forest_leaves_02_diffuse_1k.jpg', scene);
+    const normalTex = new Texture(skirtTexturePath + 'forest_leaves_02_nor_gl_1k.jpg', scene);
+    const roughTex = new Texture(skirtTexturePath + 'forest_leaves_02_rough_1k.jpg', scene);
+    
+    shaderMaterial.setTexture('diffuseTexture', diffuseTex);
+    shaderMaterial.setTexture('normalTexture', normalTex);
+    shaderMaterial.setTexture('roughTexture', roughTex);
+    shaderMaterial.setFloat('tileSize', 12.0); // Virtual tile size in world units
+    shaderMaterial.setFloat('textureScale', 0.8); // How much of texture to show per tile
+    
+    return shaderMaterial;
+  }
+  
+  // Create single shared skirt material
+  const skirtAntiTileMaterial = createAntiTilingSkirtMaterial('skirtAntiTile');
   
   /**
    * Generate points for a rounded rectangle centered at origin
@@ -2331,59 +2714,68 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
   innerPoints.push(innerPoints[0].clone());
   outerPoints.push(outerPoints[0].clone());
   
-  // Create the ramp surface using ribbon
+  // Create the ramp surface using ribbon (uses triplanar for slopes)
   const rampMesh = MeshBuilder.CreateRibbon('pyramidRamp', {
     pathArray: [outerPoints, innerPoints],
     closeArray: false,
     closePath: false,
     sideOrientation: Mesh.DOUBLESIDE
   }, scene);
-  rampMesh.material = skirtMaterial;
+  rampMesh.material = rampMaterial;
   rampMesh.isPickable = false;
   rampMesh.receiveShadows = true;
   skirtMeshes.push(rampMesh);
   
-  // Create flat skirt around the map (extends from map edge outward, under the ramp)
+  // Create 4 large skirt planes with GPU-based anti-tiling shader
+  
   // Left skirt - from map left edge outward
+  const leftSkirtWidth = skirtSize + rampWidth;
+  const leftSkirtHeight = actualMapHeight + skirtSize * 2;
   const leftSkirt = MeshBuilder.CreateGround('skirtLeft', {
-    width: skirtSize + rampWidth,
-    height: actualMapHeight + skirtSize * 2
+    width: leftSkirtWidth,
+    height: leftSkirtHeight
   }, scene);
-  leftSkirt.position = new Vector3(mapCenterX - actualMapWidth / 2 - (skirtSize + rampWidth) / 2, outerY, mapCenterZ);
-  leftSkirt.material = skirtMaterial;
+  leftSkirt.position = new Vector3(mapCenterX - actualMapWidth / 2 - leftSkirtWidth / 2, outerY, mapCenterZ);
+  leftSkirt.material = skirtAntiTileMaterial;
   leftSkirt.isPickable = false;
   leftSkirt.receiveShadows = true;
   skirtMeshes.push(leftSkirt);
   
   // Right skirt - from map right edge outward
+  const rightSkirtWidth = skirtSize + rampWidth;
+  const rightSkirtHeight = actualMapHeight + skirtSize * 2;
   const rightSkirt = MeshBuilder.CreateGround('skirtRight', {
-    width: skirtSize + rampWidth,
-    height: actualMapHeight + skirtSize * 2
+    width: rightSkirtWidth,
+    height: rightSkirtHeight
   }, scene);
-  rightSkirt.position = new Vector3(mapCenterX + actualMapWidth / 2 + (skirtSize + rampWidth) / 2, outerY, mapCenterZ);
-  rightSkirt.material = skirtMaterial;
+  rightSkirt.position = new Vector3(mapCenterX + actualMapWidth / 2 + rightSkirtWidth / 2, outerY, mapCenterZ);
+  rightSkirt.material = skirtAntiTileMaterial;
   rightSkirt.isPickable = false;
   rightSkirt.receiveShadows = true;
   skirtMeshes.push(rightSkirt);
   
   // Top skirt - from map top edge outward
+  const topSkirtWidth = actualMapWidth;
+  const topSkirtHeight = skirtSize + rampWidth;
   const topSkirt = MeshBuilder.CreateGround('skirtTop', {
-    width: actualMapWidth,
-    height: skirtSize + rampWidth
+    width: topSkirtWidth,
+    height: topSkirtHeight
   }, scene);
-  topSkirt.position = new Vector3(mapCenterX, outerY, mapCenterZ + actualMapHeight / 2 + (skirtSize + rampWidth) / 2);
-  topSkirt.material = skirtMaterial;
+  topSkirt.position = new Vector3(mapCenterX, outerY, mapCenterZ + actualMapHeight / 2 + topSkirtHeight / 2);
+  topSkirt.material = skirtAntiTileMaterial;
   topSkirt.isPickable = false;
   topSkirt.receiveShadows = true;
   skirtMeshes.push(topSkirt);
   
   // Bottom skirt - from map bottom edge outward
+  const bottomSkirtWidth = actualMapWidth;
+  const bottomSkirtHeight = skirtSize + rampWidth;
   const bottomSkirt = MeshBuilder.CreateGround('skirtBottom', {
-    width: actualMapWidth,
-    height: skirtSize + rampWidth
+    width: bottomSkirtWidth,
+    height: bottomSkirtHeight
   }, scene);
-  bottomSkirt.position = new Vector3(mapCenterX, outerY, mapCenterZ - actualMapHeight / 2 - (skirtSize + rampWidth) / 2);
-  bottomSkirt.material = skirtMaterial;
+  bottomSkirt.position = new Vector3(mapCenterX, outerY, mapCenterZ - actualMapHeight / 2 - bottomSkirtHeight / 2);
+  bottomSkirt.material = skirtAntiTileMaterial;
   bottomSkirt.isPickable = false;
   bottomSkirt.receiveShadows = true;
   skirtMeshes.push(bottomSkirt);
@@ -2397,10 +2789,11 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
   };
   
   // Load different tree types with their own placement rules
+  // NOTE: Tree counts reduced to 1 for testing - restore to 100, 10, 40, 80 for production
   const treePromise = Promise.all([
     scatterTrees(scene, skirtBounds, {
       modelFile: 'tree1.glb',
-      treeCount: 100,
+      treeCount: 1,
       minDistance: 10,
       maxDistance: 50,
       groundY: outerY,
@@ -2408,7 +2801,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
     }),
     scatterTrees(scene, skirtBounds, {
       modelFile: 'tree2.glb',
-      treeCount: 10,
+      treeCount: 1,
       minDistance: 10,
       maxDistance: 30,
       groundY: outerY,
@@ -2416,7 +2809,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
     }),
     scatterTrees(scene, skirtBounds, {
       modelFile: 'tree3.glb',
-      treeCount: 40,
+      treeCount: 1,
       minDistance: 15,
       maxDistance: 40,
       groundY: outerY,
@@ -2424,7 +2817,7 @@ export function build3DMap(scene, terrain, mapWidth, mapHeight, startZones, play
     }),
     scatterTrees(scene, skirtBounds, {
       modelFile: 'tree5.glb',
-      treeCount: 80,
+      treeCount: 1,
       minDistance: 20,
       maxDistance: 50,
       groundY: outerY,

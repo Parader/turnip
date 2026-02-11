@@ -10,10 +10,6 @@ import '@babylonjs/loaders/glTF';
 // Asset manifest - all assets that need to be preloaded
 const ASSET_MANIFEST = {
   models: [
-    // Ground terrain
-    '/assets/ground.glb',
-    '/assets/ground2.glb',
-    
     // Environment/decor trees
     '/assets/decor/tree1.glb',
     '/assets/decor/tree2.glb',
@@ -25,6 +21,7 @@ const ASSET_MANIFEST = {
     '/assets/magicshard.glb',
     '/assets/rock.glb',
     '/assets/tp_ground.glb',
+    '/assets/trap.glb',
     
     // Character models
     '/models/archer/master.glb',
@@ -52,6 +49,11 @@ const ASSET_MANIFEST = {
     '/assets/decor/mossy_rock_diff_1k.jpg',
     '/assets/decor/mossy_rock_nor_gl_1k.jpg',
     '/assets/decor/mossy_rock_rough_1k.jpg',
+    
+    // Ground textures - rocky terrain
+    '/assets/decor/rocky_terrain_03_diff_1k.jpg',
+    '/assets/decor/rocky_terrain_03_nor_gl_1k.jpg',
+    '/assets/decor/rocky_terrain_03_rough_1k.jpg',
     
     // Skybox
     '/assets/skybox.env',

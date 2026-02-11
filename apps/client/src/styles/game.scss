@@ -43,12 +43,18 @@
   top: 0;
   left: 0;
   right: 0;
+  bottom: 0;
   padding: 1rem;
   z-index: 100;
   pointer-events: none;
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+
+  // Interactive children (turn order, buttons, etc.) — same pattern as spell action bar
+  .turn-order-display {
+    pointer-events: auto;
+  }
 
   .leave-game-btn {
     padding: 0.75rem 1.5rem;

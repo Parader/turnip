@@ -3,7 +3,8 @@
  * Handles all character animations: movement, stance, cast, hit
  */
 
-import { AnimationGroup, TransformNode } from '@babylonjs/core';
+import { AnimationGroup, TransformNode, Vector3, SceneLoader } from '@babylonjs/core';
+import '@babylonjs/loaders/glTF';
 import { activeTeleports } from './babylonTeleport';
 
 /**
@@ -315,6 +316,162 @@ export function stopStanceAnimation(scene, userId) {
 }
 
 /**
+ * Get skeleton and the mesh that owns it (for character models).
+ * @param {import('@babylonjs/core').Node} node - Mesh or TransformNode
+ * @returns {{ skeleton: import('@babylonjs/core').Skeleton, ownerMesh: import('@babylonjs/core').TransformNode }|null}
+ */
+function getSkeletonAndOwner(node) {
+  if (!node) return null;
+  if (node.skeleton) return { skeleton: node.skeleton, ownerMesh: node };
+  const children = node.getChildMeshes?.() || [];
+  for (const child of children) {
+    const found = getSkeletonAndOwner(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** @type {Map<string, import('@babylonjs/core').AbstractMesh|null>} */
+const weaponTemplateCache = new Map();
+/** @type {Map<string, Promise<import('@babylonjs/core').AbstractMesh|null>>} */
+const weaponTemplateLoadPromises = new Map();
+
+/**
+ * Load a weapon mesh template for attachment (cached by url).
+ * @param {import('@babylonjs/core').Scene} scene
+ * @param {string} meshUrl - e.g. '/assets/dagger.glb'
+ * @returns {Promise<import('@babylonjs/core').AbstractMesh|null>} Root mesh of the model (template, do not parent)
+ */
+async function loadWeaponTemplate(scene, meshUrl) {
+  const cached = weaponTemplateCache.get(meshUrl);
+  if (cached !== undefined) return cached;
+  let promise = weaponTemplateLoadPromises.get(meshUrl);
+  if (promise) return promise;
+  const lastSlash = meshUrl.lastIndexOf('/');
+  const rootUrl = lastSlash >= 0 ? meshUrl.slice(0, lastSlash + 1) : '/';
+  const filename = lastSlash >= 0 ? meshUrl.slice(lastSlash + 1) : meshUrl;
+  promise = SceneLoader.ImportMeshAsync('', rootUrl, filename, scene)
+    .then((result) => {
+      if (!result.meshes || result.meshes.length === 0) {
+        weaponTemplateCache.set(meshUrl, null);
+        weaponTemplateLoadPromises.delete(meshUrl);
+        return null;
+      }
+      // Use root (no parent) so hierarchy is intact; fallback to first mesh with geometry
+      let root = result.meshes.find((m) => !m.parent) || result.meshes[0];
+      const withVerts = result.meshes.find((m) => (m.getTotalVertices?.() ?? 0) > 0);
+      if (withVerts && (root.getTotalVertices?.() ?? 0) === 0) {
+        root = withVerts;
+      }
+      root.setEnabled(false);
+      root.parent = null;
+      weaponTemplateCache.set(meshUrl, root);
+      weaponTemplateLoadPromises.delete(meshUrl);
+      return root;
+    })
+    .catch((err) => {
+      console.warn(`[WeaponAttachment] Failed to load ${meshUrl}:`, err);
+      weaponTemplateCache.delete(meshUrl);
+      weaponTemplateLoadPromises.delete(meshUrl);
+      return null;
+    });
+  weaponTemplateLoadPromises.set(meshUrl, promise);
+  return promise;
+}
+
+/**
+ * Attach a weapon mesh to a player's bone for the duration of a cast animation.
+ * @param {import('@babylonjs/core').Scene} scene
+ * @param {string} userId
+ * @param {{ meshUrl: string, boneName: string, scale?: number, positionOffset?: {x,y,z}, rotationOffset?: {x,y,z} }} def
+ * @returns {Promise<import('@babylonjs/core').AbstractMesh|TransformNode|null>} Attached mesh/container to pass to detachWeaponFromPlayer
+ */
+export async function attachWeaponToPlayer(scene, userId, def) {
+  if (!def?.meshUrl || !def?.boneName) return null;
+  const playerMesh = scene.metadata?.playerMeshes?.get(userId);
+  if (!playerMesh) return null;
+  const modelMesh = playerMesh.metadata?.modelMesh || playerMesh;
+  const skeletonAndOwner = getSkeletonAndOwner(modelMesh);
+  if (!skeletonAndOwner) {
+    console.warn(`[WeaponAttachment] No skeleton found for player ${userId}`);
+    return null;
+  }
+  const { skeleton, ownerMesh } = skeletonAndOwner;
+  const boneNames = skeleton.bones?.map((b) => b.name) ?? [];
+  let bone = skeleton.bones?.find((b) => b.name === def.boneName) ?? null;
+  if (!bone) {
+    const lower = def.boneName.toLowerCase();
+    bone = skeleton.bones?.find((b) => (b.name || '').toLowerCase() === lower || (b.name || '').toLowerCase().endsWith(lower)) ?? null;
+  }
+  if (!bone) {
+    console.warn(`[WeaponAttachment] Bone "${def.boneName}" not found on player ${userId}. Available:`, boneNames);
+    return null;
+  }
+  const template = await loadWeaponTemplate(scene, def.meshUrl);
+  if (!template) {
+    console.warn(`[WeaponAttachment] Failed to load template ${def.meshUrl}`);
+    return null;
+  }
+  const name = `weapon_${userId}_${Date.now()}`;
+  const weaponRoot = template.clone(name, null, false);
+  if (!weaponRoot) return null;
+  weaponRoot.setEnabled(true);
+  weaponRoot.visibility = 1;
+  weaponRoot.position = Vector3.Zero();
+  weaponRoot.rotation = Vector3.Zero();
+  const scale = def.scale ?? 1;
+  weaponRoot.scaling = new Vector3(scale, scale, scale);
+  if (def.positionOffset) {
+    weaponRoot.position = new Vector3(
+      def.positionOffset.x ?? 0,
+      def.positionOffset.y ?? 0,
+      def.positionOffset.z ?? 0
+    );
+  }
+  if (def.rotationOffset) {
+    weaponRoot.rotation = new Vector3(
+      def.rotationOffset.x ?? 0,
+      def.rotationOffset.y ?? 0,
+      def.rotationOffset.z ?? 0
+    );
+  }
+  const allWeaponMeshes = [weaponRoot, ...(weaponRoot.getChildMeshes?.() || [])];
+  allWeaponMeshes.forEach((m) => {
+    m.setEnabled(true);
+    m.visibility = 1;
+    m.isPickable = false;
+    if (m.material && m.material.alpha !== undefined) m.material.alpha = 1;
+  });
+  try {
+    weaponRoot.attachToBone(bone, ownerMesh);
+    console.log(`[WeaponAttachment] Attached to bone "${bone.name}" (${allWeaponMeshes.length} mesh(es))`);
+  } catch (err) {
+    console.warn(`[WeaponAttachment] attachToBone failed:`, err);
+    detachWeaponFromPlayer(weaponRoot);
+    return null;
+  }
+  return weaponRoot;
+}
+
+/**
+ * Detach and dispose a weapon that was attached for a cast animation.
+ * @param {import('@babylonjs/core').AbstractMesh|TransformNode|null} weaponRoot
+ */
+export function detachWeaponFromPlayer(weaponRoot) {
+  if (!weaponRoot) return;
+  try {
+    if (typeof weaponRoot.detachFromBone === 'function') {
+      weaponRoot.detachFromBone(false);
+    }
+    weaponRoot.setEnabled(false);
+    weaponRoot.parent = null;
+    if (!weaponRoot.isDisposed) weaponRoot.dispose();
+  } catch (e) {
+    // ignore
+  }
+}
+
+/**
  * Play cast animation for a spell using Babylon.js animation chaining
  * @param {Scene} scene - Babylon.js scene
  * @param {string} userId - Player's user ID
@@ -453,19 +610,38 @@ export async function playCastAnimation(scene, userId, castAnimDef) {
     idleAnim.stop(); // Stop it, we'll start it later for transition
   }
   
+  // Optional: attach weapon to bone for this cast (e.g. dagger in hand for attack4)
+  let attachedWeapon = null;
+  if (castAnimDef.weaponAttachment) {
+    try {
+      attachedWeapon = await attachWeaponToPlayer(scene, userId, castAnimDef.weaponAttachment);
+    } catch (e) {
+      console.warn('[WeaponAttachment] Attach failed:', e);
+    }
+  }
+
   // Start cast animation at 100% weight - ensure it's the ONLY animation playing
   castAnim.setWeightForAllAnimatables(1.0);
   castAnim.play(false); // Don't loop
-  
+
   // Store cast animation state to prevent interruption
   if (!scene.metadata.playerCastAnimations) {
     scene.metadata.playerCastAnimations = new Map();
   }
   scene.metadata.playerCastAnimations.set(userId, {
     animation: castAnim,
-    startTime: Date.now()
+    startTime: Date.now(),
+    attachedWeapon
   });
-  
+
+  const cleanupWeapon = () => {
+    const state = scene.metadata.playerCastAnimations?.get(userId);
+    if (state?.attachedWeapon) {
+      detachWeaponFromPlayer(state.attachedWeapon);
+      state.attachedWeapon = null;
+    }
+  };
+
   try {
     // Wait for cast animation to complete using onAnimationGroupEndObservable
     // AnimationGroup doesn't have waitAsync, so we use the observable pattern
@@ -505,8 +681,9 @@ export async function playCastAnimation(scene, userId, castAnimDef) {
     // Cast animation has completed at 100% weight, now transition to idle
     const castState = scene.metadata.playerCastAnimations?.get(userId);
     if (castState && castState.animation === castAnim) {
+      cleanupWeapon();
       scene.metadata.playerCastAnimations.delete(userId);
-      
+
       // Transition to idle using blend timing
       const blendOutMs = castAnimDef.blendOutMs || 200;
       if (idleAnim) {
@@ -539,10 +716,11 @@ export async function playCastAnimation(scene, userId, castAnimDef) {
     // Cleanup on error
     const castState = scene.metadata.playerCastAnimations?.get(userId);
     if (castState && castState.animation === castAnim) {
+      cleanupWeapon();
       scene.metadata.playerCastAnimations.delete(userId);
       castAnim.setWeightForAllAnimatables(0.0);
       castAnim.stop();
-      
+
       // Return to idle
       if (idleAnim) {
         idleAnim.setWeightForAllAnimatables(1.0);

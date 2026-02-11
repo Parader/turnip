@@ -3,8 +3,14 @@
  * Handles rendering of spell projectiles, impacts, and ground effects
  */
 
-import { MeshBuilder, StandardMaterial, Color3, Color4, Vector3, Animation, AnimationGroup, ParticleSystem, Texture, DynamicTexture, Material, SceneLoader, QuadraticEase, EasingFunction } from '@babylonjs/core';
+import { MeshBuilder, StandardMaterial, Color3, Color4, Vector3, Animation, AnimationGroup, ParticleSystem, Texture, DynamicTexture, Material, SceneLoader, QuadraticEase, EasingFunction, TransformNode } from '@babylonjs/core';
 import '@babylonjs/loaders/glTF';
+
+// Import trap caching system for fast instantiation
+import { createTrapInstance } from '../babylonScene';
+
+// Import audio system for impact sounds
+import { playSpellSound } from '../../audio';
 
 // ============================================================================
 // SHARED TEXTURE & MATERIAL CACHE
@@ -127,6 +133,13 @@ export function disposeVfxCache(scene) {
     }
     scene.metadata.arcaneShardModel = null;
   }
+  
+  // Dispose cached trap particle texture
+  const trapParticleTexture = scene.metadata[CACHE_PREFIX + 'trapParticleTexture'];
+  if (trapParticleTexture && !trapParticleTexture.isDisposed) {
+    trapParticleTexture.dispose();
+  }
+  scene.metadata[CACHE_PREFIX + 'trapParticleTexture'] = null;
   
   console.log('[VFX] Cache disposed');
 }
@@ -1070,16 +1083,18 @@ function disposeMeshAndChildren(mesh) {
  * @param {Vector3} endPos - End position (target position)
  * @param {number} castStartTime - Timestamp when cast animation started
  */
-export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime) {
+export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime, options = {}) {
   const presentation = spellDef.presentation;
   if (!presentation) {
     console.warn('Fireball VFX: No presentation data found in spell definition');
     return;
   }
-  
+
+  const { targetUserId, onImpact } = options;
+
   const projectileVfx = presentation.projectileVfx;
   const impactVfx = presentation.impactVfxDef;
-  
+
   // If no VFX components, skip
   if (!projectileVfx && !impactVfx) {
     console.warn('Fireball VFX: No VFX components found (projectileVfx or impactVfxDef)');
@@ -1088,8 +1103,8 @@ export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime
   
   // Playing fireball VFX
   
-  // Calculate start delay: add 150ms to match character animation + any projectileVfx delay
-  const baseDelay = 600; // 150ms delay to match character animation
+  // Calculate start delay - allow cast animation to play before projectile spawns
+  const baseDelay = 550; // Wait for cast animation wind-up
   const projectileDelay = projectileVfx ? (projectileVfx.startDelayMs || 0) : 0;
   const startDelay = baseDelay + projectileDelay;
   const actualStartTime = castStartTime + startDelay;
@@ -1197,6 +1212,15 @@ export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime
               const impactDelay = impactVfx.delayMs || 0;
               setTimeout(() => {
                 createExplosion(impactVfx, endPos, scene, 'fireball_impact');
+                // Play impact sound at target position
+                playSpellSound('fireball', 'impact', {
+                  position: endPos,
+                  eventId: `fireball_impact_${Date.now()}`
+                });
+                // Hit animation in sync with impact (avoids delay from server spellHit)
+                if (targetUserId && typeof onImpact === 'function') {
+                  onImpact(targetUserId);
+                }
               }, impactDelay);
             }
           },
@@ -1248,6 +1272,14 @@ export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime
               const impactDelay = impactVfx.delayMs || 0;
               setTimeout(() => {
                 createExplosion(impactVfx, endPos, scene, 'fireball_impact');
+                // Play impact sound at target position
+                playSpellSound('fireball', 'impact', {
+                  position: endPos,
+                  eventId: `fireball_impact_fallback_${Date.now()}`
+                });
+                if (targetUserId && typeof onImpact === 'function') {
+                  onImpact(targetUserId);
+                }
               }, impactDelay);
             }
           },
@@ -1261,6 +1293,14 @@ export function playFireballVfx(scene, spellDef, startPos, endPos, castStartTime
         const impactDelay = (impactVfx.delayMs || 0) + 200; // Add 200ms delay
         setTimeout(() => {
           createExplosion(impactVfx, endPos, scene, 'fireball_impact');
+          // Play impact sound at target position
+          playSpellSound('fireball', 'impact', {
+            position: endPos,
+            eventId: `fireball_impact_noproj_${Date.now()}`
+          });
+          if (targetUserId && typeof onImpact === 'function') {
+            onImpact(targetUserId);
+          }
         }, impactDelay);
       }
     }
@@ -1334,6 +1374,41 @@ function createHealParticles(position, scene, config = {}) {
     emitterMesh.dispose();
   }, cleanupTime);
   
+  return particleSystem;
+}
+
+/**
+ * Create poison status particles emanating from a character (pooled, start/stop when effect applied/removed).
+ * A few green particles drifting outward/up from the body; no targetStopDuration so caller controls start/stop.
+ * @param {TransformNode|Mesh} emitterMesh - Character mesh to emit from
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} name - Unique name for the particle system
+ * @returns {ParticleSystem} Particle system (call .start() / .stop(), do not dispose until effect removed for good)
+ */
+export function createPoisonStatusParticles(emitterMesh, scene, name = 'poison_status') {
+  const particleSystem = new ParticleSystem(`${name}_particles`, 80, scene);
+  particleSystem.particleTexture = createParticleTexture(scene);
+  particleSystem.emitter = emitterMesh;
+  // Emit from shoulder to above head (slight spread around body)
+  particleSystem.minEmitBox = new Vector3(-0.25, 0.7, -0.25);
+  particleSystem.maxEmitBox = new Vector3(0.25, 1.2, 0.25);
+  // Green poison colors, semi-transparent
+  particleSystem.color1 = new Color4(0.2, 0.9, 0.35, 0.7);
+  particleSystem.color2 = new Color4(0.4, 1.0, 0.5, 0.5);
+  particleSystem.colorDead = new Color4(0.1, 0.5, 0.2, 0);
+  particleSystem.minSize = 0.06;
+  particleSystem.maxSize = 0.12;
+  particleSystem.minLifeTime = 0.6;
+  particleSystem.maxLifeTime = 1.2;
+  particleSystem.emitRate = 18;
+  particleSystem.updateSpeed = 0.02;
+  // Emanate outward and slightly up from body
+  particleSystem.direction1 = new Vector3(-0.5, 0.3, -0.5);
+  particleSystem.direction2 = new Vector3(0.5, 0.8, 0.5);
+  particleSystem.minEmitPower = 0.08;
+  particleSystem.maxEmitPower = 0.2;
+  particleSystem.gravity = new Vector3(0, 0.05, 0);
+  particleSystem.blendMode = ParticleSystem.BLENDMODE_STANDARD;
   return particleSystem;
 }
 
@@ -2128,18 +2203,20 @@ function createArcaneImpact(position, scene, name) {
  * @param {number} missileIndex - Index of missile in multi-missile cast (0, 1, 2) for curve pattern
  * @param {number} totalMissiles - Total number of missiles in this cast
  */
-export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStartTime, missileIndex = 0, totalMissiles = 1) {
+export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStartTime, missileIndex = 0, totalMissiles = 1, options = {}) {
   const presentation = spellDef.presentation;
   if (!presentation) {
     console.warn('Arcane Missile VFX: No presentation data found');
     return;
   }
-  
+
+  const { targetUserId, onImpact } = options;
+
   const projectileVfx = presentation.projectileVfx;
   const impactVfx = presentation.impactVfxDef;
   
-  // Calculate start delay
-  const baseDelay = 600;
+  // Calculate start delay - allow cast animation to play before projectile spawns
+  const baseDelay = 550; // Wait for cast animation wind-up
   const projectileDelay = projectileVfx ? (projectileVfx.startDelayMs || 0) : 0;
   const startDelay = baseDelay + projectileDelay;
   const actualStartTime = castStartTime + startDelay;
@@ -2368,6 +2445,14 @@ export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStar
           setTimeout(() => {
             const impactName = `${core?.name || 'arcane_missile'}_impact`;
             createArcaneImpact(endPos, scene, impactName);
+            // Play impact sound at target position
+            playSpellSound('arcane_missile', 'impact', {
+              position: endPos,
+              eventId: `arcane_impact_${impactName}_${Date.now()}`
+            });
+            if (targetUserId && typeof onImpact === 'function') {
+              onImpact(targetUserId);
+            }
           }, impactDelay);
         }
       },
@@ -2387,15 +2472,16 @@ export function playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStar
  * @param {number} castStartTime - Timestamp when cast started
  * @param {number} missileIndex - Index of missile in multi-missile cast (for arcane_missile)
  * @param {number} totalMissiles - Total number of missiles in this cast (for arcane_missile)
+ * @param {{ targetUserId?: string, onImpact?: (userId: string) => void }} options - Optional: trigger hit animation on impact (sync with VFX)
  */
-export function playSpellVfx(scene, spellDef, startPos, endPos, castStartTime, missileIndex = 0, totalMissiles = 1) {
+export function playSpellVfx(scene, spellDef, startPos, endPos, castStartTime, missileIndex = 0, totalMissiles = 1, options = {}) {
   // Route to specific spell VFX handler
   if (spellDef.spellId === 'fireball') {
-    playFireballVfx(scene, spellDef, startPos, endPos, castStartTime);
+    playFireballVfx(scene, spellDef, startPos, endPos, castStartTime, options);
   } else if (spellDef.spellId === 'heal') {
     playHealVfx(scene, spellDef, startPos, endPos, castStartTime);
   } else if (spellDef.spellId === 'arcane_missile') {
-    playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStartTime, missileIndex, totalMissiles);
+    playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStartTime, missileIndex, totalMissiles, options);
   } else if (spellDef.spellId === 'teleport') {
     // Teleport VFX is handled separately via TeleportVFXController
     // This is just a placeholder - actual teleport is triggered via startTeleportVFX
@@ -2409,6 +2495,47 @@ export function playSpellVfx(scene, spellDef, startPos, endPos, castStartTime, m
 // TRAP VFX SYSTEM
 // Visual effects for trap triggers
 // ============================================================================
+
+/**
+ * Find a trap entity mesh at the given world position
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Vector3} position - World position to search at
+ * @returns {TransformNode|Mesh|null} The trap mesh/container or null if not found
+ */
+function findTrapMeshAtPosition(scene, position) {
+  if (!scene.metadata || !scene.metadata.entityMeshes) {
+    return null;
+  }
+  
+  const tileSize = 1;
+  const tolerance = tileSize * 0.5; // Allow some tolerance for position matching
+  
+  // Search through all entity meshes
+  for (const [entityId, mesh] of scene.metadata.entityMeshes) {
+    // Check if this is a trap entity
+    if (mesh.metadata && mesh.metadata.entityType === 'trap') {
+      // Check if position matches (using grid position if available, otherwise world position)
+      if (mesh.metadata.gridPosition) {
+        const gridX = mesh.metadata.gridPosition.x;
+        const gridY = mesh.metadata.gridPosition.y;
+        const worldX = gridX * tileSize;
+        const worldZ = gridY * tileSize;
+        
+        if (Math.abs(worldX - position.x) < tolerance && Math.abs(worldZ - position.z) < tolerance) {
+          return mesh;
+        }
+      } else if (mesh.position) {
+        // Fallback to world position comparison
+        if (Math.abs(mesh.position.x - position.x) < tolerance && 
+            Math.abs(mesh.position.z - position.z) < tolerance) {
+          return mesh;
+        }
+      }
+    }
+  }
+  
+  return null;
+}
 
 /**
  * Play trap trigger VFX at the specified position
@@ -2439,103 +2566,42 @@ export function playTrapTriggerVfx(scene, trapData) {
 
 /**
  * Play spike trap trigger VFX
- * Visual: Spikes shooting up from ground with particle burst
+ * Plays the trap model's animation and adds particle burst
+ * If the trap mesh doesn't exist (hidden from enemy), spawns a temporary one.
  * @param {Scene} scene - Babylon.js scene
  * @param {Vector3} position - World position
  * @param {number} damage - Damage dealt
  */
 function playSpikeTrapVfx(scene, position, damage) {
-  // Create spike geometry - multiple vertical spikes shooting up
-  const spikeCount = 5;
-  const spikeMeshes = [];
+  // Find the trap entity mesh at this position and play its animation
+  const trapMesh = findTrapMeshAtPosition(scene, position);
   
-  for (let i = 0; i < spikeCount; i++) {
-    // Random offset within tile
-    const offsetX = (Math.random() - 0.5) * 0.5;
-    const offsetZ = (Math.random() - 0.5) * 0.5;
+  if (trapMesh && trapMesh.metadata && trapMesh.metadata.animationGroups) {
+    const animationGroups = trapMesh.metadata.animationGroups;
     
-    // Create a cone for the spike
-    const spike = MeshBuilder.CreateCylinder(`spike_${i}_${Date.now()}`, {
-      diameterTop: 0,
-      diameterBottom: 0.08 + Math.random() * 0.04,
-      height: 0.4 + Math.random() * 0.3,
-      tessellation: 6
-    }, scene);
-    
-    // Create material for spike (dark metallic)
-    const spikeMaterial = new StandardMaterial(`spikeMat_${i}_${Date.now()}`, scene);
-    spikeMaterial.diffuseColor = new Color3(0.3, 0.25, 0.2);
-    spikeMaterial.specularColor = new Color3(0.6, 0.5, 0.4);
-    spikeMaterial.emissiveColor = new Color3(0.1, 0.05, 0.05);
-    spike.material = spikeMaterial;
-    
-    // Position spike below ground initially
-    spike.position = new Vector3(
-      position.x + offsetX,
-      -0.5, // Start below ground
-      position.z + offsetZ
-    );
-    
-    spikeMeshes.push(spike);
-    
-    // Animate spike shooting up
-    const targetY = 0.2 + Math.random() * 0.2;
-    const animationDuration = 80 + Math.random() * 40; // 80-120ms
-    
-    // Create spike up animation
-    const upAnimation = new Animation(
-      `spikeUp_${i}`,
-      'position.y',
-      60, // 60 fps
-      Animation.ANIMATIONTYPE_FLOAT,
-      Animation.ANIMATIONLOOPMODE_CONSTANT
-    );
-    
-    const upFrames = Math.ceil(animationDuration / (1000 / 60));
-    upAnimation.setKeys([
-      { frame: 0, value: -0.5 },
-      { frame: upFrames, value: targetY }
-    ]);
-    
-    // Add easing for sharp spike motion
-    const easeOut = new QuadraticEase();
-    easeOut.setEasingMode(EasingFunction.EASINGMODE_EASEOUT);
-    upAnimation.setEasingFunction(easeOut);
-    
-    spike.animations = [upAnimation];
-    scene.beginAnimation(spike, 0, upFrames, false);
-    
-    // Schedule spike retraction and disposal
-    setTimeout(() => {
-      // Animate spike going back down
-      const downAnimation = new Animation(
-        `spikeDown_${i}`,
-        'position.y',
-        60,
-        Animation.ANIMATIONTYPE_FLOAT,
-        Animation.ANIMATIONLOOPMODE_CONSTANT
-      );
-      
-      downAnimation.setKeys([
-        { frame: 0, value: targetY },
-        { frame: 20, value: -0.5 }
-      ]);
-      
-      spike.animations = [downAnimation];
-      scene.beginAnimation(spike, 0, 20, false, 1.0, () => {
-        // Dispose spike after animation
-        spikeMaterial.dispose();
-        spike.dispose();
+    // Check if removal animation is already handling this
+    if (trapMesh.metadata.isAnimatingRemoval) {
+      // Animation is already playing via removal handler, just add particles below
+    } else if (animationGroups.length > 0) {
+      // Play all animation groups at once (no individual logging to reduce overhead)
+      animationGroups.forEach(animGroup => {
+        animGroup.reset();
+        animGroup.play(false);
       });
-    }, 300); // Retract after 300ms
+    }
+  } else {
+    // Trap mesh doesn't exist - either disposed already or hidden from this player (enemy)
+    // Spawn a temporary trap mesh so the triggered player can see it
+    spawnTemporaryTrapMesh(scene, position);
   }
   
   // Create blood/damage burst particle system
-  const particleSystem = new ParticleSystem(`trapBurst_${Date.now()}`, 50, scene);
+  const particleSystem = new ParticleSystem(`trapBurst`, 50, scene);
   
-  // Create a simple red particle texture
-  const particleTexture = createTrapParticleTexture(scene);
-  particleSystem.particleTexture = particleTexture;
+  // Use cached particle texture (don't create new one each time)
+  particleSystem.particleTexture = getTrapParticleTexture(scene);
+  // IMPORTANT: Don't dispose texture when particle system disposes (it's cached)
+  particleSystem.disposeOnStop = false;
   
   // Emitter at trap position
   particleSystem.emitter = position.clone();
@@ -2572,19 +2638,114 @@ function playSpikeTrapVfx(scene, position, damage) {
   setTimeout(() => {
     particleSystem.stop();
     setTimeout(() => {
+      // Don't dispose texture (it's cached and shared)
+      particleSystem.particleTexture = null;
       particleSystem.dispose();
     }, 700);
   }, 200);
 }
 
 /**
- * Create a simple particle texture for trap VFX
+ * Spawn a temporary trap mesh for VFX when the trap was hidden from this player
+ * Loads the trap model, plays its animation, then disposes
  * @param {Scene} scene - Babylon.js scene
- * @returns {DynamicTexture} Particle texture
+ * @param {Vector3} position - World position to spawn at
  */
-function createTrapParticleTexture(scene) {
+async function spawnTemporaryTrapMesh(scene, position) {
+  try {
+    // Use cached trap asset for fast instantiation (no GLB parsing lag)
+    const tempId = `temp_trap_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Adjust Y position to match regular trap placement (position.y is for particles at 0.1)
+    const trapPosition = position.clone();
+    trapPosition.y = 0.01; // Slightly above ground to be visible over hit tile effect
+    
+    const trapInstance = await createTrapInstance(scene, tempId, trapPosition);
+    const tempContainer = trapInstance.container;
+    const animationGroups = trapInstance.animationGroups;
+    
+    // Play animations
+    let longestDuration = 0;
+    if (animationGroups && animationGroups.length > 0) {
+      animationGroups.forEach(animGroup => {
+        // Calculate duration
+        const fps = animGroup.targetedAnimations?.[0]?.animation?.framePerSecond || 30;
+        const fromFrame = animGroup.from || 0;
+        const toFrame = animGroup.to || 0;
+        const durationMs = ((toFrame - fromFrame) / fps) * 1000;
+        
+        if (durationMs > longestDuration) {
+          longestDuration = durationMs;
+        }
+        
+        // Play animation once
+        animGroup.reset();
+        animGroup.play(false);
+      });
+    }
+    
+    // Schedule disposal after animation
+    const disposalDelay = Math.max(longestDuration + 500, 1500);
+    
+    setTimeout(() => {
+      // Stop and dispose animation groups (they're cloned instances, not shared)
+      if (animationGroups) {
+        animationGroups.forEach(ag => {
+          ag.stop();
+          ag.dispose(); // Must dispose cloned animation groups to prevent leaks
+        });
+      }
+      
+      // Dispose container and all children
+      // Note: Don't dispose materials as they're shared from the AssetContainer
+      tempContainer.getChildMeshes().forEach(m => {
+        m.dispose(false, false); // Don't dispose materials
+      });
+      tempContainer.dispose();
+    }, disposalDelay);
+    
+  } catch (error) {
+    console.error('[TrapVFX] Failed to spawn temporary trap mesh:', error);
+    
+    // Fallback: create a simple visual indicator if cache fails
+    const fallbackMesh = MeshBuilder.CreateBox('fallback_trap', {
+      width: 0.6,
+      height: 0.15,
+      depth: 0.6
+    }, scene);
+    fallbackMesh.position = position.clone();
+    fallbackMesh.position.y = 0.01; // Match regular trap position
+    
+    const fallbackMat = new StandardMaterial('fallback_trap_mat', scene);
+    fallbackMat.diffuseColor = new Color3(0.3, 0.2, 0.2);
+    fallbackMat.emissiveColor = new Color3(0.1, 0.05, 0.05);
+    fallbackMesh.material = fallbackMat;
+    
+    // Dispose after a short time
+    setTimeout(() => {
+      fallbackMat.dispose();
+      fallbackMesh.dispose();
+    }, 1500);
+  }
+}
+
+/**
+ * Get or create cached trap particle texture
+ * Uses scene metadata cache to avoid creating new textures repeatedly
+ * @param {Scene} scene - Babylon.js scene
+ * @returns {DynamicTexture} Cached particle texture
+ */
+function getTrapParticleTexture(scene) {
+  const cacheKey = CACHE_PREFIX + 'trapParticleTexture';
+  
+  // Return cached texture if available
+  if (scene.metadata && scene.metadata[cacheKey]) {
+    return scene.metadata[cacheKey];
+  }
+  
+  // Create new texture and cache it
   const size = 32;
-  const texture = new DynamicTexture(`trapParticleTex_${Date.now()}`, size, scene, false);
+  const texture = new DynamicTexture('trapParticleTex_cached', size, scene, false);
   const context = texture.getContext();
   
   // Draw a simple circular gradient
@@ -2599,6 +2760,12 @@ function createTrapParticleTexture(scene) {
   
   texture.update();
   texture.hasAlpha = true;
+  
+  // Cache in scene metadata
+  if (!scene.metadata) {
+    scene.metadata = {};
+  }
+  scene.metadata[cacheKey] = texture;
   
   return texture;
 }

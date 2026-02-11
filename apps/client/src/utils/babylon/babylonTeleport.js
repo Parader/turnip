@@ -983,7 +983,7 @@ export class TeleportVFXController {
         vortex.scaling.z = currentScale;
         
         // Log periodically
-        if (frameCount % 30 === 0 || progress < 0.1 || progress > 0.9) {
+        if (false && (frameCount % 30 === 0 || progress < 0.1 || progress > 0.9)) {
           console.log(`[TeleportVFX] Frame ${frameCount}: Scaling from ${oldScale.toFixed(3)} to ${currentScale.toFixed(3)} (progress: ${(progress * 100).toFixed(1)}%)`);
         }
       } else {

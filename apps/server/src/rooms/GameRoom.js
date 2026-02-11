@@ -7,6 +7,7 @@ import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { SpellDefs, getSpell, validateSpellForCaster } from '../config/spelldefs.js';
+import { getEffectDef, MAX_EFFECTS_PER_ENTITY, MAX_STACKS, MAX_OUTCOMES_PER_TURN } from '../config/effectRegistry.js';
 import { gameData } from '../config/classes.js';
 import { hasLOS, createTerrainBlocksFunction } from '../utils/lineOfSight.js';
 
@@ -1861,13 +1862,17 @@ export class GameRoom extends Room {
     
     // Parse spell loadout
     const loadout = player.spellLoadout ? JSON.parse(player.spellLoadout) : [];
-    
-    // Validate spell can be cast
+    // Build plain object of status effects for validation (e.g. silence check)
+    const statusEffectsForValidation = {};
+    if (player.statusEffects) {
+      player.statusEffects.forEach((e, id) => { statusEffectsForValidation[id] = e; });
+    }
     const validation = validateSpellForCaster(spellId, {
       userId: player.userId,
       loadout: loadout,
       energyLeft: player.energy,
-      position: { x: player.position.x, y: player.position.y }
+      position: { x: player.position.x, y: player.position.y },
+      statusEffects: statusEffectsForValidation
     });
     
     if (!validation.valid) {
@@ -1960,14 +1965,49 @@ export class GameRoom extends Room {
         }
       }
     }
-    
+
+    // Backstab: must attack enemy from behind (target's orientation faces away from caster)
+    if (spellId === 'backstab' && targeting.targetType === 'UNIT' && targetsToProcess.length > 0) {
+      const target = targetsToProcess[0];
+      let targetPlayer = null;
+      this.state.teamA.players.forEach((p, id) => {
+        if (p.position && p.position.x === target.x && p.position.y === target.y) targetPlayer = p;
+      });
+      if (!targetPlayer) {
+        this.state.teamB.players.forEach((p, id) => {
+          if (p.position && p.position.x === target.x && p.position.y === target.y) targetPlayer = p;
+        });
+      }
+      if (targetPlayer && targetPlayer.team !== team) {
+        const dx = playerX - targetPlayer.position.x;
+        const dy = playerY - targetPlayer.position.y;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+        const toCasterX = dx / len;
+        const toCasterY = dy / len;
+        const orientation = targetPlayer.orientation ?? 0;
+        const faceX = Math.cos(orientation);
+        const faceY = Math.sin(orientation);
+        const dot = faceX * toCasterX + faceY * toCasterY;
+        if (dot >= 0) {
+          console.log(`Spell cast denied: backstab requires attacking from behind (target facing caster)`);
+          return;
+        }
+      }
+    }
+
     // Deduct energy cost
     player.energy -= spell.cost.energy;
     if (player.energy < 0) {
       player.energy = 0;
     }
     
-    // Track targets that take damage for hit animations
+    // Update caster orientation to face first target (so server state matches client rotation on attack)
+    const firstTarget = targetsToProcess[0];
+    if (firstTarget && (firstTarget.x !== playerX || firstTarget.y !== playerY)) {
+      player.orientation = Math.atan2(firstTarget.y - playerY, firstTarget.x - playerX);
+    }
+    
+    // Track targets that take damage for hit animations (one spellHit per unique target)
     const damagedTargets = new Set();
     
     // Get pattern for area effects
@@ -2088,14 +2128,16 @@ export class GameRoom extends Room {
         // Apply spell effects to all affected units for this target
         spell.effects.forEach(effect => {
           if (effect.kind === 'DAMAGE') {
-            // Apply damage to all affected units
+            // Outgoing damage modified by caster's effects (e.g. weakness)
+            const modifier = this.getOutgoingDamageModifier(player);
+            const amount = Math.round(effect.amount * modifier);
             affectedUnits.forEach(targetPlayer => {
-              targetPlayer.health -= effect.amount;
+              targetPlayer.health -= amount;
               if (targetPlayer.health < 0) {
                 targetPlayer.health = 0;
               }
               damagedTargets.add(targetPlayer.userId);
-              console.log(`Applied ${effect.amount} ${effect.damageType || 'damage'} to ${targetPlayer.username}, health now: ${targetPlayer.health}`);
+              console.log(`Applied ${amount} ${effect.damageType || 'damage'} to ${targetPlayer.username}, health now: ${targetPlayer.health}`);
             });
           } else if (effect.kind === 'HEAL') {
             // Apply heal to all affected units
@@ -2119,6 +2161,7 @@ export class GameRoom extends Room {
               const statusDef = effect.statusEffect;
               affectedUnits.forEach(targetPlayer => {
                 this.applyStatusEffect(targetPlayer, statusDef, spellId, userId);
+                damagedTargets.add(targetPlayer.userId); // So spellHit is sent and target plays hit animation
               });
             }
           } else if (effect.kind === 'GROUND_EFFECT') {
@@ -2179,28 +2222,44 @@ export class GameRoom extends Room {
     
     this.broadcast('spellCast', broadcastMessage);
     
-    // Get hit delay from cast animation definition (impactDelayMs)
-    // This represents when the spell effect should visually occur relative to cast start
-    const hitDelayMs = castAnimDef?.impactDelayMs || 0;
+    // Calculate hit delay based on projectile travel time for projectile spells
+    // This ensures hit animation/sound plays when projectile reaches target
+    const baseImpactDelayMs = castAnimDef?.impactDelayMs || 0;
     
-    // Broadcast hit animations for all damaged targets after the delay
+    // Check if spell has a projectile with speed defined
+    const projectileVfx = presentation.projectileVfx;
+    const projectileSpeed = projectileVfx?.speedCellsPerSec || 0;
+    const projectileStartDelay = projectileVfx?.startDelayMs || 0;
+    
+    // Broadcast hit animations for all damaged targets (no damageAmount; client shows damage from state only)
     damagedTargets.forEach(targetUserId => {
-      if (hitDelayMs > 0) {
-        // Delay the hit animation broadcast for ranged attacks
-        setTimeout(() => {
-          this.broadcast('spellHit', {
-            targetUserId: targetUserId,
-            casterUserId: userId,
-            spellId: spellId
-          });
-        }, hitDelayMs);
-      } else {
-        // Immediate hit for melee attacks
-        this.broadcast('spellHit', {
-          targetUserId: targetUserId,
-          casterUserId: userId,
-          spellId: spellId
+      let targetPlayer = null;
+      this.state.teamA.players.forEach((p, id) => {
+        if (p.userId === targetUserId) targetPlayer = p;
+      });
+      if (!targetPlayer) {
+        this.state.teamB.players.forEach((p, id) => {
+          if (p.userId === targetUserId) targetPlayer = p;
         });
+      }
+
+      let hitDelayMs = baseImpactDelayMs;
+      if (projectileSpeed > 0 && targetPlayer && targetPlayer.position) {
+        const targetPosX = targetPlayer.position.x;
+        const targetPosY = targetPlayer.position.y;
+        const dx = targetPosX - playerX;
+        const dy = targetPosY - playerY;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        const travelTimeMs = (distance / projectileSpeed) * 1000 * 0.95;
+        const castAnimDelay = 550;
+        hitDelayMs = castAnimDelay + projectileStartDelay + travelTimeMs;
+      }
+
+      const payload = { targetUserId, casterUserId: userId, spellId: spellId };
+      if (hitDelayMs > 0) {
+        setTimeout(() => this.broadcast('spellHit', payload), hitDelayMs);
+      } else {
+        this.broadcast('spellHit', payload);
       }
     });
     
@@ -2290,12 +2349,12 @@ export class GameRoom extends Room {
   handlePlayerReady(client, message) {
     const userId = client.userId;
     const team = this.userTeams.get(userId);
-    
+
     if (!team) {
       console.warn(`Player ${userId} tried to ready but team not found in userTeams`);
       return;
     }
-    
+
     if (this.state.phase !== GAME_PHASES.PREPARATION) {
       console.log(`Player ${userId} tried to ready but phase is ${this.state.phase}`);
       return;
@@ -2303,21 +2362,21 @@ export class GameRoom extends Room {
 
     const teamState = team === 'A' ? this.state.teamA : this.state.teamB;
     const player = teamState.players.get(userId);
-    
+
     if (!player) {
       console.warn(`Player ${userId} tried to ready but not found in team ${team} players`);
       return;
     }
-    
-    // Toggle ready state based on message
+
+    // Set ready from explicit message value only (no toggle) to avoid race when both players
+    // ready at once: duplicate or out-of-order messages must not flip ready state.
     if (message.ready === false) {
       player.ready = false;
-    } else if (message.ready === true) {
-      player.ready = true;
     } else {
-      player.ready = !player.ready;
+      // true or any other value (e.g. client toggle): set ready
+      player.ready = true;
     }
-    
+
     console.log(`Player ${userId} ready status: ${player.ready}`);
     this.broadcastFilteredState();
 
@@ -2366,6 +2425,10 @@ export class GameRoom extends Room {
     console.log(`Ready check: Team A ${teamAReadyCount}/${teamASize}, Team B ${teamBReadyCount}/${teamBSize}`);
 
     if (allTeamAReady && allTeamBReady) {
+      // Only start if still in preparation (avoid double start when both readies processed close together)
+      if (this.state.phase !== GAME_PHASES.PREPARATION) {
+        return;
+      }
       console.log(`All players ready, starting game for match ${this.state.matchId}`);
       this.startGamePhase();
     }
@@ -2680,19 +2743,30 @@ export class GameRoom extends Room {
       });
     }
     
-    // Check if position is occupied by another entity
+    // Check if position is occupied by another entity; traps at this cell are removed in favor of the new entity
+    const trapIdsAtPosition = [];
     if (!isOccupied) {
       this.state.spawnedEntities.forEach((entity, entityId) => {
         if (entity.position && entity.position.x === x && entity.position.y === y) {
-          isOccupied = true;
+          if (entity.entityType === 'trap') {
+            trapIdsAtPosition.push(entityId);
+          } else {
+            isOccupied = true;
+          }
         }
       });
     }
-    
+
     if (isOccupied) {
       console.warn(`Cannot spawn entity: position (${x}, ${y}) is occupied`);
       return;
     }
+
+    // Remove any traps at this cell so the new entity can be placed (e.g. earth block over hidden trap)
+    trapIdsAtPosition.forEach(entityId => {
+      this.state.spawnedEntities.delete(entityId);
+      console.log(`Removed trap ${entityId} at (${x}, ${y}) in favor of new entity`);
+    });
     
     // For earth_block entities, enforce limit of 2 per user
     // When spawning a third, remove the oldest one
@@ -3001,14 +3075,14 @@ export class GameRoom extends Room {
           const distance = Math.abs(tile.x - entity.position.x) + Math.abs(tile.y - entity.position.y);
           if (distance > triggerRadius) return;
           
-          // Check target filter (ENEMY, ALLY, ANY)
-          const targetFilter = trigger.targetFilter || 'ENEMY';
+          // MOVEMENT traps trigger for any player (any team); other triggers use targetFilter
+          const targetFilter = trigger.targetFilter || 'ANY';
           const isEnemy = playerTeam !== entity.team;
           const isAlly = playerTeam === entity.team;
-          
-          if (targetFilter === 'ENEMY' && !isEnemy) return;
-          if (targetFilter === 'ALLY' && !isAlly) return;
-          // ANY passes through
+          if (targetFilter !== 'ANY') {
+            if (targetFilter === 'ENEMY' && !isEnemy) return;
+            if (targetFilter === 'ALLY' && !isAlly) return;
+          }
           
           // Trigger the trap!
           console.log(`Trap ${entityId} triggered by ${movingPlayer.username} at (${tile.x}, ${tile.y}) [path index ${i}]`);
@@ -3082,14 +3156,14 @@ export class GameRoom extends Room {
         const distance = Math.abs(x - entity.position.x) + Math.abs(y - entity.position.y);
         if (distance > triggerRadius) return;
         
-        // Check target filter (ENEMY, ALLY, ANY)
-        const targetFilter = trigger.targetFilter || 'ENEMY';
+        // MOVEMENT traps trigger for any player (any team); other triggers use targetFilter
+        const targetFilter = trigger.targetFilter || 'ANY';
         const isEnemy = playerTeam !== entity.team;
         const isAlly = playerTeam === entity.team;
-        
-        if (targetFilter === 'ENEMY' && !isEnemy) return;
-        if (targetFilter === 'ALLY' && !isAlly) return;
-        // ANY passes through
+        if (targetFilter !== 'ANY') {
+          if (targetFilter === 'ENEMY' && !isEnemy) return;
+          if (targetFilter === 'ALLY' && !isAlly) return;
+        }
         
         // Trigger the trap!
         console.log(`Trap ${entityId} triggered by ${player.username} arriving at (${x}, ${y}) via teleport/knockback`);
@@ -3110,6 +3184,24 @@ export class GameRoom extends Room {
   }
 
   /**
+   * Outgoing damage multiplier from caster's status effects (e.g. weakness = 80% => 0.8).
+   * Used when applying spell damage; no per-frame or tick updates.
+   * @param {PlayerState} player - Caster/source of damage
+   * @returns {number} Multiplier in [0, 1+] (default 1)
+   */
+  getOutgoingDamageModifier(player) {
+    let multiplier = 1;
+    if (!player.statusEffects) return multiplier;
+    player.statusEffects.forEach((effect, effectId) => {
+      const def = getEffectDef(effectId);
+      if (def && def.outgoingDamagePercent != null) {
+        multiplier *= (def.outgoingDamagePercent / 100);
+      }
+    });
+    return multiplier;
+  }
+
+  /**
    * Apply a status effect to a player
    * @param {PlayerState} targetPlayer - Player to apply effect to
    * @param {Object} statusDef - Status effect definition
@@ -3120,14 +3212,21 @@ export class GameRoom extends Room {
     if (!targetPlayer.statusEffects) {
       targetPlayer.statusEffects = new MapSchema();
     }
-    
+
+    // Safety: cap total effects per entity (no memory bloat)
+    if (targetPlayer.statusEffects.size >= MAX_EFFECTS_PER_ENTITY) {
+      console.log(`Cannot apply ${statusDef.effectId} to ${targetPlayer.username}: max effects (${MAX_EFFECTS_PER_ENTITY}) reached`);
+      return;
+    }
+
     const effectId = statusDef.effectId;
     const existingEffect = targetPlayer.statusEffects.get(effectId);
-    
+    const registryDef = getEffectDef(effectId);
+
     // Check if effect is stackable
     if (existingEffect && statusDef.stackable) {
-      // Stack the effect
-      const maxStacks = statusDef.maxStacks || 999;
+      // Stack the effect (cap at MAX_STACKS)
+      const maxStacks = Math.min(statusDef.maxStacks || 999, MAX_STACKS);
       if (existingEffect.stacks < maxStacks) {
         existingEffect.stacks++;
         // Refresh duration when stacking
@@ -3145,14 +3244,16 @@ export class GameRoom extends Room {
       statusEffect.duration = statusDef.duration;
       statusEffect.stacks = 1;
       
-      // Store effect data as JSON
+      // Store effect data as JSON (include registry flags for validation/damage calc)
       const effectData = {
         onApply: statusDef.onApply || {},
         onTurnStart: statusDef.onTurnStart || {},
         onTurnEnd: statusDef.onTurnEnd || {},
         onRemove: statusDef.onRemove || {},
         type: statusDef.type || 'NEUTRAL',
-        grantsInvisibility: statusDef.grantsInvisibility || false
+        grantsInvisibility: statusDef.grantsInvisibility || false,
+        blocksCasting: registryDef?.blocksCasting ?? false,
+        outgoingDamagePercent: registryDef?.outgoingDamagePercent ?? null
       };
       statusEffect.data = JSON.stringify(effectData);
       
@@ -3184,42 +3285,47 @@ export class GameRoom extends Room {
   }
 
   /**
-   * Process status effects for a player at the start of their turn
+   * Process status effects for a player at the start of their turn only (O(#effects on active character)).
+   * Resolves damage/heal/expire, decrements duration, removes expired; sends one compact effectResolved message.
    * @param {PlayerState} player - Player whose turn is starting
    */
   processTurnStartStatusEffects(player) {
     if (!player.statusEffects || player.statusEffects.size === 0) {
+      this.broadcast('effectResolved', { activeEntityId: player.userId, outcomes: [] });
       return;
     }
-    
+
     const effectsToRemove = [];
-    
+    const outcomes = [];
+
     player.statusEffects.forEach((effect, effectId) => {
+      if (outcomes.length >= MAX_OUTCOMES_PER_TURN) return; // Safety: prevent infinite loops
       try {
         const effectData = JSON.parse(effect.data || '{}');
-        
+
         // Apply onTurnStart effects
         if (effectData.onTurnStart) {
           if (effectData.onTurnStart.damage) {
-            const damage = effectData.onTurnStart.damage * effect.stacks; // Scale by stacks
+            const damage = effectData.onTurnStart.damage * effect.stacks;
             player.health -= damage;
             if (player.health < 0) player.health = 0;
+            outcomes.push({ type: 'damage', effectId, amount: damage, stacks: effect.stacks });
             console.log(`Status effect ${effectId} dealt ${damage} damage to ${player.username} (${effect.stacks} stacks), health now: ${player.health}`);
           }
           if (effectData.onTurnStart.heal) {
-            const heal = effectData.onTurnStart.heal * effect.stacks; // Scale by stacks
+            const heal = effectData.onTurnStart.heal * effect.stacks;
             player.health += heal;
             if (player.health > player.maxHealth) player.health = player.maxHealth;
+            outcomes.push({ type: 'heal', effectId, amount: heal, stacks: effect.stacks });
             console.log(`Status effect ${effectId} healed ${heal} to ${player.username} (${effect.stacks} stacks), health now: ${player.health}`);
           }
         }
-        
+
         // Decrement duration
         effect.duration--;
-        
+
         // Check if effect should be removed
         if (effect.duration <= 0) {
-          // Apply onRemove effects
           if (effectData.onRemove) {
             if (effectData.onRemove.damage) {
               player.health -= effectData.onRemove.damage;
@@ -3230,25 +3336,23 @@ export class GameRoom extends Room {
               if (player.health > player.maxHealth) player.health = player.maxHealth;
             }
           }
-          
-          // Remove invisibility if this effect granted it
           if (effectData.grantsInvisibility && player.invisibilitySource === effect.sourceSpellId) {
             this.removeInvisibility(player);
           }
-          
           effectsToRemove.push(effectId);
+          outcomes.push({ type: 'expire', effectId });
           console.log(`Status effect ${effectId} expired on ${player.username}`);
         }
       } catch (error) {
         console.error(`Error processing status effect ${effectId} for ${player.username}:`, error);
-        effectsToRemove.push(effectId); // Remove corrupted effects
+        effectsToRemove.push(effectId);
       }
     });
-    
-    // Remove expired effects
-    effectsToRemove.forEach(effectId => {
-      player.statusEffects.delete(effectId);
-    });
+
+    effectsToRemove.forEach(effectId => player.statusEffects.delete(effectId));
+
+    // Single compact message for clients (state is broadcast separately)
+    this.broadcast('effectResolved', { activeEntityId: player.userId, outcomes });
   }
 
   /**
