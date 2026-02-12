@@ -77,6 +77,7 @@ class PlayerState extends Schema {
     this.movementPath = ''; // JSON string array of path coordinates [{x, y}, ...]
     this.energy = 0; // Current energy
     this.maxEnergy = 0; // Maximum energy
+    this.spellCastsThisTurn = '{}'; // JSON object spellId -> count (for maxCastsPerTurn)
     this.statusEffects = new MapSchema(); // Map of effectId -> StatusEffectState
     this.isInvisible = false; // Whether player is invisible
     this.invisibilitySource = ''; // Spell or effect that granted invisibility
@@ -103,6 +104,7 @@ defineTypes(PlayerState, {
   movementPath: 'string', // JSON string array of path coordinates
   energy: 'number',
   maxEnergy: 'number',
+  spellCastsThisTurn: 'string',
   statusEffects: { map: StatusEffectState },
   isInvisible: 'boolean',
   invisibilitySource: 'string',
@@ -542,6 +544,17 @@ function getPatternCells(centerX, centerY, pattern, radius = 1, casterX = null, 
         cells.push({ x: centerX, y: centerY });
       }
       break;
+
+    case 'LINE4':
+      // 4 tiles in each cardinal direction (N/S/E/W), no diagonals. Center + 4 lines of 4.
+      cells.push({ x: centerX, y: centerY });
+      for (let step = 1; step <= 4; step++) {
+        cells.push({ x: centerX, y: centerY + step });
+        cells.push({ x: centerX, y: centerY - step });
+        cells.push({ x: centerX + step, y: centerY });
+        cells.push({ x: centerX - step, y: centerY });
+      }
+      break;
       
     default:
       cells.push({ x: centerX, y: centerY });
@@ -635,6 +648,34 @@ function getTerrainType(gameRoom, x, y) {
   }
   
   return TILE_TYPES.NONE;
+}
+
+/**
+ * Check if a tile is blocked for pull/knockback (cannot move a unit here).
+ * Blocked = not walkable terrain, or any player at (x,y), or any entity at (x,y).
+ * @param {GameRoom} gameRoom
+ * @param {number} x
+ * @param {number} y
+ * @returns {boolean} True if tile is blocked
+ */
+function isTileBlockedForPull(gameRoom, x, y) {
+  const terrainType = getTerrainType(gameRoom, x, y);
+  if (!isTileWalkable(terrainType)) return true;
+  let hasPlayer = false;
+  gameRoom.state.teamA.players.forEach((p) => {
+    if (p.position && p.position.x === x && p.position.y === y) hasPlayer = true;
+  });
+  if (!hasPlayer) {
+    gameRoom.state.teamB.players.forEach((p) => {
+      if (p.position && p.position.x === x && p.position.y === y) hasPlayer = true;
+    });
+  }
+  if (hasPlayer) return true;
+  let hasEntity = false;
+  gameRoom.state.spawnedEntities.forEach((entity) => {
+    if (entity.position && entity.position.x === x && entity.position.y === y) hasEntity = true;
+  });
+  return hasEntity;
 }
 
 export class GameRoom extends Room {
@@ -742,6 +783,10 @@ export class GameRoom extends Room {
 
     this.onMessage('updateOrientation', (client, message) => {
       this.handleOrientationUpdate(client, message);
+    });
+
+    this.onMessage('movementComplete', (client, message) => {
+      this.handleMovementComplete(client, message);
     });
   }
 
@@ -1125,6 +1170,7 @@ export class GameRoom extends Room {
         player.health = 20;
         player.maxHealth = 20;
       }
+      player.spellCastsThisTurn = '{}';
     });
 
     // Set energy and health for Team B
@@ -1141,6 +1187,7 @@ export class GameRoom extends Room {
         player.health = 20;
         player.maxHealth = 20;
       }
+      player.spellCastsThisTurn = '{}';
     });
   }
 
@@ -1516,6 +1563,8 @@ export class GameRoom extends Room {
         movementPath: player.movementPath ? JSON.parse(player.movementPath) : null, // Parse JSON string to array
         energy: player.energy || 0,
         maxEnergy: player.maxEnergy || 0,
+        // Per-turn spell cast counts (JSON string spellId -> count) so client can disable spells at max casts
+        spellCastsThisTurn: player.spellCastsThisTurn || '{}',
         statusEffects: player.statusEffects ? (() => {
           // Convert MapSchema to object for client
           const effects = {};
@@ -1697,7 +1746,46 @@ export class GameRoom extends Room {
     player.position.x = finalX;
     player.position.y = finalY;
     player.usedMovementPoints += actualPathCost;
-    
+
+    // Store pending onMove effects (e.g. slash_wound) - trigger when client sends movementComplete after animation finishes
+    if (actualPathCost >= 1 && player.statusEffects && player.statusEffects.size > 0) {
+      const pendingOnMove = [];
+      player.statusEffects.forEach((effect, effectId) => {
+        const def = getEffectDef(effectId);
+        if (!def || !def.onMove) return;
+        const onMove = def.onMove;
+        let damage = 0;
+        let removeOnTrigger = true;
+        if (onMove.damagePerMovementPoint) {
+          damage = onMove.damagePerMovementPoint * actualPathCost * (effect.stacks || 1);
+          removeOnTrigger = onMove.removeOnTrigger !== false;
+        } else if (onMove.damage) {
+          damage = onMove.damage * (effect.stacks || 1);
+        }
+        if (damage > 0) {
+          pendingOnMove.push({
+            effectId,
+            damage,
+            removeOnTrigger,
+            sourceUserId: effect.sourceUserId,
+            sourceSpellId: effect.sourceSpellId || 'slash'
+          });
+        }
+      });
+      if (pendingOnMove.length > 0) {
+        if (!this.pendingOnMoveEffects) this.pendingOnMoveEffects = new Map();
+        this.pendingOnMoveEffects.set(userId, pendingOnMove);
+        // Broadcast hit info so clients can show it when movement animation completes (no round-trip delay)
+        const totalDamage = pendingOnMove.reduce((s, p) => s + p.damage, 0);
+        this.broadcast('pendingMovementHit', {
+          targetUserId: userId,
+          damage: totalDamage,
+          casterUserId: pendingOnMove[0]?.sourceUserId || userId,
+          spellId: pendingOnMove[0]?.sourceSpellId || 'slash'
+        });
+      }
+    }
+
     // Remove triggered traps
     trapResult.entitiesToRemove.forEach(entityId => {
       console.log(`Removing triggered trap: ${entityId}`);
@@ -1872,7 +1960,8 @@ export class GameRoom extends Room {
       loadout: loadout,
       energyLeft: player.energy,
       position: { x: player.position.x, y: player.position.y },
-      statusEffects: statusEffectsForValidation
+      statusEffects: statusEffectsForValidation,
+      spellCastsThisTurn: player.spellCastsThisTurn || '{}'
     });
     
     if (!validation.valid) {
@@ -2000,6 +2089,13 @@ export class GameRoom extends Room {
     if (player.energy < 0) {
       player.energy = 0;
     }
+
+    // Track per-turn cast count for spells with maxCastsPerTurn
+    if (spell.maxCastsPerTurn != null) {
+      const counts = JSON.parse(player.spellCastsThisTurn || '{}');
+      counts[spellId] = (counts[spellId] || 0) + 1;
+      player.spellCastsThisTurn = JSON.stringify(counts);
+    }
     
     // Update caster orientation to face first target (so server state matches client rotation on attack)
     const firstTarget = targetsToProcess[0];
@@ -2009,6 +2105,8 @@ export class GameRoom extends Room {
     
     // Track targets that take damage for hit animations (one spellHit per unique target)
     const damagedTargets = new Set();
+    /** User IDs of players pulled by taunt (client skips walk animation for them) */
+    let tauntPulledUserIds = [];
     
     // Get pattern for area effects
     const pattern = targeting.pattern || 'SINGLE';
@@ -2018,8 +2116,22 @@ export class GameRoom extends Room {
       // Get all affected units based on pattern for this target
       let affectedUnits = [];
       if (targeting.targetType === 'SELF') {
-        // Self-targeting: only affect caster
-        affectedUnits = [player];
+        // Self-targeting with AoE (CIRCLE1, etc.): affect units in pattern around caster (e.g. Slam hits enemies only)
+        const patternForSelf = targeting.pattern || 'SINGLE';
+        if (patternForSelf === 'CIRCLE1' || patternForSelf === 'CIRCLE2' || patternForSelf === 'LINE4') {
+          affectedUnits = getUnitsInPattern(
+            this,
+            target.x,
+            target.y,
+            patternForSelf,
+            'ENEMY', // Slam and similar: damage/heal allies or enemies per spell - Slam hits enemies
+            team,
+            playerX,
+            playerY
+          );
+        } else {
+          affectedUnits = [player];
+        }
       } else if (targeting.targetType === 'UNIT') {
         // Unit targeting: find unit at target position
         let targetPlayer = null;
@@ -2071,6 +2183,38 @@ export class GameRoom extends Room {
           playerX,
           playerY
         );
+      }
+
+      // Taunt: pull affected enemies toward caster up to pullTiles (2), stop at structure/trap/entity or caster
+      if (spellId === 'taunt' && spell.pullTiles && targeting.targetType === 'SELF' && affectedUnits.length > 0) {
+        const casterX = playerX;
+        const casterY = playerY;
+        const maxPull = Math.max(0, spell.pullTiles);
+        const byDistance = [...affectedUnits].sort((a, b) => {
+          const da = Math.abs(a.position.x - casterX) + Math.abs(a.position.y - casterY);
+          const db = Math.abs(b.position.x - casterX) + Math.abs(b.position.y - casterY);
+          return db - da;
+        });
+        byDistance.forEach((targetPlayer) => {
+          let vx = targetPlayer.position.x;
+          let vy = targetPlayer.position.y;
+          const stepX = casterX > vx ? 1 : casterX < vx ? -1 : 0;
+          const stepY = casterY > vy ? 1 : casterY < vy ? -1 : 0;
+          for (let s = 0; s < maxPull; s++) {
+            const nextX = vx + stepX;
+            const nextY = vy + stepY;
+            if (nextX === casterX && nextY === casterY) break;
+            if (isTileBlockedForPull(this, nextX, nextY)) break;
+            vx = nextX;
+            vy = nextY;
+          }
+          if (vx !== targetPlayer.position.x || vy !== targetPlayer.position.y) {
+            targetPlayer.position.x = vx;
+            targetPlayer.position.y = vy;
+            tauntPulledUserIds.push(targetPlayer.userId);
+            console.log(`Taunt pulled ${targetPlayer.username} to (${vx}, ${vy})`);
+          }
+        });
       }
       
       // Special handling for teleportation spell - move caster to target cell
@@ -2218,6 +2362,9 @@ export class GameRoom extends Room {
     } else {
       broadcastMessage.targetX = targetX;
       broadcastMessage.targetY = targetY;
+    }
+    if (spellId === 'taunt' && tauntPulledUserIds.length > 0) {
+      broadcastMessage.pulledUserIds = tauntPulledUserIds;
     }
     
     this.broadcast('spellCast', broadcastMessage);
@@ -3321,8 +3468,11 @@ export class GameRoom extends Room {
           }
         }
 
-        // Decrement duration
-        effect.duration--;
+        // Decrement duration (skip for expireAtTurnEnd - those decrement at turn end)
+        const registryDef = getEffectDef(effectId);
+        if (!registryDef || !registryDef.expireAtTurnEnd) {
+          effect.duration--;
+        }
 
         // Check if effect should be removed
         if (effect.duration <= 0) {
@@ -3356,6 +3506,27 @@ export class GameRoom extends Room {
   }
 
   /**
+   * Process status effects with expireAtTurnEnd when the player ends their turn.
+   * Decrements duration and removes expired effects so they stay visible during the turn.
+   */
+  processTurnEndStatusEffects(player) {
+    if (!player.statusEffects || player.statusEffects.size === 0) return;
+
+    const effectsToRemove = [];
+    player.statusEffects.forEach((effect, effectId) => {
+      const def = getEffectDef(effectId);
+      if (!def || !def.expireAtTurnEnd) return;
+
+      effect.duration--;
+      if (effect.duration <= 0) {
+        effectsToRemove.push(effectId);
+        console.log(`Status effect ${effectId} expired on ${player.username} (turn end)`);
+      }
+    });
+    effectsToRemove.forEach(effectId => player.statusEffects.delete(effectId));
+  }
+
+  /**
    * Handle end turn
    */
   handleEndTurn(client, message) {
@@ -3377,6 +3548,12 @@ export class GameRoom extends Room {
       userId: userId
     });
     console.log(`Cancelled spell preparation for ${userId} (ending turn)`);
+
+    // Process turn-end status effects (decrement/expire effects with expireAtTurnEnd - e.g. dizzy)
+    const currentPlayerForEffects = this.getPlayerById(userId);
+    if (currentPlayerForEffects) {
+      this.processTurnEndStatusEffects(currentPlayerForEffects);
+    }
 
     // Advance turn logic
     this.state.turn++;
@@ -3409,9 +3586,23 @@ export class GameRoom extends Room {
     const nextPlayer = this.getPlayerById(nextPlayerId);
     if (nextPlayer) {
       nextPlayer.usedMovementPoints = 0;
-      nextPlayer.energy = nextPlayer.maxEnergy; // Restore energy to max at start of turn
-      // Ensure movement points are at max at start of turn (in case they were reduced)
-      if (nextPlayer.movementPoints < nextPlayer.maxMovementPoints) {
+      nextPlayer.spellCastsThisTurn = '{}';
+      // Apply apModifier/mpModifier from status effects (e.g. dizzy: -1 AP, -1 MP)
+      let energyModifier = 0;
+      let mpModifier = 0;
+      if (nextPlayer.statusEffects) {
+        nextPlayer.statusEffects.forEach((effect, effectId) => {
+          const def = getEffectDef(effectId);
+          if (def) {
+            if (def.apModifier != null) energyModifier += (def.apModifier * (effect.stacks || 1));
+            if (def.mpModifier != null) mpModifier += (def.mpModifier * (effect.stacks || 1));
+          }
+        });
+      }
+      nextPlayer.energy = Math.max(0, nextPlayer.maxEnergy + energyModifier); // apModifier affects energy (AP)
+      nextPlayer.movementPoints = Math.max(0, (nextPlayer.maxMovementPoints + mpModifier)); // mpModifier affects movement (MP)
+      // Cap movement points if they exceeded max from spells
+      if (nextPlayer.movementPoints > nextPlayer.maxMovementPoints) {
         nextPlayer.movementPoints = nextPlayer.maxMovementPoints;
       }
       
@@ -3471,6 +3662,36 @@ export class GameRoom extends Room {
     player.orientation = normalizedOrientation;
     
     // Broadcast state update so other clients see the orientation change
+    this.broadcastFilteredState();
+  }
+
+  /**
+   * Handle movement complete - client signals when movement animation has finished.
+   * Triggers pending onMove effects (e.g. slash_wound) and broadcasts spellHit.
+   */
+  handleMovementComplete(client, message) {
+    const userId = client.userId;
+    if (!this.pendingOnMoveEffects || !this.pendingOnMoveEffects.has(userId)) {
+      return;
+    }
+    const pendingOnMove = this.pendingOnMoveEffects.get(userId);
+    this.pendingOnMoveEffects.delete(userId);
+
+    const player = this.getPlayerById(userId);
+    if (!player || !player.statusEffects) return;
+
+    pendingOnMove.forEach(({ effectId, damage, removeOnTrigger, sourceUserId, sourceSpellId }) => {
+      if (!player.statusEffects.has(effectId)) return;
+      player.health -= damage;
+      if (player.health < 0) player.health = 0;
+      if (removeOnTrigger) {
+        player.statusEffects.delete(effectId);
+        console.log(`OnMove effect ${effectId}: ${player.username} moved, took ${damage} damage, effect removed. Health now: ${player.health}`);
+      } else {
+        console.log(`OnMove effect ${effectId}: ${player.username} moved, took ${damage} damage (effect persists until turn end). Health now: ${player.health}`);
+      }
+      // No spellHit broadcast - clients show hit from pendingMovementHit when movement animation completes
+    });
     this.broadcastFilteredState();
   }
 

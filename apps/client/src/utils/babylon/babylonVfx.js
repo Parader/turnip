@@ -11,6 +11,7 @@ import { createTrapInstance } from '../babylonScene';
 
 // Import audio system for impact sounds
 import { playSpellSound } from '../../audio';
+import { getBoneWorldPosition } from './babylonAnimations';
 
 // ============================================================================
 // SHARED TEXTURE & MATERIAL CACHE
@@ -1413,6 +1414,96 @@ export function createPoisonStatusParticles(emitterMesh, scene, name = 'poison_s
 }
 
 /**
+ * Create slash impact VFX - red blood spray at impact point (simulates blood from sword).
+ * Particles burst outward in slash direction and fall down.
+ * @param {Vector3} position - Impact position (target)
+ * @param {Scene} scene - Babylon.js scene
+ * @param {Vector3} [slashDirection] - Direction of slash (from caster to target), normalized
+ */
+export function createSlashBloodImpact(position, scene, slashDirection = null) {
+  if (!scene || scene.isDisposed) return null;
+  const emitterMesh = MeshBuilder.CreateSphere('slash_blood_emitter', { diameter: 0.12 }, scene);
+  const impactPos = position.clone();
+  impactPos.y += 0.5; // At body height for visible impact
+  emitterMesh.position = impactPos;
+  emitterMesh.isVisible = false;
+
+  const particleSystem = new ParticleSystem('slash_blood_particles', 200, scene);
+  particleSystem.particleTexture = createParticleTexture(scene);
+  particleSystem.emitter = emitterMesh;
+  particleSystem.minEmitBox = new Vector3(-0.08, -0.08, -0.08);
+  particleSystem.maxEmitBox = new Vector3(0.08, 0.08, 0.08);
+
+  particleSystem.color1 = new Color4(0.95, 0.2, 0.2, 0.95);
+  particleSystem.color2 = new Color4(0.8, 0.1, 0.1, 0.85);
+  particleSystem.colorDead = new Color4(0.5, 0.05, 0.05, 0);
+  particleSystem.minSize = 0.1;
+  particleSystem.maxSize = 0.2;
+  particleSystem.minLifeTime = 0.4;
+  particleSystem.maxLifeTime = 0.9;
+  particleSystem.emitRate = 220;
+  particleSystem.minEmitPower = 0.5;
+  particleSystem.maxEmitPower = 1.0;
+  particleSystem.updateSpeed = 0.02;
+  particleSystem.gravity = new Vector3(0, -0.35, 0);
+
+  if (slashDirection && (slashDirection.x !== 0 || slashDirection.z !== 0)) {
+    const dx = slashDirection.x;
+    const dz = slashDirection.z;
+    particleSystem.direction1 = new Vector3(dx - 0.5, -0.2, dz - 0.5);
+    particleSystem.direction2 = new Vector3(dx + 0.5, 0.4, dz + 0.5);
+  } else {
+    particleSystem.direction1 = new Vector3(-0.7, -0.2, -0.7);
+    particleSystem.direction2 = new Vector3(0.7, 0.4, 0.7);
+  }
+  particleSystem.blendMode = ParticleSystem.BLENDMODE_STANDARD;
+  particleSystem.targetStopDuration = 0.28;
+  particleSystem.start();
+
+  const cleanupTime = 2000;
+  setTimeout(() => {
+    particleSystem.dispose();
+    emitterMesh.dispose();
+  }, cleanupTime);
+  return particleSystem;
+}
+
+/**
+ * Create slash wound bleed status particles - red droplets/drips going downward from character.
+ * Similar to poison but red and gravity-driven downward.
+ * @param {TransformNode|Mesh} emitterMesh - Character mesh to emit from
+ * @param {Scene} scene - Babylon.js scene
+ * @param {string} name - Unique name for the particle system
+ * @returns {ParticleSystem} Particle system (call .start() / .stop(), do not dispose until effect removed)
+ */
+export function createSlashWoundStatusParticles(emitterMesh, scene, name = 'slash_wound_status') {
+  const particleSystem = new ParticleSystem(`${name}_particles`, 60, scene);
+  particleSystem.particleTexture = createParticleTexture(scene);
+  particleSystem.emitter = emitterMesh;
+  // Emit from torso/shoulders - bleed drips down
+  particleSystem.minEmitBox = new Vector3(-0.3, 0.4, -0.3);
+  particleSystem.maxEmitBox = new Vector3(0.3, 1.0, 0.3);
+  // Red bleed colors, semi-transparent
+  particleSystem.color1 = new Color4(0.9, 0.15, 0.15, 0.6);
+  particleSystem.color2 = new Color4(0.7, 0.1, 0.1, 0.4);
+  particleSystem.colorDead = new Color4(0.4, 0.05, 0.05, 0);
+  particleSystem.minSize = 0.04;
+  particleSystem.maxSize = 0.1;
+  particleSystem.minLifeTime = 0.5;
+  particleSystem.maxLifeTime = 1.0;
+  particleSystem.emitRate = 12;
+  particleSystem.updateSpeed = 0.02;
+  // Direction downward with slight outward spread
+  particleSystem.direction1 = new Vector3(-0.3, -0.9, -0.3);
+  particleSystem.direction2 = new Vector3(0.3, -0.5, 0.3);
+  particleSystem.minEmitPower = 0.05;
+  particleSystem.maxEmitPower = 0.15;
+  particleSystem.gravity = new Vector3(0, -0.15, 0); // Pull downward
+  particleSystem.blendMode = ParticleSystem.BLENDMODE_STANDARD;
+  return particleSystem;
+}
+
+/**
  * Create expanding green sphere on the ground
  * @param {Vector3} position - Position on ground
  * @param {Scene} scene - Babylon.js scene
@@ -2482,13 +2573,437 @@ export function playSpellVfx(scene, spellDef, startPos, endPos, castStartTime, m
     playHealVfx(scene, spellDef, startPos, endPos, castStartTime);
   } else if (spellDef.spellId === 'arcane_missile') {
     playArcaneMissileVfx(scene, spellDef, startPos, endPos, castStartTime, missileIndex, totalMissiles, options);
+  } else if (spellDef.spellId === 'slash') {
+    playSlashVfx(scene, spellDef, startPos, endPos, castStartTime, options);
+  } else if (spellDef.spellId === 'slam') {
+    playSlamVfx(scene, spellDef, startPos, endPos, castStartTime);
+  } else if (spellDef.spellId === 'taunt') {
+    playTauntVfx(scene, spellDef, startPos, endPos, castStartTime);
+  } else if (spellDef.spellId === 'aid') {
+    playAidVfx(scene, spellDef, startPos, endPos, castStartTime, options);
   } else if (spellDef.spellId === 'teleport') {
     // Teleport VFX is handled separately via TeleportVFXController
-    // This is just a placeholder - actual teleport is triggered via startTeleportVFX
     console.warn(`Teleport VFX should be handled via TeleportVFXController, not playSpellVfx`);
   } else {
     console.warn(`VFX not implemented for spell: ${spellDef.spellId}`);
   }
+}
+
+/**
+ * Play slash (melee) VFX - blood impact at ~700ms when sword connects
+ */
+function playSlashVfx(scene, spellDef, startPos, endPos, castStartTime, options = {}) {
+  const SLASH_BLOOD_DELAY_MS = 700;
+  const now = Date.now();
+  const delay = Math.max(0, castStartTime + SLASH_BLOOD_DELAY_MS - now);
+
+  const slashDirection = new Vector3(endPos.x - startPos.x, 0, endPos.z - startPos.z);
+  const len = Math.sqrt(slashDirection.x * slashDirection.x + slashDirection.z * slashDirection.z);
+  if (len > 0.001) {
+    slashDirection.x /= len;
+    slashDirection.z /= len;
+  } else {
+    slashDirection.set(1, 0, 0);
+  }
+
+  setTimeout(() => {
+    createSlashBloodImpact(endPos, scene, slashDirection);
+    if (options?.targetUserId && typeof options?.onImpact === 'function') {
+      options.onImpact(options.targetUserId);
+    }
+  }, delay);
+}
+
+/**
+ * Create slam ground effect - dust burst + expanding shockwave ring at ground level.
+ * Used when warrior slams the ground (CIRCLE1 AoE).
+ * @param {Vector3} position - Center position (caster position)
+ * @param {Scene} scene - Babylon.js scene
+ */
+function createSlamGroundEffect(position, scene) {
+  if (!scene || scene.isDisposed) return;
+  const groundPos = new Vector3(position.x, 0.08, position.z);
+
+  // 1. Light brown dust particles - spread outward in circular pattern (horizontal XZ plane)
+  const emitterMesh = MeshBuilder.CreateSphere('slam_dust_emitter', { diameter: 0.25 }, scene);
+  emitterMesh.position = groundPos.clone();
+  emitterMesh.isVisible = false;
+
+  const dustParticles = new ParticleSystem('slam_dust_particles', 450, scene);
+  dustParticles.particleTexture = createParticleTexture(scene);
+  dustParticles.emitter = emitterMesh;
+  dustParticles.minEmitBox = new Vector3(-0.22, -0.03, -0.22);
+  dustParticles.maxEmitBox = new Vector3(0.22, 0.02, 0.22);
+
+  // Light brown / dust colors - tan, beige, sand
+  dustParticles.color1 = new Color4(0.82, 0.72, 0.58, 0.92);
+  dustParticles.color2 = new Color4(0.7, 0.6, 0.48, 0.85);
+  dustParticles.colorDead = new Color4(0.55, 0.47, 0.38, 0);
+  dustParticles.minSize = 0.18;
+  dustParticles.maxSize = 0.38;
+  dustParticles.minLifeTime = 0.5;
+  dustParticles.maxLifeTime = 1.0;
+  dustParticles.emitRate = 550;
+  // Radial spread in circle - direction covers full 360° in horizontal plane
+  dustParticles.direction1 = new Vector3(-1, 0.02, -1);
+  dustParticles.direction2 = new Vector3(1, 0.08, 1);
+  dustParticles.minEmitPower = 1.0;
+  dustParticles.maxEmitPower = 2.0;
+  dustParticles.updateSpeed = 0.02;
+  dustParticles.gravity = new Vector3(0, -0.12, 0);
+  dustParticles.blendMode = ParticleSystem.BLENDMODE_STANDARD;
+  dustParticles.targetStopDuration = 0.25;
+  dustParticles.start();
+
+  setTimeout(() => {
+    dustParticles.dispose();
+    emitterMesh.dispose();
+  }, 2000);
+
+  // 2. Expanding shockwave ring on ground (flat disc in XZ plane)
+  const ringRadius = 0.25;
+  const ring = MeshBuilder.CreateDisc('slam_ring', { radius: ringRadius, tessellation: 32 }, scene);
+  ring.position = groundPos.clone();
+  ring.rotation.x = Math.PI / 2; // Lay flat on ground (XZ plane)
+
+  const ringMaterial = new StandardMaterial('slam_ring_material', scene);
+  ringMaterial.emissiveColor = new Color3(0.58, 0.5, 0.42);
+  ringMaterial.alpha = 0.78;
+  ringMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
+  ringMaterial.backFaceCulling = false;
+  ringMaterial.disableDepthWrite = true;
+  ring.material = ringMaterial;
+  ring.isPickable = false;
+
+  const ringStartTime = Date.now();
+  const ringDuration = 420;
+  const maxRadius = 1.85;
+  const ringObserver = scene.onBeforeRenderObservable.add(() => {
+    const elapsed = Date.now() - ringStartTime;
+    const progress = Math.min(elapsed / ringDuration, 1.0);
+    const currentRadius = ringRadius + (maxRadius - ringRadius) * progress;
+    const scale = currentRadius / ringRadius;
+    ring.scaling = new Vector3(scale, scale, 1);
+    ringMaterial.alpha = 0.75 * (1 - progress);
+    if (progress >= 1.0) {
+      scene.onBeforeRenderObservable.remove(ringObserver);
+      if (ringMaterial && !ringMaterial.isDisposed) ringMaterial.dispose();
+      ring.dispose();
+    }
+  });
+}
+
+/**
+ * Play slam (ground AoE) VFX - ground slam effect at 1.6s when attack connects.
+ */
+function playSlamVfx(scene, spellDef, startPos, endPos, castStartTime) {
+  const SLAM_IMPACT_DELAY_MS = 1600;
+  const now = Date.now();
+  const delay = Math.max(0, castStartTime + SLAM_IMPACT_DELAY_MS - now);
+  const slamPos = endPos.clone(); // Self-target: endPos = caster position
+  setTimeout(() => {
+    createSlamGroundEffect(slamPos, scene);
+  }, delay);
+}
+
+/**
+ * Create taunt shouting effect - short red shockwave pulse from warrior's feet with air distortion ripple outward.
+ */
+function createTauntShockwaveEffect(position, scene) {
+  if (!scene || scene.isDisposed) return;
+  const groundPos = new Vector3(position.x, 0.08, position.z);
+
+  // 1. Air distortion ripple - subtle, slightly above ground
+  const ringRadius = 0.25;
+  const rippleY = 0.18;
+  const ripplePos = new Vector3(groundPos.x, rippleY, groundPos.z);
+  const ripple = MeshBuilder.CreateDisc('taunt_ripple', { radius: ringRadius, tessellation: 32 }, scene);
+  ripple.position = ripplePos;
+  ripple.rotation.x = Math.PI / 2;
+
+  const rippleMaterial = new StandardMaterial('taunt_ripple_material', scene);
+  rippleMaterial.emissiveColor = new Color3(0.9, 0.35, 0.3);
+  rippleMaterial.alpha = 0.25;
+  rippleMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
+  rippleMaterial.backFaceCulling = false;
+  rippleMaterial.disableDepthWrite = true;
+  ripple.material = rippleMaterial;
+  ripple.isPickable = false;
+
+  const rippleStartTime = Date.now();
+  const rippleDuration = 380;
+  // Slightly smaller final size so the red ring clearly overtakes it
+  const rippleMaxRadius = 1.1;
+  const rippleObserver = scene.onBeforeRenderObservable.add(() => {
+    const elapsed = Date.now() - rippleStartTime;
+    const progress = Math.min(elapsed / rippleDuration, 1.0);
+    const currentRadius = ringRadius + (rippleMaxRadius - ringRadius) * progress;
+    const scale = currentRadius / ringRadius;
+    ripple.scaling = new Vector3(scale, scale, 1);
+    rippleMaterial.alpha = 0.45 * (1 - progress);
+    if (progress >= 1.0) {
+      scene.onBeforeRenderObservable.remove(rippleObserver);
+      if (rippleMaterial && !rippleMaterial.isDisposed) rippleMaterial.dispose();
+      ripple.dispose();
+    }
+  });
+
+  // 2. Red shockwave ring - draw last and slightly higher so it visually sits on top
+  const ring = MeshBuilder.CreateDisc('taunt_ring', { radius: ringRadius, tessellation: 32 }, scene);
+  ring.position = groundPos.clone();
+  ring.rotation.x = Math.PI / 2;
+
+  const ringMaterial = new StandardMaterial('taunt_ring_material', scene);
+  // Make the ring very bright and obviously red
+  ringMaterial.diffuseColor = new Color3(1.0, 0.0, 0.0);
+  ringMaterial.emissiveColor = new Color3(1.0, 0.2, 0.15);
+  ringMaterial.alpha = 1.0;
+  ringMaterial.disableLighting = true; // Ignore scene lights so color is not washed out
+  ringMaterial.transparencyMode = Material.MATERIAL_ALPHABLEND;
+  ringMaterial.backFaceCulling = false;
+  ringMaterial.disableDepthWrite = true;
+  ring.material = ringMaterial;
+  ring.isPickable = false;
+
+  const ringStartTime = Date.now();
+  const ringDuration = 360;
+  // Make red ring grow noticeably larger than the grey ripple
+  const maxRadius = 1.6;
+  const ringObserver = scene.onBeforeRenderObservable.add(() => {
+    const elapsed = Date.now() - ringStartTime;
+    const progress = Math.min(elapsed / ringDuration, 1.0);
+    const currentRadius = ringRadius + (maxRadius - ringRadius) * progress;
+    const scale = currentRadius / ringRadius;
+    ring.scaling = new Vector3(scale, scale, 1);
+    ringMaterial.alpha = 0.9 * (1 - progress);
+    if (progress >= 1.0) {
+      scene.onBeforeRenderObservable.remove(ringObserver);
+      if (ringMaterial && !ringMaterial.isDisposed) ringMaterial.dispose();
+      ring.dispose();
+    }
+  });
+}
+
+/**
+ * Play taunt (shout) VFX - red shockwave pulse from caster's feet at impact time.
+ */
+function playTauntVfx(scene, spellDef, startPos, endPos, castStartTime) {
+  const TAUNT_IMPACT_DELAY_MS = 320;
+  const now = Date.now();
+  const delay = Math.max(0, castStartTime + TAUNT_IMPACT_DELAY_MS - now);
+  const tauntPos = endPos.clone();
+  setTimeout(() => {
+    createTauntShockwaveEffect(tauntPos, scene);
+  }, delay);
+}
+
+/**
+ * Create holy crest texture - radiant insignia in gold and soft white.
+ */
+function createHolyCrestTexture(scene) {
+  const size = 128;
+  const texture = new DynamicTexture('aid_crest_texture', size, scene, false);
+  const ctx = texture.getContext();
+  const c = size / 2;
+
+  ctx.clearRect(0, 0, size, size);
+  const grd = ctx.createRadialGradient(c, c, 0, c, c, c);
+  grd.addColorStop(0, 'rgba(255, 250, 235, 0.95)');
+  grd.addColorStop(0.4, 'rgba(255, 215, 120, 0.7)');
+  grd.addColorStop(0.7, 'rgba(218, 165, 32, 0.4)');
+  grd.addColorStop(1, 'rgba(255, 250, 235, 0)');
+  ctx.fillStyle = grd;
+  ctx.beginPath();
+  ctx.arc(c, c, c - 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255, 248, 220, 0.9)';
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  const r = c * 0.45;
+  for (let i = 0; i < 8; i++) {
+    const a = (i * Math.PI / 4);
+    ctx.beginPath();
+    ctx.moveTo(c, c);
+    ctx.lineTo(c + Math.cos(a) * r, c + Math.sin(a) * r);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(255, 215, 100, 0.8)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(c, c, r * 0.35, 0, Math.PI * 2);
+  ctx.stroke();
+  texture.update();
+  return texture;
+}
+
+/**
+ * Create aid radiant effect - holy insignia crest, shimmer particles, downward drift (centered on hand), chest glow.
+ * @param {Vector3} handPos - Hand position
+ * @param {Vector3} chestPos - Character center / chest position
+ * @param {Scene} scene - Babylon.js scene
+ */
+function createAidRadiantEffect(handPos, chestPos, scene) {
+  if (!scene || scene.isDisposed) return;
+  const pos = handPos.clone();
+
+  // 1. Expanding holy aura ring - explodes outward from center
+  const ringRadius = 0.15;
+  const crest = MeshBuilder.CreateTorus('aid_crest', { diameter: ringRadius * 2, thickness: 0.02, tessellation: 32 }, scene);
+  crest.position = pos.clone();
+  crest.rotation.x = Math.PI / 2; // Lie flat (XZ plane)
+  const crestMat = new StandardMaterial('aid_crest_mat', scene);
+  crestMat.emissiveColor = new Color3(0.98, 0.93, 0.78);
+  crestMat.alpha = 0.88;
+  crestMat.transparencyMode = Material.MATERIAL_ALPHABLEND;
+  crestMat.backFaceCulling = false;
+  crestMat.disableDepthWrite = true;
+  crest.material = crestMat;
+  crest.isPickable = false;
+
+  const crestStart = Date.now();
+  const crestDur = 1100;
+  const expandDur = 0.7; // 70% of duration: burst from point to full size
+  const maxScale = 2.5; // Ring expands to 2.5x base size
+  crest.scaling = new Vector3(0.01, 0.01, 0.01);
+  const crestObs = scene.onBeforeRenderObservable.add(() => {
+    const t = (Date.now() - crestStart) / crestDur;
+    if (t >= 1) {
+      scene.onBeforeRenderObservable.remove(crestObs);
+      crestMat.dispose();
+      crest.dispose();
+      return;
+    }
+    const growT = Math.min(t / expandDur, 1);
+    const scale = 0.01 + (maxScale - 0.01) * (1 - Math.pow(1 - growT, 2)); // Ease-out: burst then settle
+    crest.scaling.set(scale, scale, scale);
+    crest.position.y = pos.y + Math.sin(t * Math.PI * 2) * 0.05;
+    crestMat.alpha = 0.88 * (1 - t);
+  });
+
+  // 2. Shimmer particles - dust in sunlight, gold and white
+  const shimmerEmitter = MeshBuilder.CreateSphere('aid_shimmer_emitter', { diameter: 0.5 }, scene);
+  shimmerEmitter.position = pos.clone();
+  shimmerEmitter.isVisible = false;
+
+  const shimmer = new ParticleSystem('aid_shimmer', 150, scene);
+  shimmer.particleTexture = createStarTexture(scene);
+  shimmer.emitter = shimmerEmitter;
+  shimmer.minEmitBox = new Vector3(-0.15, -0.08, -0.15);
+  shimmer.maxEmitBox = new Vector3(0.15, 0.1, 0.15);
+  shimmer.color1 = new Color4(1, 0.98, 0.85, 0.9);
+  shimmer.color2 = new Color4(1, 0.92, 0.7, 0.6);
+  shimmer.colorDead = new Color4(0.95, 0.85, 0.5, 0);
+  shimmer.minSize = 0.04;
+  shimmer.maxSize = 0.1;
+  shimmer.minLifeTime = 0.3;
+  shimmer.maxLifeTime = 0.65;
+  shimmer.emitRate = 80;
+  shimmer.direction1 = new Vector3(-0.3, -0.7, -0.3);
+  shimmer.direction2 = new Vector3(0.3, -0.3, 0.3);
+  shimmer.minEmitPower = 0.08;
+  shimmer.maxEmitPower = 0.22;
+  shimmer.updateSpeed = 0.02;
+  shimmer.gravity = new Vector3(0, -0.18, 0);
+  shimmer.blendMode = ParticleSystem.BLENDMODE_ONEONE;
+  shimmer.targetStopDuration = 0.7;
+  shimmer.start();
+
+  setTimeout(() => {
+    shimmer.dispose();
+    shimmerEmitter.dispose();
+  }, 1400);
+
+  // 3. Faint downward drifting particles
+  const driftEmitter = MeshBuilder.CreateSphere('aid_drift_emitter', { diameter: 0.25 }, scene);
+  driftEmitter.position = pos.clone();
+  driftEmitter.isVisible = false;
+
+  const drift = new ParticleSystem('aid_drift', 100, scene);
+  drift.particleTexture = createParticleTexture(scene);
+  drift.emitter = driftEmitter;
+  drift.minEmitBox = new Vector3(-0.1, -0.06, -0.1);
+  drift.maxEmitBox = new Vector3(0.1, 0.06, 0.1);
+  drift.color1 = new Color4(1, 0.95, 0.8, 0.5);
+  drift.color2 = new Color4(0.95, 0.88, 0.6, 0.35);
+  drift.colorDead = new Color4(0.9, 0.82, 0.55, 0);
+  drift.minSize = 0.05;
+  drift.maxSize = 0.12;
+  drift.minLifeTime = 0.35;
+  drift.maxLifeTime = 0.75;
+  drift.emitRate = 55;
+  drift.direction1 = new Vector3(-0.15, -0.98, -0.15);
+  drift.direction2 = new Vector3(0.15, -0.9, 0.15);
+  drift.minEmitPower = 0.15;
+  drift.maxEmitPower = 0.35;
+  drift.updateSpeed = 0.025;
+  drift.gravity = new Vector3(0, -0.25, 0);
+  drift.blendMode = ParticleSystem.BLENDMODE_STANDARD;
+  drift.targetStopDuration = 0.6;
+  drift.start();
+
+  setTimeout(() => {
+    drift.dispose();
+    driftEmitter.dispose();
+  }, 1300);
+
+  // 4. Second expanding ring - same position as first, rotated 90°
+  const chestRing = MeshBuilder.CreateTorus('aid_chest_ring', { diameter: ringRadius * 2, thickness: 0.02, tessellation: 32 }, scene);
+  chestRing.position = pos.clone();
+  chestRing.rotation.x = Math.PI / 2;
+  chestRing.rotation.y = Math.PI / 2;
+  const chestRingMat = new StandardMaterial('aid_chest_ring_mat', scene);
+  chestRingMat.emissiveColor = new Color3(0.98, 0.93, 0.78);
+  chestRingMat.alpha = 0.88;
+  chestRingMat.transparencyMode = Material.MATERIAL_ALPHABLEND;
+  chestRingMat.backFaceCulling = false;
+  chestRingMat.disableDepthWrite = true;
+  chestRing.material = chestRingMat;
+  chestRing.isPickable = false;
+
+  chestRing.scaling = new Vector3(0.01, 0.01, 0.01);
+  const chestRingStart = Date.now();
+  const chestRingDur = 1100;
+  const chestRingExpandDur = 0.7;
+  const chestRingMaxScale = 2.5;
+  const chestRingObs = scene.onBeforeRenderObservable.add(() => {
+    const t = (Date.now() - chestRingStart) / chestRingDur;
+    if (t >= 1) {
+      scene.onBeforeRenderObservable.remove(chestRingObs);
+      chestRingMat.dispose();
+      chestRing.dispose();
+      return;
+    }
+    const growT = Math.min(t / chestRingExpandDur, 1);
+    const scale = 0.01 + (chestRingMaxScale - 0.01) * (1 - Math.pow(1 - growT, 2));
+    chestRing.scaling.set(scale, scale, scale);
+    chestRingMat.alpha = 0.88 * (1 - t);
+  });
+}
+
+/**
+ * Play aid (self-heal) VFX - radiant holy crest, shimmer, drift around hand, chest ring at 800ms.
+ */
+function playAidVfx(scene, spellDef, startPos, endPos, castStartTime, options = {}) {
+  const AID_VFX_DELAY_MS = 800;
+  const castUserId = options?.castUserId;
+  const now = Date.now();
+  const delay = Math.max(0, castStartTime + AID_VFX_DELAY_MS - now);
+
+  setTimeout(() => {
+    let handPos = null;
+    if (castUserId) {
+      handPos = getBoneWorldPosition(scene, castUserId, 'RightHand') ||
+        getBoneWorldPosition(scene, castUserId, 'mixamorig:RightHand');
+    }
+    if (!handPos) {
+      handPos = endPos.clone();
+      handPos.y += 0.55;
+    }
+    const chestPos = endPos.clone();
+    chestPos.y = 1.1;
+    createAidRadiantEffect(handPos, chestPos, scene);
+  }, delay);
 }
 
 // ============================================================================

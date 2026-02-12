@@ -316,6 +316,34 @@ export function stopStanceAnimation(scene, userId) {
 }
 
 /**
+ * Get world position of a bone on a player's character.
+ * @param {import('@babylonjs/core').Scene} scene
+ * @param {string} userId - Player userId
+ * @param {string} boneName - Bone name (e.g. 'mixamorig:LeftHand', 'LeftHand')
+ * @returns {import('@babylonjs/core').Vector3|null} World position or null if not found
+ */
+export function getBoneWorldPosition(scene, userId, boneName) {
+  const playerMesh = scene.metadata?.playerMeshes?.get(userId);
+  if (!playerMesh) return null;
+  const modelMesh = playerMesh.metadata?.modelMesh || playerMesh;
+  const skel = getSkeletonAndOwner(modelMesh);
+  if (!skel) return null;
+  const { skeleton, ownerMesh } = skel;
+  const lower = (boneName || '').toLowerCase();
+  const bone = skeleton.bones?.find(
+    (b) => {
+      const n = (b.name || '').toLowerCase();
+      return n === lower || n.endsWith('_' + lower) || n.endsWith(':' + lower) || n.includes(lower);
+    }
+  ) ?? null;
+  if (!bone) return null;
+  ownerMesh.computeWorldMatrix(true);
+  const localPos = bone.getAbsolutePosition();
+  const worldMatrix = ownerMesh.getWorldMatrix();
+  return Vector3.TransformCoordinates(localPos, worldMatrix);
+}
+
+/**
  * Get skeleton and the mesh that owns it (for character models).
  * @param {import('@babylonjs/core').Node} node - Mesh or TransformNode
  * @returns {{ skeleton: import('@babylonjs/core').Skeleton, ownerMesh: import('@babylonjs/core').TransformNode }|null}

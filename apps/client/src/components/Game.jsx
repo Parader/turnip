@@ -142,6 +142,7 @@ const Game = () => {
   const gameRoomRef = useRef(null);
   const spellMessageListenersRegisteredRef = useRef(false);
   const latestGameStateRef = useRef(null);
+  const pendingMovementHitRef = useRef(null); // { targetUserId, damage, casterUserId, spellId } - shown when movement completes
 
   // Check if user should be in game - redirect if not
   useEffect(() => {
@@ -465,11 +466,34 @@ const Game = () => {
   useEffect(() => {
     if (babylonResourcesRef.current && babylonResourcesRef.current.setOnOrientationChange && gameRoomRef.current) {
       babylonResourcesRef.current.setOnOrientationChange((userId, babylonRotation) => {
-        // Only send orientation updates for the current user
         if (gameRoomRef.current && userId === user?.id) {
-          // Convert Babylon rotation to server orientation format
           const serverOrientation = babylonToServerOrientation(babylonRotation);
           gameRoomRef.current.send('updateOrientation', { orientation: serverOrientation });
+        }
+      });
+    }
+  }, [babylonResourcesRef.current, gameRoomRef.current, user]);
+
+  // Movement complete: show hit/damage immediately when animation finishes, send movementComplete for our character
+  useEffect(() => {
+    if (babylonResourcesRef.current?.setOnMovementComplete && gameRoomRef.current) {
+      babylonResourcesRef.current.setOnMovementComplete((completedUserId) => {
+        const pending = pendingMovementHitRef.current;
+        if (pending && pending.targetUserId === completedUserId) {
+          // Show hit and damage in sync with movement completion (no server round-trip delay)
+          if (babylonResourcesRef.current?.recordSpellHit) {
+            babylonResourcesRef.current.recordSpellHit(completedUserId, 0);
+          }
+          if (babylonResourcesRef.current?.playHitAnimation) {
+            babylonResourcesRef.current.playHitAnimation(completedUserId);
+          }
+          if (pending.damage > 0 && babylonResourcesRef.current?.queueEffectDamageText) {
+            babylonResourcesRef.current.queueEffectDamageText(completedUserId, pending.damage);
+          }
+          pendingMovementHitRef.current = null;
+        }
+        if (gameRoomRef.current && completedUserId === user?.id) {
+          gameRoomRef.current.send('movementComplete', {});
         }
       });
     }
@@ -617,6 +641,10 @@ const Game = () => {
         };
       }
       
+      if (message.pulledUserIds && message.pulledUserIds.length > 0 && babylonResourcesRef.current?.scene) {
+        if (!babylonResourcesRef.current.scene.metadata) babylonResourcesRef.current.scene.metadata = {};
+        babylonResourcesRef.current.scene.metadata.tauntPulledUserIds = new Set(message.pulledUserIds);
+      }
       if (babylonResourcesRef.current && babylonResourcesRef.current.playSpellCastAnimation) {
         if (castAnimDef) {
           
@@ -811,6 +839,15 @@ const Game = () => {
     const removeSpellCast = gameRoom.onMessage('spellCast', handleSpellCast);
     const removeSpellPrep = gameRoom.onMessage('spellPrep', handleSpellPrep);
     const removeSpellPrepCancel = gameRoom.onMessage('spellPrepCancel', handleSpellPrepCancel);
+    const handlePendingMovementHit = (message) => {
+      pendingMovementHitRef.current = {
+        targetUserId: message.targetUserId,
+        damage: message.damage || 0,
+        casterUserId: message.casterUserId,
+        spellId: message.spellId || 'slash'
+      };
+    };
+    const removePendingMovementHit = gameRoom.onMessage('pendingMovementHit', handlePendingMovementHit);
     const removeSpellHit = gameRoom.onMessage('spellHit', handleSpellHit);
     const removeTeleportConfirm = gameRoom.onMessage('teleportConfirm', handleTeleportConfirm);
     const removeTrapTriggered = gameRoom.onMessage('trapTriggered', handleTrapTriggered);
@@ -821,7 +858,7 @@ const Game = () => {
     // Cleanup: remove listeners when dependencies change to prevent duplicates
     return () => {
       if (typeof removeEffectResolved === 'function') removeEffectResolved();
-      // Remove all listeners to prevent duplicate message handling
+      if (typeof removePendingMovementHit === 'function') removePendingMovementHit();
       if (typeof removeSpellCast === 'function') removeSpellCast();
       if (typeof removeSpellPrep === 'function') removeSpellPrep();
       if (typeof removeSpellPrepCancel === 'function') removeSpellPrepCancel();

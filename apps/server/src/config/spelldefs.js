@@ -10,7 +10,7 @@ import { getEffectDef } from './effectRegistry.js';
  * @property {boolean} requiresLoS
  * @property {boolean} allowBlockedCellTarget
  * @property {boolean} allowOccupiedCellTarget
- * @property {"SINGLE" | "CIRCLE1" | "LINE3"} pattern
+ * @property {"SINGLE" | "CIRCLE1" | "LINE3" | "LINES4"} pattern - LINES4 = line in each cardinal direction (N/S/E/W) from caster
  */
 
 /**
@@ -167,6 +167,13 @@ import { getEffectDef } from './effectRegistry.js';
 /**
  * Canonical spell definitions registry
  * @type {Record<string, SpellDef>}
+ *
+ * --- Warrior mechanics to implement (GameRoom / server) ---
+ * 1. Slash: DONE - 60 damage + slash_wound; target's next turn: 10 dmg per MP spent when moving (effect expires at turn end).
+ * 2. Aid: Enforce castPerTurnLimit (2) by counting aid casts this turn per player.
+ * 3. Rage: Enforce cooldown (4 turns since last cast); apply incomingDamageResistPercent from effectRegistry when resolving damage to bearer; apply outgoingDamagePercent (already used).
+ * 4. Slam: DONE - damage + dizzy to enemies in CIRCLE1; apModifier/mpModifier applied at turn start.
+ * 5. Taunt: Implement LINES4 in getPatternCells (4 lines N/S/E/W, range from spell); pull each enemy in those lines up to pullTiles toward caster; apply taunt_debuff (-2 MP); require LOS along each line.
  */
 export const SpellDefs = {
     // Minimal initial spell set
@@ -292,30 +299,40 @@ export const SpellDefs = {
       }
     },
   
+    // Warrior: 6 AP, range 1. 60 damage + slash_wound: for target's next turn, 10 dmg per MP spent when moving (effect expires at turn end).
     slash: {
       spellId: 'slash',
       name: 'Slash',
-      description: 'Melee attack on an enemy unit',
+      description: 'Strike an enemy for 60 damage. If they move, they take 30 more and the wound closes.',
       targeting: {
         targetType: 'UNIT',
         unitFilter: 'ENEMY',
         range: { min: 1, max: 1 },
         requiresLoS: true,
         allowBlockedCellTarget: false,
-        allowOccupiedCellTarget: true, // UNIT targeting always allows occupied
+        allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 2 },
+      cost: { energy: 6 },
       effects: [
         {
           kind: 'DAMAGE',
-          amount: 4,
+          amount: 60,
           damageType: 'physical'
+        },
+        {
+          kind: 'STATUS_EFFECT',
+          statusEffect: getEffectDef('slash_wound')
         }
       ],
       presentation: {
         castAnim: 'melee',
         impactVfx: 'slash_impact',
+        impactVfxDef: {
+          delayMs: 700,
+          duration: 400,
+          vfx: { type: 'PARTICLE', size: 0.1 }
+        },
         sound: 'slash_swing'
       },
       animations: {
@@ -330,6 +347,50 @@ export const SpellDefs = {
           name: 'melee',
           blendInMs: 50,
           blendOutMs: 150,
+          lockMs: 600,
+          impactDelayMs: 800
+        }
+      }
+    },
+
+    // Warrior: 2 AP, self only. Heal 20. Max 2 casts per turn.
+    aid: {
+      spellId: 'aid',
+      name: 'Aid',
+      description: 'Quick self-heal. Usable up to twice per turn.',
+      targeting: {
+        targetType: 'SELF',
+        range: { min: 0, max: 0 },
+        requiresLoS: false,
+        allowBlockedCellTarget: false,
+        allowOccupiedCellTarget: true,
+        pattern: 'SINGLE'
+      },
+      cost: { energy: 2 },
+      maxCastsPerTurn: 2,
+      effects: [
+        {
+          kind: 'HEAL',
+          amount: 20
+        }
+      ],
+      presentation: {
+        castAnim: 'cast2',
+        impactVfx: 'heal_glow',
+        sound: 'heal_cast'
+      },
+      animations: {
+        prep: {
+          name: 'stance',
+          loop: true,
+          blendInMs: 200,
+          blendOutMs: 150,
+          canMoveWhilePreparing: false
+        },
+        cast: {
+          name: 'cast2',
+          blendInMs: 100,
+          blendOutMs: 200,
           lockMs: 600,
           impactDelayMs: 300
         }
@@ -350,6 +411,7 @@ export const SpellDefs = {
         pattern: 'SINGLE'
       },
       cost: { energy: 5 },
+      maxCastsPerTurn: 1,
       effects: [
         {
           kind: 'HEAL',
@@ -896,28 +958,31 @@ export const SpellDefs = {
       }
     },
   
+    // Warrior: 3 AP, self-cast. AoE LINE4 (4 tiles in each cardinal direction, no diagonals). Pull enemies up to 2 tiles closer; -2 MP. Max 2 casts per turn.
     taunt: {
       spellId: 'taunt',
       name: 'Taunt',
-      description: 'Provoke an enemy to attack you',
+      description: 'Draw enemies in line toward you (up to 2 tiles) and reduce their movement.',
       targeting: {
-        targetType: 'UNIT',
-        unitFilter: 'ENEMY',
-        range: { min: 1, max: 3 },
+        targetType: 'SELF',
+        range: { min: 0, max: 0 },
         requiresLoS: true,
         allowBlockedCellTarget: false,
         allowOccupiedCellTarget: true,
-        pattern: 'SINGLE'
+        pattern: 'LINE4'
       },
-      cost: { energy: 2 },
+      cost: { energy: 3 },
+      maxCastsPerTurn: 2,
+      /** Server: move each enemy in affected lines up to pullTiles toward caster, then apply mpModifier. */
+      pullTiles: 2,
       effects: [
         {
-          kind: 'DAMAGE',
-          amount: 0 // Debuff spell
+          kind: 'STATUS_EFFECT',
+          statusEffect: getEffectDef('taunt_debuff')
         }
       ],
       presentation: {
-        castAnim: 'cast',
+        castAnim: 'attack3',
         impactVfx: 'taunt_effect',
         sound: 'taunt_shout'
       },
@@ -930,7 +995,7 @@ export const SpellDefs = {
           canMoveWhilePreparing: false
         },
         cast: {
-          name: 'cast',
+          name: 'attack3',
           blendInMs: 100,
           blendOutMs: 200,
           lockMs: 600,
@@ -939,10 +1004,11 @@ export const SpellDefs = {
       }
     },
   
+    // Warrior: 8 AP, self. -20% dmg resistance, +20% dmg dealt for 2 turns. Can cast every 4 turns. TODO: server must enforce cooldown (lastRageTurn + 4 <= currentTurn).
     rage: {
       spellId: 'rage',
       name: 'Rage',
-      description: 'Enter a berserker rage',
+      description: 'Take and deal more damage for 2 turns. Usable once every 4 turns.',
       targeting: {
         targetType: 'SELF',
         range: { min: 0, max: 0 },
@@ -951,11 +1017,12 @@ export const SpellDefs = {
         allowOccupiedCellTarget: true,
         pattern: 'SINGLE'
       },
-      cost: { energy: 3 },
+      cost: { energy: 8 },
+      cooldown: 4,
       effects: [
         {
-          kind: 'HEAL',
-          amount: 0 // Buff spell
+          kind: 'STATUS_EFFECT',
+          statusEffect: getEffectDef('rage')
         }
       ],
       presentation: {
@@ -977,6 +1044,54 @@ export const SpellDefs = {
           blendOutMs: 200,
           lockMs: 700,
           impactDelayMs: 400
+        }
+      }
+    },
+
+    // Warrior: 4 AP, 1-tile radius around self. 20 physical dmg, dizzy (-1 AP, -1 MP next turn) to enemies in area.
+    slam: {
+      spellId: 'slam',
+      name: 'Slam',
+      description: 'Hit nearby enemies for 20 damage and dizzy them (-1 AP, -1 MP next turn).',
+      targeting: {
+        targetType: 'SELF',
+        range: { min: 0, max: 0 },
+        requiresLoS: false,
+        allowBlockedCellTarget: false,
+        allowOccupiedCellTarget: true,
+        pattern: 'CIRCLE1'
+      },
+      cost: { energy: 4 },
+      effects: [
+        {
+          kind: 'DAMAGE',
+          amount: 20,
+          damageType: 'physical'
+        },
+        {
+          kind: 'STATUS_EFFECT',
+          statusEffect: getEffectDef('dizzy')
+        }
+      ],
+      presentation: {
+        castAnim: 'attack2',
+        impactVfx: 'spin_whirl',
+        sound: 'spin_attack'
+      },
+      animations: {
+        prep: {
+          name: 'stance',
+          loop: true,
+          blendInMs: 200,
+          blendOutMs: 150,
+          canMoveWhilePreparing: false
+        },
+        cast: {
+          name: 'attack2',
+          blendInMs: 50,
+          blendOutMs: 150,
+          lockMs: 800,
+          impactDelayMs: 1400
         }
       }
     },
@@ -1783,6 +1898,14 @@ export const SpellDefs = {
         if (def && def.blocksCasting) {
           return { valid: false, error: 'Silenced' };
         }
+      }
+    }
+
+    // Per-turn cast limit (e.g. taunt: max 2 per turn)
+    if (spell.maxCastsPerTurn != null) {
+      const counts = JSON.parse(casterState.spellCastsThisTurn || '{}');
+      if ((counts[spellId] || 0) >= spell.maxCastsPerTurn) {
+        return { valid: false, error: `Can only cast ${spell.name} ${spell.maxCastsPerTurn} time(s) per turn` };
       }
     }
 

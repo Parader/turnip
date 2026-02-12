@@ -12,7 +12,7 @@ export const gameData = {
         }
       },
       warrior: {
-        starterSpells: ['taunt', 'slash', 'heal', 'rage', 'spin'],
+        starterSpells: ['slash', 'aid', 'rage', 'slam', 'taunt'],
         baseStats: {
           movement: 6,
           energy: 16,

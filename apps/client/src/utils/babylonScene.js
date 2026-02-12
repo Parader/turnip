@@ -3,9 +3,9 @@ import '@babylonjs/loaders/glTF';
 import { TILE_TYPES, doesTileBlockLOS } from './mapRenderer';
 import { findPath, getMovementRange } from './pathfinding';
 import { build3DMap } from './babylon/babylonMap';
-import { buildPlayerCharacters, updatePlayerCharacters } from './babylon/babylonPlayers';
+import { buildPlayerCharacters, updatePlayerCharacters, updateTauntSlides } from './babylon/babylonPlayers';
 import { startMovementAnimation, startStanceAnimation, stopStanceAnimation, playCastAnimation, playHitAnimation, updateMovementAnimations, blendAnimations } from './babylon/babylonAnimations';
-import { playSpellVfx, preWarmArcaneMissileShaders, disposeVfxCache, createPoisonStatusParticles } from './babylon/babylonVfx';
+import { playSpellVfx, preWarmArcaneMissileShaders, disposeVfxCache, createPoisonStatusParticles, createSlashWoundStatusParticles } from './babylon/babylonVfx';
 import { startTeleportVFX, onServerTeleportConfirmed, activeTeleports, disposeTeleportCache } from './babylon/babylonTeleport';
 import { hasLOS, createTerrainBlocksFunction } from './lineOfSight';
 import { initCombatTextSystem, updateCombatTextFromState, recordCombatTextHit, flushPendingDamageForImpact, queueEffectDamageText, disposeCombatTextSystem } from './babylon/babylonCombatText';
@@ -399,6 +399,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   // Start render loop with camera following and movement animations
   engine.runRenderLoop(() => {
     updateCameraToFollowPlayer();
+    updateTauntSlides(scene);
     updateMovementAnimations(scene);
     scene.render();
   });
@@ -489,9 +490,16 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   trapAoEMaterial.diffuseColor = new Color3(0.9, 0.6, 0.2); // Orange
   trapAoEMaterial.emissiveColor = new Color3(0.5, 0.3, 0.1); // Warm glow
   trapAoEMaterial.alpha = 0.4; // Semi-transparent to not be too distracting
+
+  // Create material for spell AoE visualization (yellow) - shows when hovering valid cast tile
+  let spellAoEMaterial = new StandardMaterial('spellAoEMaterial', scene);
+  spellAoEMaterial.diffuseColor = new Color3(0.9, 0.85, 0.2); // Yellow
+  spellAoEMaterial.emissiveColor = new Color3(0.5, 0.4, 0.1); // Warm glow
+  spellAoEMaterial.alpha = 0.5;
   
   let spellRangeTiles = []; // Currently highlighted spell range tiles
   let spellTargetTiles = []; // Currently highlighted spell target tiles
+  let spellAoeTiles = []; // Currently highlighted spell AoE tiles (CIRCLE1 etc)
   let trapAoETiles = []; // Currently highlighted trap trigger zone tiles
   
   // Function to clear movement visualization
@@ -532,6 +540,15 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       }
     });
     spellTargetTiles = [];
+
+    // Clear spell AoE tiles
+    spellAoeTiles.forEach(tileKey => {
+      const tile = allTiles.get(tileKey);
+      if (tile && tile.userData && tile.userData.originalMaterial) {
+        tile.material = tile.userData.originalMaterial;
+      }
+    });
+    spellAoeTiles = [];
     
     // Re-apply trap AoE overlay for tiles that were suppressed during spell targeting
     // This ensures trap zones are visible again after spell casting ends
@@ -549,8 +566,9 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
         const isInMovementPath = movementPath.includes(tileKey);
         const isInSpellRange = spellRangeTiles.includes(tileKey);
         const isInSpellTarget = spellTargetTiles.includes(tileKey);
-        
-        if (!isInMovementPath && !isInSpellRange && !isInSpellTarget) {
+        const isInSpellAoe = spellAoeTiles.includes(tileKey);
+
+        if (!isInMovementPath && !isInSpellRange && !isInSpellTarget && !isInSpellAoe) {
           tile.material = tile.userData.originalMaterial;
         }
       }
@@ -644,8 +662,8 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
   };
 
   /**
-   * Pooled status-effect VFX: poison = green particles emanating from body; start/stop by effect presence.
-   * No per-turn spawn/dispose; one particle system per poisoned player, reused.
+   * Pooled status-effect VFX: poison = green particles up; slash_wound = red particles down.
+   * Start/stop by effect presence; one particle system per effect per player.
    */
   const updateStatusEffectAuras = (scene, newGameState) => {
     if (!scene.metadata || !scene.metadata.playerMeshes) return;
@@ -662,24 +680,31 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     if (newGameState.enemyTeam && newGameState.enemyTeam.players) {
       players.push(...Object.values(newGameState.enemyTeam.players));
     }
+    const effectDefs = [
+      { key: 'poison', hasEffect: (p) => p.statusEffects?.poison, create: (mesh, name) => createPoisonStatusParticles(mesh, scene, name) },
+      { key: 'slash_wound', hasEffect: (p) => p.statusEffects?.slash_wound, create: (mesh, name) => createSlashWoundStatusParticles(mesh, scene, name) }
+    ];
     players.forEach((player) => {
       const mesh = playerMeshes.get(player.userId);
       if (!mesh) return;
-      const hasPoison = player.statusEffects && player.statusEffects.poison;
       let entry = auras.get(player.userId);
-      if (hasPoison) {
-        if (!entry || !entry.particleSystem || entry.particleSystem.isDisposed) {
-          const particleSystem = createPoisonStatusParticles(mesh, scene, `poison_${player.userId}`);
-          particleSystem.start();
-          auras.set(player.userId, { particleSystem });
-        } else if (!entry.particleSystem.isStarted) {
-          entry.particleSystem.start();
+      if (!entry) entry = {};
+      effectDefs.forEach(({ key, hasEffect, create }) => {
+        const hasIt = hasEffect(player);
+        let ps = entry[key];
+        if (hasIt) {
+          if (!ps || ps.isDisposed) {
+            ps = create(mesh, `${key}_${player.userId}`);
+            ps.start();
+            entry[key] = ps;
+          } else if (!ps.isStarted) {
+            ps.start();
+          }
+        } else if (ps) {
+          if (ps.isStarted) ps.stop();
         }
-      } else if (entry?.particleSystem) {
-        if (entry.particleSystem.isStarted) {
-          entry.particleSystem.stop();
-        }
-      }
+      });
+      auras.set(player.userId, entry);
     });
   };
   
@@ -924,6 +949,49 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
     }
     
     return rangeTiles;
+  };
+
+  // Get AoE cells for a spell pattern (CIRCLE1, CIRCLE2) centered on a tile
+  const getSpellPatternCells = (centerX, centerY, pattern, terrain) => {
+    const cells = [];
+    if (!terrain || !terrain.length) return cells;
+    const mapHeight = terrain.length;
+    const mapWidth = terrain[0]?.length || 0;
+
+    if (pattern === 'CIRCLE1') {
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const x = centerX + dx;
+          const y = centerY + dy;
+          if (x >= 0 && x < mapWidth && y >= 0 && y < mapHeight && terrain[y][x] === TILE_TYPES.TILE) {
+            cells.push({ x, y });
+          }
+        }
+      }
+    } else if (pattern === 'CIRCLE2') {
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dy = -2; dy <= 2; dy++) {
+          if (Math.abs(dx) + Math.abs(dy) <= 2) {
+            const x = centerX + dx;
+            const y = centerY + dy;
+            if (x >= 0 && x < mapWidth && y >= 0 && y < mapHeight && terrain[y][x] === TILE_TYPES.TILE) {
+              cells.push({ x, y });
+            }
+          }
+        }
+      }
+    } else if (pattern === 'LINE4') {
+      // 4 tiles in each cardinal direction (N/S/E/W), no diagonals
+      const inBounds = (x, y) => x >= 0 && x < mapWidth && y >= 0 && y < mapHeight && terrain[y][x] === TILE_TYPES.TILE;
+      if (inBounds(centerX, centerY)) cells.push({ x: centerX, y: centerY });
+      for (let step = 1; step <= 4; step++) {
+        if (inBounds(centerX, centerY + step)) cells.push({ x: centerX, y: centerY + step });
+        if (inBounds(centerX, centerY - step)) cells.push({ x: centerX, y: centerY - step });
+        if (inBounds(centerX + step, centerY)) cells.push({ x: centerX + step, y: centerY });
+        if (inBounds(centerX - step, centerY)) cells.push({ x: centerX - step, y: centerY });
+      }
+    }
+    return cells;
   };
   
   // Function to handle spell targeting visualization
@@ -1191,12 +1259,29 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
               if (!tile.userData) {
                 tile.userData = {};
               }
-              // Don't overwrite originalMaterial if already set
               if (!tile.userData.originalMaterial) {
                 tile.userData.originalMaterial = tile.material;
               }
               tile.material = spellTargetMaterial;
               spellTargetTiles.push(tileKey);
+            }
+
+            // Show spell AoE (yellow) only when hovering valid cast tile - target stays red, surround with yellow
+            const pattern = targeting.pattern || 'SINGLE';
+            if (pattern === 'CIRCLE1' || pattern === 'CIRCLE2' || pattern === 'LINE4') {
+              const aoeCells = getSpellPatternCells(tileX, tileY, pattern, terrain);
+              aoeCells.forEach(({ x, y }) => {
+                // Skip center - keep target tile red
+                if (x === tileX && y === tileY) return;
+                const aoeTileKey = `${x}_${y}`;
+                const aoeTile = allTiles.get(aoeTileKey);
+                if (aoeTile) {
+                  if (!aoeTile.userData) aoeTile.userData = {};
+                  if (!aoeTile.userData.originalMaterial) aoeTile.userData.originalMaterial = aoeTile.material;
+                  aoeTile.material = spellAoEMaterial;
+                  spellAoeTiles.push(aoeTileKey);
+                }
+              });
             }
             
             // Handle spell cast on click
@@ -1827,9 +1912,13 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
       onPositionChangeRequest = callback;
     },
     setOnOrientationChange: (callback) => {
-      // Update scene metadata with new callback
       if (scene.metadata) {
         scene.metadata.onOrientationChange = callback;
+      }
+    },
+    setOnMovementComplete: (callback) => {
+      if (scene.metadata) {
+        scene.metadata.onMovementComplete = callback;
       }
     },
     setOnSpellCast: (callback) => {
@@ -2194,8 +2283,15 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
           return; // No targets, nothing to do
         }
         
-        if (!isTeleportSpell && (!spellDef || !spellDef.presentation || (!spellDef.presentation.projectileVfx && !spellDef.presentation.impactVfxDef && !spellDef.presentation.groundEffectVfx))) {
-          return; // Not teleport and no VFX definitions, skip
+        const hasVfxDefs = spellDef?.presentation && (spellDef.presentation.projectileVfx || spellDef.presentation.impactVfxDef || spellDef.presentation.groundEffectVfx);
+        // Spells that have dedicated handlers inside playSpellVfx (babylonVfx)
+        const hasCustomVfxHandler =
+          spellDef?.spellId === 'slash' ||
+          spellDef?.spellId === 'slam' ||
+          spellDef?.spellId === 'aid' ||
+          spellDef?.spellId === 'taunt';
+        if (!isTeleportSpell && (!spellDef || (!hasVfxDefs && !hasCustomVfxHandler))) {
+          return; // Not teleport and no VFX definitions or custom handler, skip
         }
         
         // Continue with VFX processing
@@ -2307,6 +2403,7 @@ export function createBabylonScene(canvas, mapData, matchInfo, userId, gameState
               const playerAt = findPlayerAt(target.x, target.y);
               const targetUserId = playerAt?.userId ?? null;
               const options = {
+                castUserId,
                 targetUserId: targetUserId || undefined,
                 onImpact: targetUserId
                   ? (userId) => {
@@ -3030,15 +3127,17 @@ export function disposeBabylonScene({ engine, scene, camera, handleResize }) {
       scene.metadata.targetMarkers.clear();
     }
     
-    // 5b. Clean up status effect VFX (poison particle systems per player)
+    // 5b. Clean up status effect VFX (poison, slash_wound particle systems per player)
     if (scene.metadata.statusEffectAuras) {
       scene.metadata.statusEffectAuras.forEach((entry, userId) => {
         try {
-          const ps = entry?.particleSystem;
-          if (ps && !ps.isDisposed) {
-            ps.stop();
-            ps.dispose();
-          }
+          const systems = entry?.particleSystem ? [entry.particleSystem] : Object.values(entry || {}).filter(Boolean);
+          systems.forEach((ps) => {
+            if (ps && !ps.isDisposed) {
+              ps.stop();
+              ps.dispose();
+            }
+          });
         } catch (e) {
           console.warn(`[BabylonScene] Error disposing status effect VFX for ${userId}:`, e);
         }

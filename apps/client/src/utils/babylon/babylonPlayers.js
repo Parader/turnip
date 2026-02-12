@@ -340,6 +340,35 @@ export function buildPlayerCharacters(scene, gameState, userId, mapWidth, mapHei
 }
 
 /**
+ * Update taunt-slide animations (smooth translate, no walk). Call from render loop.
+ * @param {import('@babylonjs/core').Scene} scene
+ */
+export function updateTauntSlides(scene) {
+  const slides = scene.metadata?.tauntSlides;
+  if (!slides || slides.size === 0) return;
+  const now = Date.now();
+  const toRemove = [];
+  slides.forEach((data, userId) => {
+    const elapsed = now - data.startTime;
+    const t = Math.min(elapsed / data.durationMs, 1);
+    const eased = 1 - Math.pow(1 - t, 2);
+    const x = data.startX + (data.endX - data.startX) * eased;
+    const z = data.startZ + (data.endZ - data.startZ) * eased;
+    data.mesh.position.x = x;
+    data.mesh.position.z = z;
+    if (t >= 1) {
+      data.mesh.position.x = data.endX;
+      data.mesh.position.z = data.endZ;
+      if (scene.metadata.playerPreviousPositions) {
+        scene.metadata.playerPreviousPositions.set(userId, data.endGrid);
+      }
+      toRemove.push(userId);
+    }
+  });
+  toRemove.forEach((id) => slides.delete(id));
+}
+
+/**
  * Update player character positions when game state changes
  * @param {Scene} scene - Babylon.js scene
  * @param {Object} gameState - Updated game state
@@ -412,6 +441,7 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
       
       // If player has moved, handle movement (animation or teleport)
       if (hasMoved && previousPos) {
+        if (scene.metadata.tauntSlides?.has(player.userId)) return;
         const startX = previousPos.x;
         const startY = previousPos.y;
         const endX = player.position.x;
@@ -436,6 +466,27 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
             scene.metadata.playerPreviousPositions.set(player.userId, { x: endX, y: endY });
           }
           return; // Skip normal movement handling
+        }
+
+        // Taunt pull: translate smoothly to new position without walk animation
+        const tauntPulled = scene.metadata.tauntPulledUserIds && scene.metadata.tauntPulledUserIds.has(player.userId);
+        if (tauntPulled) {
+          scene.metadata.tauntPulledUserIds.delete(player.userId);
+          if (!scene.metadata.tauntSlides) scene.metadata.tauntSlides = new Map();
+          const startWorldX = startX * tileSize;
+          const startWorldZ = startY * tileSize;
+          scene.metadata.tauntSlides.set(player.userId, {
+            mesh: existingMesh,
+            isContainer,
+            startX: startWorldX,
+            startZ: startWorldZ,
+            endX: xPos,
+            endZ: zPos,
+            endGrid: { x: endX, y: endY },
+            startTime: Date.now(),
+            durationMs: 350
+          });
+          return;
         }
         
         // During preparation phase, just teleport to destination (no animation)
@@ -558,10 +609,13 @@ export async function updatePlayerCharacters(scene, gameState, userId, mapWidth,
           // Determine animation type (walk for 2 tiles or less, run for more)
           const animationType = distance <= 2 ? 'walk' : 'run';
           
-          // Create onComplete callback to sync orientation with server
+          // Create onComplete callback to sync orientation and trigger movement-complete effects
           const onMovementComplete = (completedUserId, finalBabylonRotation) => {
             if (scene.metadata?.onOrientationChange) {
               scene.metadata.onOrientationChange(completedUserId, finalBabylonRotation);
+            }
+            if (scene.metadata?.onMovementComplete) {
+              scene.metadata.onMovementComplete(completedUserId);
             }
           };
           

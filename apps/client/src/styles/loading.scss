@@ -1,3 +1,4 @@
+@use 'sass:color';
 @import 'variables';
 
 .loading-screen {
@@ -40,7 +41,7 @@
 
 .loading-progress-bar {
   height: 100%;
-  background: linear-gradient(90deg, var(--color-primary), lighten(#4a9eff, 10%));
+  background: linear-gradient(90deg, var(--color-primary), color.adjust(#4a9eff, $lightness: 10%));
   border-radius: var(--border-radius-md);
   transition: width 0.2s ease-out;
 }

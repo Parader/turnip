@@ -19,6 +19,17 @@ const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}
         : currentPlayer.spellLoadout)
     : [];
   
+  // Per-turn spell cast counts (from server, JSON string spellId -> count)
+  const spellCastsThisTurn = (() => {
+    if (!currentPlayer?.spellCastsThisTurn) return {};
+    try {
+      return JSON.parse(currentPlayer.spellCastsThisTurn);
+    } catch (e) {
+      console.warn('Failed to parse spellCastsThisTurn:', currentPlayer.spellCastsThisTurn, e);
+      return {};
+    }
+  })();
+  
   const isMyTurn = gameState?.phase === 'game' && gameState?.currentPlayerId === currentUserId;
   // Energy might not be in game state yet, use defaults
   const currentEnergy = currentPlayer?.energy ?? 10;
@@ -26,8 +37,9 @@ const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}
   // Health
   const currentHealth = currentPlayer?.health ?? 100;
   const maxHealth = currentPlayer?.maxHealth ?? 100;
-  // Movement
+  // Movement (use maxMovementPoints for display so debuffs like dizzy show "4/5" not "4/4")
   const totalMovement = currentPlayer?.movementPoints ?? 0;
+  const maxMovement = currentPlayer?.maxMovementPoints ?? totalMovement;
   const usedMovement = currentPlayer?.usedMovementPoints ?? 0;
   const availableMovement = totalMovement - usedMovement;
   
@@ -42,6 +54,13 @@ const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}
     const cost = spell.cost?.energy || 0;
     if (currentEnergy < cost) {
       // TODO: Show "Not enough energy" message
+      return;
+    }
+
+    // Check per-turn cast limit (e.g. taunt max casts per turn)
+    const castsSoFar = spellCastsThisTurn[spellId] || 0;
+    if (spell.maxCastsPerTurn != null && castsSoFar >= spell.maxCastsPerTurn) {
+      // Cannot cast any more this turn
       return;
     }
     
@@ -93,12 +112,21 @@ const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}
     const spell = spellId ? spellDefs[spellId] : null;
     const isSelected = selectedSpell === spellId;
     const canAfford = spell ? (currentEnergy >= (spell.cost?.energy || 0)) : false;
+    const castsSoFar = spell && spellCastsThisTurn ? (spellCastsThisTurn[spellId] || 0) : 0;
+    const hasPerTurnLimit = spell && spell.maxCastsPerTurn != null;
+    const atPerTurnLimit = hasPerTurnLimit && castsSoFar >= spell.maxCastsPerTurn;
     const isOnCooldown = false; // TODO: Implement cooldown tracking
     
     slots.push(
       <div key={i} className="spell-slot-wrapper">
         <div
-          className={`spell-slot ${spellId ? 'has-spell' : 'empty'} ${isSelected ? 'selected' : ''} ${!canAfford && spellId ? 'insufficient-energy' : ''} ${isOnCooldown ? 'on-cooldown' : ''}`}
+          className={
+            `spell-slot ${spellId ? 'has-spell' : 'empty'}` +
+            `${isSelected ? ' selected' : ''}` +
+            `${!canAfford && spellId ? ' insufficient-energy' : ''}` +
+            `${isOnCooldown ? ' on-cooldown' : ''}` +
+            `${atPerTurnLimit ? ' max-per-turn' : ''}`
+          }
           onClick={() => handleSpellClick(spellId, i)}
           onMouseEnter={() => {
             // Clear movement visualization when hovering over spell slots
@@ -106,7 +134,14 @@ const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}
               clearMovementVisualization();
             }
           }}
-          title={spell ? `${spell.name} - ${spell.description || ''} (Cost: ${spell.cost?.energy || 0} Energy)` : 'Empty Slot'}
+          title={
+            spell
+              ? `${spell.name} - ${spell.description || ''} (Cost: ${spell.cost?.energy || 0} Energy` +
+                (hasPerTurnLimit ? `, Max ${spell.maxCastsPerTurn}/turn` : '') +
+                (atPerTurnLimit ? ' - Max casts reached this turn' : '') +
+                ')'
+              : 'Empty Slot'
+          }
         >
         {spell && (
           <>
@@ -117,6 +152,12 @@ const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}
               ) : (
                 <div className="spell-icon-placeholder">
                   {spell.name.charAt(0).toUpperCase()}
+                </div>
+              )}
+              {/* Per-turn limit overlay */}
+              {atPerTurnLimit && (
+                <div className="cooldown-overlay">
+                  <span className="cooldown-text">MAX</span>
                 </div>
               )}
               {/* Cooldown overlay */}
@@ -184,9 +225,9 @@ const SpellActionBar = ({ gameState, currentUserId, onSpellClick, spellDefs = {}
             <div className="resource-bar-container">
               <div 
                 className="resource-fill movement-fill" 
-                style={{ width: `${totalMovement > 0 ? (availableMovement / totalMovement) * 100 : 0}%` }}
+                style={{ width: `${maxMovement > 0 ? (availableMovement / maxMovement) * 100 : 0}%` }}
               />
-              <span className="resource-text">{availableMovement} / {totalMovement}</span>
+              <span className="resource-text">{availableMovement} / {maxMovement}</span>
             </div>
           </div>
           

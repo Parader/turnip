@@ -56,6 +56,70 @@ export const EffectRegistry = {
     onRemove: {},
     /** When present, blocks spell casting (checked in spell validation). */
     blocksCasting: true
+  },
+
+  /** Warrior: -20% damage resistance (take more damage), +20% damage dealt. Server must apply incomingDamageResistPercent when resolving damage to bearer. */
+  rage: {
+    effectId: 'rage',
+    name: 'Rage',
+    duration: 2,
+    stackable: false,
+    type: 'BUFF',
+    onApply: {},
+    onTurnStart: {},
+    onTurnEnd: {},
+    onRemove: {},
+    outgoingDamagePercent: 120,
+    /** Stored in effect data: multiply incoming damage by (100 + this) / 100. -20 => take 20% more damage. */
+    incomingDamageResistPercent: -20
+  },
+
+  /** Warrior slam: -1 AP, -1 MP for the affected turn. Expires at turn end so effect is visible during victim's turn. */
+  dizzy: {
+    effectId: 'dizzy',
+    name: 'Dizzy',
+    duration: 1,
+    stackable: false,
+    type: 'DEBUFF',
+    onApply: {},
+    onTurnStart: {},
+    onTurnEnd: {},
+    onRemove: {},
+    apModifier: -1,
+    mpModifier: -1,
+    /** Decrement duration at turn end (not start) so effect stays visible during victim's turn */
+    expireAtTurnEnd: true
+  },
+
+  /** Warrior Slash: for victim's whole next turn, take 10 damage per movement point spent. Effect expires at turn end (not removed when moving). */
+  slash_wound: {
+    effectId: 'slash_wound',
+    name: 'Slash Wound',
+    duration: 1,
+    stackable: false,
+    type: 'DEBUFF',
+    onApply: {},
+    onTurnStart: {},
+    onTurnEnd: {},
+    onRemove: {},
+    expireAtTurnEnd: true,
+    /** When bearer moves: 10 damage per MP spent. Effect is NOT removed; expires at turn end. */
+    onMove: { damagePerMovementPoint: 10, damageType: 'physical', removeOnTrigger: false }
+  },
+
+  /** Warrior taunt: -2 MP. Expires at turn end so effect visible during victim's turn. */
+  taunt_debuff: {
+    effectId: 'taunt_debuff',
+    name: 'Taunted',
+    duration: 1,
+    stackable: false,
+    type: 'DEBUFF',
+    onApply: {},
+    onTurnStart: {},
+    onTurnEnd: {},
+    onRemove: {},
+    mpModifier: -2,
+    expireAtTurnEnd: true
   }
 };
 
